@@ -319,10 +319,28 @@ checkpoint's totals were "measured under a disclosed test-harness-only
 getgroups LD_PRELOAD shim necessitated by the external /etc rewrite; changes
 no assertions; suite passes identically without it once the group db is
 restored or the session runs 950-free" (the oracle fails identically under
-the same condition, so this is not a parity defect). Remaining follow-ups: a
-root-cause slice for two known flakes (cacerts restart repair-path race,
-~1-in-7; process_runtime slow-observer 200 ms windows under load) plus the
-Go-ahead cabundle and cgroups-aggregate coverage modules.
+the same condition, so this is not a parity defect). The two known flakes
+were then root-caused and fixed deterministically: the whole cacerts family
+staged files through tokio's blocking pool without `flush()`, letting a
+same-pool `rename` publish an empty or partial file (fixed with a single
+`flush().await` at the staging seam; the amplified loop went 18/20 red
+pre-fix to 0/25 green post-fix), and the process_runtime slow-observer test
+measured machine latency (fork/exec under load) rather than the
+deadlock-freedom property it guards (now a 30 s deadlock tripwire whose
+`listed` step also asserts pid visibility; the former 200 ms windows failed
+on machine speed alone at measured 331 ms spawn+reap under a fork storm).
+Remaining follow-ups: an analogous missing final flush in
+`daemon.rs::write_upgrade_binary` (no same-request rename, so no torn-publish
+window — a straggler write could merely still be in flight when the response
+returns), two further load-sensitive process_runtime tests observed under
+stress (`regression_deadline_retires_exited_child_with_only_pump_blocked`,
+`disconnect_keeps_child_alive_and_connect_has_no_output_replay`), two more
+pre-existing intermittent failures captured once each while verifying this
+mirror under residual load (the metadata_poll busy-wait of 100 `yield_now`s
+can exhaust before its `spawn_blocking` writer lands the file; a single
+ETXTBSY from `route_runner` whose source is undetermined — the writer there
+is synchronous, and the passing full runs in both trees bound the risk), and
+the Go-ahead cabundle and cgroups-aggregate coverage modules.
 Guest mode enables the OOM watcher unless `--isnotfc` is supplied; development mode
 keeps it disabled. Known history is returned oldest first, up to 32 kills, while
 unknown history is omitted. A dedicated dual-VM run validated one real kernel OOM,

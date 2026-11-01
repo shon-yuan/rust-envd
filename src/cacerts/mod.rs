@@ -1045,6 +1045,16 @@ async fn prepare_file(path: &Path, data: &[u8], mode: u32) -> Result<PathBuf, St
             .map_err(|error| go_path_error("chmod", &tmp, &error))?;
         file.write_all(data)
             .await
+            .map_err(|error| go_path_error("write", &tmp, &error))?;
+        // tokio's fs File reports write_all complete once the write is QUEUED
+        // on the blocking pool (fs/file.rs poll_write returns Ready after
+        // spawning the task); flush is the await that waits for the syscall
+        // itself. The oracle stages through synchronous Go writes
+        // (CreateTemp/WriteFile), so the staged file must already hold every
+        // byte when this returns — otherwise the caller's rename, queued on
+        // the same pool, can run first and publish a truncated file.
+        file.flush()
+            .await
             .map_err(|error| go_path_error("write", &tmp, &error))
     }
     .await;

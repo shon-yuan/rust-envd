@@ -469,18 +469,23 @@ async fn regression_slow_observer_connect_cannot_lock_registry() {
     let other = rt.clone();
     let attach = tokio::spawn(async move { other.connect(&pid_selector(pid)).await });
     tokio::task::yield_now().await;
-    let listed = tokio::time::timeout(Duration::from_millis(200), rt.list()).await;
-    let independent = tokio::time::timeout(Duration::from_millis(200), async {
+    // The guarded property is deadlock-freedom, not latency: a connect that
+    // serialized the registry behind a slow observer would hold the lock
+    // forever, so these operations would never complete and ANY finite bound
+    // eventually fails. The former 200 ms windows instead failed on machine
+    // speed alone — a fork/exec+reap of /bin/true spikes past 200 ms near
+    // load 44 (measured: 331 ms worst spawn+reap under a fork/exec storm,
+    // ~10 ms idle) with no registry contention at all. The watchdog bound
+    // only has to exceed every plausible host delay, not measure latency.
+    let wedge = Duration::from_secs(30);
+    let listed = tokio::time::timeout(wedge, rt.list()).await;
+    let independent = tokio::time::timeout(wedge, async {
         let mut stream = rt.start(request("/bin/true", &[]), None).await.unwrap();
         start_pid(&mut stream).await;
         finish(&mut stream).await
     })
     .await;
-    let signaled = tokio::time::timeout(
-        Duration::from_millis(200),
-        rt.send_signal(&pid_selector(pid), 15),
-    )
-    .await;
+    let signaled = tokio::time::timeout(wedge, rt.send_signal(&pid_selector(pid), 15)).await;
     drop(slow);
     let mut attached = attach.await.unwrap().unwrap();
     start_pid(&mut attached).await;
@@ -488,6 +493,10 @@ async fn regression_slow_observer_connect_cannot_lock_registry() {
     assert!(
         listed.is_ok(),
         "Connect held registry while blocked by slow subscriber"
+    );
+    assert!(
+        listed.unwrap().iter().any(|info| info.pid == pid),
+        "list missed the running process"
     );
     assert!(
         independent.is_ok(),
