@@ -1,15 +1,54 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/envd",
-]
-
-[workspace.package]
+[package]
+name = "coorworker-envd"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
-[workspace.dependencies]
+[dependencies]
+axum = { version = "0.8", features = ["http2"] }
+tower = { version = "0.5", features = ["util"] }
+nix = { version = "0.29", features = ["user", "fs", "signal", "process", "term", "time"] }
+xattr = "1"
+inotify = { version = "=0.11.5", default-features = false }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "process", "io-util", "sync", "fs"] }
+futures-util = "0.3"
+flate2 = "1"
+http-range = "0.1"
+httpdate = "1"
+mime_guess = "2"
+form_urlencoded = "1"
+percent-encoding = "2"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+multer = "3"
+tokio-util = { version = "0.7", features = ["io-util"] }
+base64 = "0.22"
+sha2 = "0.10"
+subtle = "2"
+zeroize = { version = "1", features = ["alloc"] }
+seckey = "=0.12.1"
+region = "=4.0.1"
+buffa = { version = "=0.9.1", features = ["json"] }
+buffa-types = { version = "=0.9.1", features = ["json"] }
+connectrpc = { version = "=0.9.1", default-features = false, features = ["json", "gzip", "server", "axum"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "process", "io-util"] }
+serde_json = { version = "1", features = ["raw_value"] }
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "=0.8.5"
+url = "=2.5.8"
+
+[build-dependencies]
+connectrpc-build = "=0.9.0"
+
+[dev-dependencies]
+tempfile = "3"
+futures-util = "0.3"
+http = "1"
+tokio = { version = "1", features = ["sync", "test-util"] }
+
+[features]
+client = ["connectrpc/client"]

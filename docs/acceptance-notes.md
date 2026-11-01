@@ -1,9 +1,8 @@
-# Rust envd protocol work
+# Acceptance notes
 
-This crate is under construction. The running local sandbox service still uses
-the earlier Go façade and Rust foreground executor. The new crate contains
-ordinary-user process and filesystem runtimes plus the initial HTTP integration;
-it is not yet a complete guest daemon or a replacement for the serving assets.
+This is the working acceptance log for aligning this Rust daemon with the
+pinned upstream envd 0.10.2; the entries below record what was built, how each
+slice was verified, and what remains.
 
 The target is the complete official envd 0.10.2 behavior at commit
 `51083a83cc0903185d992725ea6bb33683814b29`, as inventoried in
