@@ -12,6 +12,7 @@
 mod fixtures;
 
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::Arc;
 
 use axum::{
@@ -173,6 +174,21 @@ fn parse_matches_the_probed_go_acceptance() {
                 base64_of(&cert_a_der())
             ),
             Err("PEM block is \"CERTIFICATE extra\", not a certificate"),
+        ),
+        (
+            // Go %q byte escapes: quote, backslash, tab, CR and a control
+            // byte in the type line all render with escapes; a literal
+            // newline cannot appear in a getLine line, which is why the \n
+            // arm is unreachable from parsed input.
+            "type escapes follow go %q",
+            {
+                let typ = "CERT\"X\\Y\tZ\rQ\u{1}W";
+                format!(
+                    "-----BEGIN {typ}-----\n{}\n-----END {typ}-----\n",
+                    base64_of(&cert_a_der())
+                )
+            },
+            Err("PEM block is \"CERT\\\"X\\\\Y\\tZ\\rQ\\x01W\", not a certificate"),
         ),
         (
             "spaces inside base64 break the begin line",
@@ -671,6 +687,371 @@ fn x509_gate_rejects_structural_corruption() {
     }
 }
 
+// --- x509 gate: the remaining structural branches ---
+
+/// The fixture certificate's uncompressed P-256 point (the bytes after the
+/// SPKI's `03 42 00` prefix), reused to build a structurally valid SPKI for
+/// the manual-TBS rows below.
+fn ec_public_key_bits() -> Vec<u8> {
+    let point = cert_a_der();
+    let start = point
+        .windows(3)
+        .position(|window| window == [0x03, 0x42, 0x00])
+        .unwrap();
+    point[start + 3..start + 3 + 65].to_vec()
+}
+
+fn validity_ok() -> Vec<u8> {
+    seq(&[&utc_time("250101000000Z"), &utc_time("260101000000Z")])
+}
+
+fn spki_ok() -> Vec<u8> {
+    let point = ec_public_key_bits();
+    seq(&[&alg_ec(), &bit_string(&cat(&[&[0x00], &point]))])
+}
+
+fn base_tbs_parts() -> Vec<Vec<u8>> {
+    vec![
+        v3(),
+        serial1(),
+        alg_sha(),
+        name_cn(b"probe issuer"),
+        validity_ok(),
+        name_cn(b"probe subject"),
+        spki_ok(),
+    ]
+}
+
+fn cert_of_parts(parts: &[Vec<u8>], signature: &[u8]) -> Vec<u8> {
+    let refs: Vec<&[u8]> = parts.iter().map(|part| part.as_slice()).collect();
+    let tbs = seq(&refs);
+    let alg = alg_sha();
+    seq(&[&tbs, &alg, signature])
+}
+
+fn default_sig() -> Vec<u8> {
+    bit_string(&[0x00, 0xde, 0xad])
+}
+
+/// Every remaining reachable arm of the DER gate, one mutation per row. The
+/// oracle is Go's crypto/x509 parser as pinned by the probe battery; the
+/// expected detail is the bare error text `validate_certificate` returns.
+#[test]
+fn x509_gate_rejects_every_remaining_structural_branch() {
+    let malformed = Some("x509: malformed certificate");
+    let mut rows: Vec<(&str, Vec<u8>, Option<&str>)> = vec![
+        (
+            "outer tbs not a sequence",
+            seq(&[&set(&[]), &alg_sha(), &default_sig()]),
+            malformed,
+        ),
+        (
+            "outer inner-alg not a sequence",
+            seq(&[&seq(&[]), &set(&[]), &default_sig()]),
+            malformed,
+        ),
+        (
+            "outer signature not a bit string",
+            seq(&[&seq(&[]), &alg_sha(), &octet_string(&[])]),
+            malformed,
+        ),
+        (
+            "outer trailing element",
+            seq(&[&seq(&[]), &alg_sha(), &default_sig(), &integer(&[0x01])]),
+            Some("x509: trailing data"),
+        ),
+    ];
+    let push = |name: &'static str,
+                parts: Vec<Vec<u8>>,
+                signature: Option<Vec<u8>>,
+                expected: Option<&'static str>,
+                rows: &mut Vec<(&'static str, Vec<u8>, Option<&'static str>)>| {
+        let signature = signature.unwrap_or_else(default_sig);
+        rows.push((name, cert_of_parts(&parts, &signature), expected));
+    };
+
+    let mut parts = base_tbs_parts();
+    parts[0] = tlv(0xa0, &octet_string(&[]));
+    push(
+        "version value not an integer",
+        parts,
+        None,
+        Some("x509: malformed version"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[2] = raw_string(0x04, b"x");
+    push(
+        "tbs algorithm not a sequence",
+        parts,
+        None,
+        malformed,
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[4] = raw_string(0x04, b"x");
+    push("validity not a sequence", parts, None, malformed, &mut rows);
+
+    let mut parts = base_tbs_parts();
+    parts[5] = raw_string(0x04, b"x");
+    push(
+        "subject not a sequence",
+        parts,
+        None,
+        Some("x509: malformed subject"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[6] = octet_string(&[]);
+    push(
+        "spki not a sequence",
+        parts,
+        None,
+        Some("x509: malformed subjectPublicKey"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[6] = seq(&[&octet_string(&[]), &bit_string(&[0x00])]);
+    push(
+        "spki algorithm not a sequence",
+        parts,
+        None,
+        Some("x509: malformed subjectPublicKey"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[6] = seq(&[&alg_ec(), &octet_string(&[])]);
+    push(
+        "spki key not a bit string",
+        parts,
+        None,
+        Some("x509: malformed subjectPublicKey"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts.push(integer(&[0x01]));
+    push(
+        "tbs trailing element",
+        parts,
+        None,
+        Some("x509: trailing data"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[4] = seq(&[
+        &utc_time("250101000000Z"),
+        &utc_time("260101000000Z"),
+        &utc_time("270101000000Z"),
+    ]);
+    push(
+        "validity trailing element",
+        parts,
+        None,
+        Some("x509: trailing data"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[4] = seq(&[&utc_time("2501"), &utc_time("260101000000Z")]);
+    push(
+        "utc wrong length",
+        parts,
+        None,
+        Some("x509: malformed UTCTime"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[4] = seq(&[&utc_time("25a101000000Z"), &utc_time("260101000000Z")]);
+    push(
+        "utc non-digit",
+        parts,
+        None,
+        Some("x509: malformed UTCTime"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[4] = seq(&[&gen_time("2025a101000000Z"), &utc_time("260101000000Z")]);
+    push(
+        "generalized time non-digit",
+        parts,
+        None,
+        Some("x509: malformed GeneralizedTime"),
+        &mut rows,
+    );
+
+    for (name, zone) in [
+        ("utc zone non-digit", "250101000000+0a00"),
+        ("utc zone wrong shape", "250101000000+07"),
+        ("utc 31st of a 30-day month", "250431000000Z"),
+    ] {
+        let mut parts = base_tbs_parts();
+        parts[4] = seq(&[&utc_time(zone), &utc_time("260101000000Z")]);
+        push(
+            name,
+            parts,
+            None,
+            Some("x509: malformed UTCTime"),
+            &mut rows,
+        );
+    }
+
+    let mut parts = base_tbs_parts();
+    parts[2] = seq(&[&octet_string(&[]), &tlv(0x05, &[])]);
+    push(
+        "algorithm identifier type not an oid",
+        parts,
+        None,
+        malformed,
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[3] = seq(&[&set(&[&octet_string(&[])])]);
+    push(
+        "rdn set child not a sequence",
+        parts,
+        None,
+        Some("x509: invalid RDNSequence"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[3] = seq(&[&set(&[&seq(&[&octet_string(&[])])])]);
+    push(
+        "attribute type not an oid",
+        parts,
+        None,
+        Some("x509: invalid RDNSequence: invalid attribute type"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[5] = seq(&[&set(&[&seq(&[
+        &oid(&[0x55, 0x04, 0x03]),
+        &raw_string(0x16, &[0xff]),
+    ])])]);
+    push(
+        "ia5 string out of range",
+        parts,
+        None,
+        Some("x509: invalid RDNSequence: invalid attribute value: invalid IA5String"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts.push(tlv(
+        0xa3,
+        &cat(&[&seq(&[&ext_entry(OID_BC, &seq(&[]))]), &integer(&[0x01])]),
+    ));
+    push(
+        "extensions wrapper trailing element",
+        parts,
+        None,
+        Some("x509: malformed extensions"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts.push(extensions_of(&[&seq(&[
+        &octet_string(&[]),
+        &octet_string(&[]),
+    ])]));
+    push(
+        "extension oid field not an oid",
+        parts,
+        None,
+        Some("x509: malformed extension"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts.push(extensions_of(&[&ext_entry(OID_SAN, &octet_string(&[]))]));
+    push(
+        "san value not a sequence",
+        parts,
+        None,
+        Some("x509: invalid subject alternative names"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts.push(extensions_of(&[&ext_entry(
+        OID_SAN,
+        &seq(&[&[0x02, 0x05, 0x01]]),
+    )]));
+    push(
+        "san entry truncated",
+        parts,
+        None,
+        Some("x509: invalid subject alternative names"),
+        &mut rows,
+    );
+
+    // Signature BIT STRING envelope arms.
+    let parts = base_tbs_parts();
+    rows.push((
+        "signature bit string empty",
+        cert_of_parts(&parts, &bit_string(&[])),
+        Some("x509: malformed signature"),
+    ));
+    rows.push((
+        "signature pad with no data",
+        cert_of_parts(&parts, &bit_string(&[0x01])),
+        Some("x509: malformed signature"),
+    ));
+    rows.push((
+        "signature pad with zeroed padding bits",
+        cert_of_parts(&parts, &bit_string(&[0x01, 0x02])),
+        None,
+    ));
+
+    // OID arms: a non-minimal leading 0x80, a first arc below 40, and an
+    // empty body.
+    let mut parts = base_tbs_parts();
+    parts[2] = seq(&[&oid(&[0x80, 0x2a]), &tlv(0x05, &[])]);
+    push("oid non-minimal lead", parts, None, malformed, &mut rows);
+
+    let mut parts = base_tbs_parts();
+    parts[2] = seq(&[&oid(&[0x05])]);
+    push(
+        "oid first arc below 40",
+        parts,
+        None,
+        Some("x509: inner and outer signature algorithm identifiers don't match"),
+        &mut rows,
+    );
+
+    let mut parts = base_tbs_parts();
+    parts[2] = seq(&[&oid(&[])]);
+    push("oid empty", parts, None, malformed, &mut rows);
+
+    let mut mismatches = Vec::new();
+    for (name, der, expected) in &rows {
+        let outcome = x509::validate_certificate(der).err();
+        match (outcome.as_deref(), *expected) {
+            (None, None) => {}
+            (Some(actual), Some(want)) if actual == want => {}
+            (actual, want) => {
+                mismatches.push(format!("{name}: got {actual:?}, want {want:?}"));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "structural branch mismatches:\n{}",
+        mismatches.join("\n")
+    );
+}
+
 // --- installer (injected tempdir roots) ---
 
 struct Trust {
@@ -1089,6 +1470,148 @@ async fn run_loop_finishes_persisted_intent_without_init() {
     assert!(text.contains(CERT_B_PEM.trim_end()));
     assert!(text.contains(CERT_C_PEM.trim_end()));
     assert!(!text.contains(&CERT_A_PEM[..CERT_A_PEM.len() / 3]));
+}
+
+// --- installer error paths ---
+
+#[tokio::test]
+async fn empty_bundle_is_a_noop_and_a_wedged_slot_honours_cancellation() {
+    let trust = new_trust();
+    let installer = installer_for(&trust);
+    let before = bundle_text(&trust);
+    installer.install("").await.unwrap();
+    assert!(!trust.state_path.exists());
+    assert_eq!(bundle_text(&trust), before);
+    // A cancellation that fires while the slot is held must win the select
+    // even though the try-lock fast path already failed.
+    let guard = installer.hold_lock_for_tests().await;
+    let cancel = tokio::time::sleep(Duration::from_millis(5));
+    let error = installer
+        .install_cancellable(CERT_A_PEM, cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CaError::InProgress), "{error:?}");
+    drop(guard);
+}
+
+#[tokio::test]
+async fn state_publish_rename_failure_reports_the_go_path_error() {
+    let trust = new_trust();
+    let installer = installer_for(&trust);
+    installer.install(CERT_A_PEM).await.unwrap();
+    // Replace the published state with a directory: the staging file itself
+    // is written, but the rename cannot replace a directory (EISDIR).
+    std::fs::remove_file(&trust.state_path).unwrap();
+    std::fs::create_dir(&trust.state_path).unwrap();
+    let error = installer.install(CERT_B_PEM).await.unwrap_err();
+    let text = error.to_string();
+    assert!(text.starts_with("publish CA state: rename "), "{text}");
+    assert!(text.ends_with("state.json: is a directory"), "{text}");
+    // The failed staging file was removed; no .tmp residue is left behind.
+    let residues: Vec<_> = std::fs::read_dir(trust.state_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp"))
+        .collect();
+    assert!(residues.is_empty(), "{residues:?}");
+}
+
+#[tokio::test]
+async fn bundle_cleanup_read_failure_is_reported_with_the_go_path_error() {
+    let trust = new_trust();
+    install(&trust, &[CERT_A_PEM]).await;
+    // The persisted intent makes a fresh reconcile pending; reading the
+    // aggregate for cleanup then fails on the directory.
+    std::fs::remove_file(&trust.bundle_path).unwrap();
+    std::fs::create_dir(&trust.bundle_path).unwrap();
+    let error = installer_for(&trust).persist().await.unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.starts_with("read CA bundle for cleanup: open "),
+        "{text}"
+    );
+    assert!(text.contains("is a directory"), "{text}");
+}
+
+#[tokio::test]
+async fn a_stale_managed_entry_that_cannot_be_unlinked_fails_the_reconcile() {
+    let trust = new_trust();
+    install(&trust, &[CERT_A_PEM]).await;
+    // A managed name (64 lowercase hex) that is a non-empty directory: the
+    // removal is a real error, not the NotFound a concurrent prune produces.
+    let stale = trust.cert_dir.join(format!("e2b-{}d.crt", "0".repeat(63)));
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("child"), b"x").unwrap();
+    let error = installer_for(&trust).persist().await.unwrap_err();
+    let text = error.to_string();
+    assert!(text.starts_with("remove stale CA cert: remove "), "{text}");
+    assert!(text.contains("is a directory"), "{text}");
+    std::fs::remove_dir_all(&stale).unwrap();
+}
+
+#[tokio::test]
+async fn legacy_alias_read_failure_is_reported_with_the_go_path_error() {
+    let trust = new_trust();
+    install(&trust, &[CERT_A_PEM]).await;
+    let legacy = trust.cert_dir.join("e2b-ca.crt");
+    std::fs::create_dir(&legacy).unwrap();
+    std::fs::write(legacy.join("child"), b"x").unwrap();
+    let error = installer_for(&trust).persist().await.unwrap_err();
+    let text = error.to_string();
+    assert!(text.starts_with("read legacy CA cert: open "), "{text}");
+    assert!(text.contains("is a directory"), "{text}");
+    std::fs::remove_dir_all(&legacy).unwrap();
+}
+
+#[tokio::test]
+async fn legacy_alias_unlink_failure_is_reported_with_the_go_path_error() {
+    let trust = new_trust();
+    // Empty intent: writeCertFiles writes nothing, so the read-only cert dir
+    // only bites the legacy unlink.
+    std::fs::write(&trust.state_path, r#"{"desiredPEM":"","owned":[]}"#).unwrap();
+    std::fs::write(trust.cert_dir.join("e2b-ca.crt"), CERT_A_PEM).unwrap();
+    std::fs::set_permissions(&trust.cert_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let error = installer_for(&trust).persist().await.unwrap_err();
+    std::fs::set_permissions(&trust.cert_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = error.to_string();
+    assert!(text.starts_with("remove legacy CA cert: remove "), "{text}");
+    assert!(text.ends_with("permission denied"), "{text}");
+}
+
+#[tokio::test]
+async fn cert_source_rename_failure_is_reported_as_a_persist_error() {
+    let trust = new_trust();
+    install(&trust, &[CERT_A_PEM]).await;
+    let source = trust.cert_dir.join(format!("e2b-{CERT_A_FP}.crt"));
+    std::fs::remove_file(&source).unwrap();
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("child"), b"x").unwrap();
+    let installer = installer_for(&trust);
+    installer.install(CERT_A_PEM).await.unwrap();
+    let error = installer.persist().await.unwrap_err();
+    let text = error.to_string();
+    assert!(text.starts_with("persist CA cert: rename "), "{text}");
+    assert!(text.contains("is a directory"), "{text}");
+    std::fs::remove_dir_all(&source).unwrap();
+}
+
+#[tokio::test]
+async fn run_loop_logs_its_failure_and_keeps_polling_until_stopped() {
+    let trust = new_trust();
+    // A directory where the state file belongs makes every persist fail.
+    std::fs::create_dir(&trust.state_path).unwrap();
+    let installer = installer_for(&trust);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move { installer.run(stop_rx).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // changed() with a false value keeps the loop alive; true returns.
+    stop_tx.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    stop_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("run loop did not stop")
+        .unwrap();
 }
 
 // --- daemon integration ---

@@ -20,6 +20,7 @@ use coorworker_envd::cgroups::{
     CgroupError, Manager, PathManager, ProcessType,
     {vanished, DEFAULT_FREEZE_MAX_CGROUPS, DEFAULT_THAW_MAX_CGROUPS},
 };
+use std::os::unix::fs::PermissionsExt as _;
 use tempfile::TempDir;
 
 const INIT_PROCFILE: &str = "0::/system.slice/envd.service\n";
@@ -497,6 +498,11 @@ fn hierarchy_helpers_match_the_oracle_path_arithmetic() {
         root,
         Path::new("/sys/fs/cgroup/system.slice/other")
     ));
+    // A path outside the root, and a non-UTF-8 relative path, never match.
+    use std::os::unix::ffi::OsStrExt as _;
+    assert!(!allowlisted(root, Path::new("/other/place")));
+    let non_utf8 = std::ffi::OsStr::from_bytes(b"/sys/fs/cgroup/system.slice/\xff");
+    assert!(!allowlisted(root, Path::new(non_utf8)));
 }
 
 #[test]
@@ -1533,4 +1539,270 @@ async fn freeze_workload_hold_wraps_the_drain_refusal_like_the_handover_abort() 
     })
     .await
     .expect("lock released on refusal");
+}
+
+// --- hierarchy/audit/scan/thaw branches (coverage slice) ---
+
+#[tokio::test]
+async fn hierarchy_mode_without_a_membership_line_falls_back_to_legacy() {
+    let dir = TempDir::new().unwrap();
+    let fs = Arc::new(FakeCgroupfs::new(
+        &dir,
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    ));
+    // No 0:: line: the complement cannot be computed safely, so the sweep
+    // must fall back to the static list rather than freeze a guess.
+    std::fs::write(dir.path().join("proc"), "1:name=systemd:/old\n").unwrap();
+    let freezer = Arc::new(WorkloadFreezer::new(fs).with_proc_self_cgroup(dir.path().join("proc")));
+    let mut opts = options(Duration::from_millis(50));
+    opts.mode = FreezeMode::Hierarchy;
+    let (result, error) = freezer.freeze(opts).await;
+    assert_eq!(result.mode, FreezeMode::Legacy);
+    let error = error.expect("the fallback is reported").to_string();
+    assert!(error.contains("falling back to legacy mode"), "{error}");
+    assert_eq!(freeze_value(&dir.path().join("user")), "1");
+    assert_eq!(freeze_value(&dir.path().join("ptys")), "1");
+}
+
+#[tokio::test]
+async fn hierarchy_mode_skips_static_types_without_a_cgroup() {
+    let dir = TempDir::new().unwrap();
+    // Only the user cgroup exists: the walk's inside-set insert for a
+    // workload type with no cgroup is a no-op.
+    let fs = Arc::new(FakeCgroupfs::new(&dir, &[("user", ProcessType::User)]));
+    let freezer = make_freezer(fs, &dir);
+    let mut opts = options(Duration::from_millis(50));
+    opts.mode = FreezeMode::Hierarchy;
+    let (result, error) = freezer.freeze(opts).await;
+    assert_eq!(result.mode, FreezeMode::Hierarchy);
+    let error = error
+        .expect("the missing static cgroup is reported")
+        .to_string();
+    assert!(error.contains("freeze pty cgroup"), "{error}");
+    assert_eq!(freeze_value(&dir.path().join("user")), "1");
+}
+
+#[tokio::test]
+async fn audit_counts_every_class_bounds_samples_and_fails_without_membership() {
+    let dir = TempDir::new().unwrap();
+    let fs = Arc::new(FakeCgroupfs::new(
+        &dir,
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    ));
+    let freezer = make_freezer(fs.clone(), &dir);
+    let mut opts = options(Duration::ZERO);
+    opts.mode = FreezeMode::Hierarchy;
+    let (result, _) = freezer.freeze(opts).await;
+    assert_eq!(result.mode, FreezeMode::Hierarchy);
+
+    // One frozen non-protected cgroup (the arm that counts reach), one frozen
+    // allowlisted cgroup (a violation), and ten post-sweep cgroups left
+    // unfrozen (escaped, sampled up to eight).
+    let frozen = fs.customer("system.slice/frozen.container");
+    std::fs::write(frozen.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+    let protected = fs.customer("system.slice/rpcbind.service");
+    std::fs::write(protected.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+    for index in 0..10 {
+        fs.customer(&format!("system.slice/late{index}"));
+    }
+
+    let audit = freezer
+        .audit_frozen_set(DEFAULT_THAW_MAX_CGROUPS)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(audit.applicable);
+    assert!(audit.frozen >= 1, "{audit:?}");
+    assert!(audit.violations >= 1, "{audit:?}");
+    assert!(audit.escaped >= 10, "{audit:?}");
+    assert_eq!(audit.escaped_paths.len(), 8, "samples are bounded");
+
+    // A one-cgroup bound truncates the walk after the root.
+    let truncated = freezer.audit_frozen_set(1).await.unwrap().unwrap();
+    assert!(truncated.truncated, "{truncated:?}");
+
+    // Losing the 0:: line makes the audit decline with an error rather than
+    // classifying against a guessed chain.
+    std::fs::write(dir.path().join("proc"), "1:name=systemd:/old\n").unwrap();
+    let error = freezer
+        .audit_frozen_set(DEFAULT_THAW_MAX_CGROUPS)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.contains("locate envd cgroup for the audit"),
+        "{error}"
+    );
+}
+
+#[test]
+fn scan_bounds_the_walk_and_reports_unreadable_cgroups() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("proc"), INIT_PROCFILE).unwrap();
+    let fs = FakeCgroupfs::new(
+        &dir,
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    );
+    for name in ["a", "b", "c"] {
+        fs.customer(name);
+    }
+    let (_, truncated, errors) = scan_guest_frozen(&fs, &dir.path().join("proc"), 1);
+    assert!(truncated);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let locked = fs.customer("locked");
+    let unreadable = fs.customer("unreadable");
+    std::fs::set_permissions(
+        locked.join("cgroup.freeze"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (found, truncated, errors) =
+        scan_guest_frozen(&fs, &dir.path().join("proc"), DEFAULT_THAW_MAX_CGROUPS);
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(
+        locked.join("cgroup.freeze"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(!truncated);
+    assert!(found.is_empty(), "{found:?}");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.starts_with("read freeze state of ")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.starts_with("list children of ")),
+        "{errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn thaw_reports_read_and_list_failures_outside_the_chain() {
+    let dir = TempDir::new().unwrap();
+    let fs = Arc::new(FakeCgroupfs::new(
+        &dir,
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    ));
+    let freezer = make_freezer(fs.clone(), &dir);
+    let mut opts = options(Duration::ZERO);
+    opts.mode = FreezeMode::Hierarchy;
+    freezer.freeze(opts).await;
+
+    // Created after the sweep and frozen behind it, so the thaw walk finds a
+    // request to clear; an unreadable freeze file and an unreadable
+    // directory are the two non-vanished errors the walk must report.
+    let locked = fs.customer("locked");
+    let unreadable = fs.customer("unreadable");
+    set_freeze_request(&locked, true).unwrap();
+    set_freeze_request(&unreadable, true).unwrap();
+    std::fs::set_permissions(
+        locked.join("cgroup.freeze"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let error = freezer.unfreeze().await.unwrap_err();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(
+        locked.join("cgroup.freeze"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(error.contains("read freeze state of "), "{error}");
+    assert!(error.contains("list children of "), "{error}");
+}
+
+#[test]
+fn guest_frozen_path_accessors_decline_without_a_path_manager() {
+    let manager: Arc<dyn Manager> = Arc::new(NoopManager);
+    let freezer = WorkloadFreezer::new(manager);
+    assert!(freezer.guest_frozen_paths().is_empty());
+    freezer.set_guest_frozen_paths(&["user".to_owned()]);
+    assert!(freezer.guest_frozen_paths().is_empty());
+}
+
+#[test]
+fn freeze_mode_names_match_the_oracle_strings() {
+    assert_eq!(FreezeMode::Legacy.as_str(), "legacy");
+    assert_eq!(FreezeMode::Hierarchy.as_str(), "hierarchy");
+}
+
+#[tokio::test]
+async fn an_unreadable_events_file_surfaces_as_a_poll_failure() {
+    let dir = TempDir::new().unwrap();
+    let fs = Arc::new(FakeCgroupfs::new(
+        &dir,
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    ));
+    // A walked cgroup the sweep writes but cannot confirm: the path label and
+    // the poll-failure arm, not the static list. Its request starts at 0 so
+    // the sweep is the writer (a guest-issued request would be adopted).
+    let guest = fs.customer("system.slice/guest");
+    std::fs::set_permissions(
+        guest.join("cgroup.events"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let freezer = make_freezer(fs, &dir);
+    let mut opts = options(Duration::from_millis(50));
+    opts.mode = FreezeMode::Hierarchy;
+    let (result, error) = freezer.freeze(opts).await;
+    std::fs::set_permissions(
+        guest.join("cgroup.events"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(result.failed >= 1, "{result:?}");
+    let error = error.expect("a poll failure is reported").to_string();
+    assert!(
+        error.contains("system.slice/guest cgroup.events"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn thaw_walk_truncation_is_reported_and_not_clean() {
+    let dir = TempDir::new().unwrap();
+    let fs = Arc::new(FakeCgroupfs::new(
+        &dir,
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    ));
+    // Pretend a freeze of ours is in effect: the static settled state is the
+    // evidence the thaw uses to decide whether to walk the whole tree.
+    for relative in ["user", "ptys"] {
+        std::fs::write(
+            dir.path().join(relative).join("cgroup.events"),
+            "populated 1\nfrozen 1\n",
+        )
+        .unwrap();
+    }
+    let freezer = make_freezer(fs, &dir);
+    for index in 0..DEFAULT_THAW_MAX_CGROUPS + 8 {
+        std::fs::create_dir(dir.path().join(format!("bulk{index}"))).unwrap();
+    }
+    let error = freezer.unfreeze().await.unwrap_err();
+    assert!(error.contains("thaw walk truncated at"), "{error}");
+}
+
+#[tokio::test]
+async fn an_unreadable_static_events_file_surfaces_as_a_poll_failure() {
+    let dir = TempDir::new().unwrap();
+    let fs = Arc::new(FakeCgroupfs::new(
+        &dir,
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    ));
+    let user_events = dir.path().join("user").join("cgroup.events");
+    std::fs::set_permissions(&user_events, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let freezer = make_freezer(fs, &dir);
+    let (result, error) = freezer.freeze(options(Duration::from_millis(30))).await;
+    std::fs::set_permissions(&user_events, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(result.failed >= 1, "{result:?}");
+    let error = error.expect("a poll failure is reported").to_string();
+    assert!(error.contains("read user cgroup.events"), "{error}");
 }

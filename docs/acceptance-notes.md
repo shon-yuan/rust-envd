@@ -304,9 +304,11 @@ closed the Go-ahead modules RED-first and surfaced two real production
 defects, now fixed: terminal process-state rendering is byte-exact against
 Go's `ProcessState.String()` including the " (core dumped)" suffix
 (exec_posix.go:149-150), and the signal-name table lives once in
-`src/errno_text.rs` with `mmds/route.rs` delegating to it. Residual
-Go-ahead modules (cabundle −11.5pp, cgroups aggregate −2.2pp) are tracked
-for follow-up slices. Immutable candidate
+`src/errno_text.rs` with `mmds/route.rs` delegating to it. The Go-ahead
+cgroups aggregate was then closed by the follow-up slice below; the
+cabundle comparison remains structurally asymmetric (`der.rs` ports parts
+of Go's stdlib crypto/x509, which Go's cabundle denominator does not
+count). Immutable candidate
 `5fbd8bae80b6bc008459418c698c5a423c549f233b49efcd35c3202adc4a7174` passes
 the same seven same-hash VM gate families (standard 14-group
 `/tmp/envd-oracle-vm-zn9h4uxa`, CPU `/tmp/envd-cpus-vm-jmzfzbcg`, OOM
@@ -329,18 +331,41 @@ measured machine latency (fork/exec under load) rather than the
 deadlock-freedom property it guards (now a 30 s deadlock tripwire whose
 `listed` step also asserts pid visibility; the former 200 ms windows failed
 on machine speed alone at measured 331 ms spawn+reap under a fork storm).
-Remaining follow-ups: an analogous missing final flush in
-`daemon.rs::write_upgrade_binary` (no same-request rename, so no torn-publish
-window — a straggler write could merely still be in flight when the response
-returns), two further load-sensitive process_runtime tests observed under
-stress (`regression_deadline_retires_exited_child_with_only_pump_blocked`,
-`disconnect_keeps_child_alive_and_connect_has_no_output_replay`), two more
-pre-existing intermittent failures captured once each while verifying this
-mirror under residual load (the metadata_poll busy-wait of 100 `yield_now`s
-can exhaust before its `spawn_blocking` writer lands the file; a single
-ETXTBSY from `route_runner` whose source is undetermined — the writer there
-is synchronous, and the passing full runs in both trees bound the risk), and
-the Go-ahead cabundle and cgroups-aggregate coverage modules.
+A follow-up slice then closed every remaining flake follow-up RED-first.
+`daemon.rs::write_upgrade_binary` now `flush()`es before the caller can
+swap (same seam as `cacerts::prepare_file`; tokio reports `write_all`
+complete once the write is queued on the blocking pool — a 200-round
+`#[cfg(test)]` test was deterministically red at 64512/65536 bytes before
+the fix and 0/30 after); the metadata_poll busy-wait became a bounded
+2 s wall-clock wait on the file (under the paused test clock, 100
+`yield_now`s had no real-time bound at all; 88/720 red to 0/720); the two
+load-sensitive process_runtime tests kept every assertion and gained a
+2 s trigger deadline, 30 s deadlock tripwires, and consume-before-
+disconnect (their stress-era reds are disclosed honest negatives within
+the current load policy, not green-from-fix claims); and the route_runner
+ETXTBSY was root-caused to kernel fork fd-inheritance (a fork copies the
+fd table and O_CLOEXEC closes only at the child's own execve, so a
+sibling thread's in-flight write fd makes execve fail — fixed with a
+process-wide SPAWN_GATE serializing every fork/exec in that test binary;
+19/150 red to 0/200; production `route.rs` holds no program fd and is
+not implicated, and the analogous window beside the upgrade seam is
+annotated as parity-identical with Go's `io.Copy`). Coverage closed the
+cgroups gap past the Go oracle: global 90.69% lines (17203/18969),
+cgroups 96.70% against Go's 88.97%, cacerts 93.36% (like-for-like
+`mod.rs` 92.46%; the residual against cabundle's 97.83% is the DER
+parser, which is the stdlib x509 port outside Go's denominator), 27 new
+tests, and every disclosed uncovered arm verified genuinely uncovered
+(`days_in_month`'s `_ => 0` is proven unreachable from source). The
+suite is 677 top-level tests in 45 suites. An independent adversarial
+review returned APPROVE with four LOW findings, all adjudicated: the
++130-new-test-lines-vs-net-+129 denominator nuance and the cgroup2.rs:96
+closure-arm phrasing are folded into these notes as stated, the
+production-side fork/fd window note was added, and two legacy
+`yield_now` loops in `accepted_init_refresh_survives_http_cancel…` are
+ledgered unconverted (no observed flake, loud asserts, and the current
+Docker load policy cannot reproduce the historical reds, so a conversion
+would be unverifiable). Remaining follow-ups: the cacerts structural
+residual and those two ledgered loops.
 Guest mode enables the OOM watcher unless `--isnotfc` is supplied; development mode
 keeps it disabled. Known history is returned oldest first, up to 32 kills, while
 unknown history is omitted. A dedicated dual-VM run validated one real kernel OOM,

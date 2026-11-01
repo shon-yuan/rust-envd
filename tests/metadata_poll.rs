@@ -61,11 +61,23 @@ async fn guest_non_fc_skips_boot_but_every_successful_init_refreshes_internal_id
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     step(0).await;
     step(50).await;
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-        if dir.path().join(".E2B_TEMPLATE_ID").exists() {
-            break;
-        }
+    // The refresh updates the in-memory env BEFORE its spawn_blocking file
+    // write joins, so /envs can already serve the new ids while
+    // `.E2B_TEMPLATE_ID` is still queued on the blocking pool. A fixed yield
+    // budget measures host scheduling latency, not the write (captured red:
+    // under load the writer landed after this test's tempdir was gone, ENOENT
+    // from the writer and NotFound from the read below). Wait on the FILE with
+    // a real wall-clock bound: the runtime is time-paused, so a tokio sleep
+    // auto-advances without handing this worker to the blocking-pool thread; a
+    // real sleep parks the thread and gives the writer a scheduling slot. Two
+    // seconds is a deadlock tripwire, not a latency measurement.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !dir.path().join(".E2B_TEMPLATE_ID").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a successful init refresh never wrote .E2B_TEMPLATE_ID"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
     let values = envs(router.clone(), None).await;
     assert_eq!(values["E2B_SANDBOX_ID"], "sandbox");

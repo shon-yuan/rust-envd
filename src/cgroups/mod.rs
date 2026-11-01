@@ -177,3 +177,62 @@ pub mod noop;
 pub mod spawn;
 
 pub use freeze::FreezeMode;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_type_names_match_the_oracle_strings() {
+        for (process_type, name) in [
+            (ProcessType::Pty, "pty"),
+            (ProcessType::User, "user"),
+            (ProcessType::Socat, "socat"),
+            (ProcessType::System, "system"),
+        ] {
+            assert_eq!(process_type.as_str(), name);
+            assert_eq!(process_type.to_string(), name);
+        }
+    }
+
+    /// The pre-exec placement opens `cgroup.procs` relative to the caller's
+    /// directory fd and writes the one-byte task id. A plain directory fd
+    /// stands in for the cgroup directory the guest main holds.
+    #[test]
+    fn place_into_cgroup_writes_zero_into_the_relative_cgroup_procs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let procs = dir.path().join("cgroup.procs");
+        std::fs::write(&procs, b"").unwrap();
+        let cgroup_fd = nix::fcntl::open(
+            dir.path(),
+            nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY,
+            nix::sys::stat::Mode::empty(),
+        )
+        .unwrap();
+        place_into_cgroup(cgroup_fd).unwrap();
+        assert_eq!(std::fs::read_to_string(&procs).unwrap(), "0");
+        nix::unistd::close(cgroup_fd).unwrap();
+    }
+
+    #[test]
+    fn place_into_cgroup_reports_open_failures_before_writing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cgroup_fd = nix::fcntl::open(
+            dir.path(),
+            nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY,
+            nix::sys::stat::Mode::empty(),
+        )
+        .unwrap();
+        // No cgroup.procs in the directory: ENOENT from openat.
+        let error = place_into_cgroup(cgroup_fd).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::ENOENT));
+        // A directory named cgroup.procs cannot be opened O_WRONLY: EISDIR.
+        std::fs::create_dir(dir.path().join("cgroup.procs")).unwrap();
+        let error = place_into_cgroup(cgroup_fd).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EISDIR));
+        nix::unistd::close(cgroup_fd).unwrap();
+        // An invalid directory descriptor fails at openat, never at write.
+        let error = place_into_cgroup(-1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EBADF));
+    }
+}

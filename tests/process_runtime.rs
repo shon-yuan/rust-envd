@@ -179,19 +179,43 @@ async fn disconnect_keeps_child_alive_and_connect_has_no_output_replay() {
         .await
         .unwrap();
     let pid = start_pid(&mut original).await;
-    drop(original);
     let selector = pid_selector(pid);
+    // Consume "old" on the first observer BEFORE disconnecting, so "already
+    // delivered, must not be replayed" is a deterministic premise rather than
+    // a race against a wall clock. The former 40 ms sleep waited for cat's
+    // echo to reach the pump and be discarded; when that window lapsed (a
+    // loaded machine — stress-observed 4/30) the echo instead landed on the
+    // next attach and the output was "oldnew".
     rt.send_input(
         &selector,
         &serde_json::from_value(json!({"stdin":"b2xk"})).unwrap(),
     )
     .await
     .unwrap();
-    // Reading via a second write ensures attachment sees future data; no snapshots.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match original.recv().await.unwrap().event.unwrap() {
+                process_event::Event::Data(data) => match data.output.unwrap() {
+                    process_event::data_event::Output::Stdout(bytes) => {
+                        assert_eq!(bytes, b"old");
+                        break;
+                    }
+                    // The spawn wrapper's `nice` diagnostic lands on stderr
+                    // when this test process carries a positive niceness.
+                    process_event::data_event::Output::Stderr(_) => {}
+                    other => panic!("unexpected output: {other:?}"),
+                },
+                event => panic!("expected the echoed input, got {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the child never echoed the first write");
+    drop(original);
     assert_eq!(rt.list().await.len(), 1);
     let mut attached = rt.connect(&selector).await.unwrap();
     assert_eq!(start_pid(&mut attached).await, pid);
+    // Reading via a second write ensures attachment sees future data; no snapshots.
     rt.send_input(
         &selector,
         &serde_json::from_value(json!({"stdin":"bmV3"})).unwrap(),
@@ -625,21 +649,39 @@ async fn regression_deadline_retires_exited_child_with_only_pump_blocked() {
     let mut slow = rt
         .start(
             request("/usr/bin/head", &["-c", "262144", "/dev/zero"]),
-            Some(Duration::from_millis(120)),
+            Some(Duration::from_secs(2)),
         )
         .await
         .unwrap();
     let pid = start_pid(&mut slow).await;
-    tokio::time::timeout(Duration::from_millis(800), async {
+    // The guarded property is that an EXITED child is retired while the pump
+    // is wedged on the unread subscriber, and that its retained exit (code 0,
+    // nothing replayed) is served to connect. The execution deadline is only
+    // the retirement trigger, so it must not preempt the child's own exit:
+    // with the former 120 ms value a loaded machine could still be in
+    // fork/exec when it fired, SIGKILLing head and recording exit-code -1
+    // instead of 0 (the stress-observed failure; a 1 ms deadline reproduces
+    // it deterministically). Two seconds is orders of magnitude above
+    // fork/exec plus a 256 KiB pipe at any plausible host speed. The bounds
+    // below are deadlock tripwires, not latency measurements: a broken
+    // implementation blocks forever, so any finite bound fails it, while a
+    // healthy one passes at any speed.
+    let wedge = Duration::from_secs(30);
+    tokio::time::timeout(wedge, async {
         while rt.list().await.iter().any(|info| info.pid == pid) {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("completed readers were polled again while retiring a blocked pump");
-    let mut retained = rt.connect(&pid_selector(pid)).await.unwrap();
+    let mut retained = tokio::time::timeout(wedge, rt.connect(&pid_selector(pid)))
+        .await
+        .expect("connect wedged while the pump was blocked")
+        .unwrap();
     assert_eq!(start_pid(&mut retained).await, pid);
-    let (out, err, end) = finish(&mut retained).await;
+    let (out, err, end) = tokio::time::timeout(wedge, finish(&mut retained))
+        .await
+        .expect("retained exit wedged behind the blocked pump");
     assert!(out.is_empty() && err.is_empty());
     assert_eq!(end.exit_code, 0);
     assert!(end.exited);

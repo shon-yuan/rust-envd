@@ -1026,3 +1026,41 @@ async fn a_disconnected_fsthaw_still_thaws_the_rootfs() {
         "a disconnected /fsthaw must still thaw the rootfs (oracle api/fsfreeze.go:55 WithoutCancel)"
     );
 }
+
+/// The documented-hidden fake's full Manager/PathManager contract. The /freeze
+/// handlers only exercise part of it; the remaining arms are the ones a
+/// mistaken UnknownProcessType or a swallowed path-write error would hide.
+#[test]
+fn fake_manager_covers_its_full_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = FakeCgroupfs::new(dir.path(), &[("user", ProcessType::User)]);
+    let customer = fs.customer("guest");
+    assert!(customer.is_dir());
+    assert!(customer.join("cgroup.freeze").is_file());
+
+    for error in [
+        fs.freeze(ProcessType::Pty).unwrap_err(),
+        fs.unfreeze(ProcessType::Pty).unwrap_err(),
+        fs.frozen(ProcessType::Pty).unwrap_err(),
+    ] {
+        assert!(
+            matches!(error, CgroupError::UnknownProcessType(ProcessType::Pty)),
+            "{error:?}"
+        );
+    }
+    assert!(fs.close().is_ok());
+
+    let paths = fs.as_path_manager().expect("fake is a walker");
+    assert_eq!(paths.root(), dir.path());
+    assert_eq!(
+        paths.path_of(ProcessType::User),
+        Some(dir.path().join("user"))
+    );
+    assert_eq!(paths.path_of(ProcessType::Socat), None);
+    assert!(paths.children_of(dir.path()).unwrap().contains(&customer));
+    paths.freeze_at(&customer).unwrap();
+    assert!(paths.freeze_requested_at(&customer).unwrap());
+    assert!(!paths.frozen_at(&customer).unwrap());
+    paths.unfreeze_at(&customer).unwrap();
+    assert!(!paths.freeze_requested_at(&customer).unwrap());
+}

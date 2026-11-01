@@ -19,6 +19,29 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Serializes every fork/exec in this binary.
+///
+/// Linux copies the parent's descriptor table into a fork child and closes
+/// O_CLOEXEC descriptors only at that child's own execve. A thread that writes
+/// a fixture and then execs it therefore races any other thread's in-flight
+/// spawn: the other child can still hold the writer's descriptor, and the
+/// writer's execve fails with ETXTBSY ("text file busy") instead of reaching
+/// the loader. The race reproduces with `std::fs::write` + `std::process`
+/// alone across four threads and needs no envd code (kernel/fs behavior; Go's
+/// forkAndExecInChild inherits O_CLOEXEC descriptors the same way). Holding
+/// this gate across each run makes fork events exclusive: a run's child has
+/// always completed its own execve before the gate is released, so no
+/// inherited write descriptor can survive into the next exec.
+static SPAWN_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn run_gated(
+    runner: &ProcessRunner,
+    args: Vec<String>,
+) -> std::io::Result<coorworker_envd::mmds::CommandOutput> {
+    let _gate = SPAWN_GATE.lock().await;
+    runner.run(args).await
+}
+
 fn tempdir() -> PathBuf {
     tempfile::tempdir().unwrap().keep()
 }
@@ -90,9 +113,11 @@ async fn path_lookup_semantics_match_go_look_path() {
     {
         let fixture = PathFixture::with_directory();
         fixture.set_path_to_directory();
-        let outcome = ProcessRunner::with_program("no-such-iptables-xyz")
-            .run(vec!["-w".into(), "5".into()])
-            .await;
+        let outcome = run_gated(
+            &ProcessRunner::with_program("no-such-iptables-xyz"),
+            vec!["-w".into(), "5".into()],
+        )
+        .await;
         assert_eq!(
             outcome.unwrap_err().to_string(),
             "exec: \"no-such-iptables-xyz\": executable file not found in $PATH"
@@ -108,9 +133,11 @@ async fn path_lookup_semantics_match_go_look_path() {
             "unset" => std::env::remove_var("PATH"),
             _ => unreachable!(),
         }
-        let outcome = ProcessRunner::with_program("no-such-iptables-xyz")
-            .run(vec!["-t".into(), "nat".into()])
-            .await;
+        let outcome = run_gated(
+            &ProcessRunner::with_program("no-such-iptables-xyz"),
+            vec!["-t".into(), "nat".into()],
+        )
+        .await;
         assert_eq!(
             outcome.unwrap_err().to_string(),
             "exec: \"no-such-iptables-xyz\": executable file not found in $PATH",
@@ -142,9 +169,7 @@ async fn path_lookup_semantics_match_go_look_path() {
             plain_directory.display(),
             pick_directory.display()
         ));
-        let outcome = ProcessRunner::with_program("pick-pgm2")
-            .run(Vec::new())
-            .await;
+        let outcome = run_gated(&ProcessRunner::with_program("pick-pgm2"), Vec::new()).await;
         let output = outcome.unwrap();
         assert!(output.success, "{output:?}");
         assert_eq!(
@@ -167,9 +192,11 @@ async fn path_lookup_semantics_match_go_look_path() {
             0o755,
         );
         fixture.set_path(&format!(":{}", pick_directory.display()));
-        let outcome = ProcessRunner::with_program("empty-entry-pgm-xyz")
-            .run(Vec::new())
-            .await;
+        let outcome = run_gated(
+            &ProcessRunner::with_program("empty-entry-pgm-xyz"),
+            Vec::new(),
+        )
+        .await;
         let output = outcome.unwrap();
         assert!(output.success, "{output:?}");
         assert_eq!(
@@ -184,7 +211,7 @@ async fn path_lookup_semantics_match_go_look_path() {
         let fixture = PathFixture::with_cwd_directory("route-runner-reldir-fixture");
         write_script(&fixture.path(), "rel-pgm", "#!/bin/sh\nexit 0\n", 0o755);
         fixture.set_path("route-runner-reldir-fixture");
-        let outcome = ProcessRunner::with_program("rel-pgm").run(Vec::new()).await;
+        let outcome = run_gated(&ProcessRunner::with_program("rel-pgm"), Vec::new()).await;
         assert_eq!(
             outcome.unwrap_err().to_string(),
             "exec: \"rel-pgm\": cannot run executable found relative to current directory"
@@ -197,9 +224,7 @@ async fn path_lookup_semantics_match_go_look_path() {
         let fixture = PathFixture::with_directory();
         let program = write_script(&fixture.path(), "dirty-pgm", "garbage\n", 0o755);
         fixture.set_path(&format!("{}/./", fixture.path().display()));
-        let outcome = ProcessRunner::with_program("dirty-pgm")
-            .run(Vec::new())
-            .await;
+        let outcome = run_gated(&ProcessRunner::with_program("dirty-pgm"), Vec::new()).await;
         assert_eq!(
             outcome.unwrap_err().to_string(),
             format!("fork/exec {}: exec format error", program.display())
@@ -209,9 +234,11 @@ async fn path_lookup_semantics_match_go_look_path() {
 
 #[tokio::test]
 async fn slash_program_missing_reports_stat_path_error_text() {
-    let outcome = ProcessRunner::with_program("/route-runner-no-such-dir-xyz/pgm")
-        .run(Vec::new())
-        .await;
+    let outcome = run_gated(
+        &ProcessRunner::with_program("/route-runner-no-such-dir-xyz/pgm"),
+        Vec::new(),
+    )
+    .await;
     assert_eq!(
         outcome.unwrap_err().to_string(),
         "exec: \"/route-runner-no-such-dir-xyz/pgm\": \
@@ -222,9 +249,11 @@ async fn slash_program_missing_reports_stat_path_error_text() {
 #[tokio::test]
 async fn slash_program_directory_reports_is_a_directory() {
     let dir = tempdir();
-    let outcome = ProcessRunner::with_program(dir.display().to_string())
-        .run(Vec::new())
-        .await;
+    let outcome = run_gated(
+        &ProcessRunner::with_program(dir.display().to_string()),
+        Vec::new(),
+    )
+    .await;
     assert_eq!(
         outcome.unwrap_err().to_string(),
         format!("exec: \"{}\": is a directory", dir.display())
@@ -235,9 +264,11 @@ async fn slash_program_directory_reports_is_a_directory() {
 async fn slash_program_non_executable_reports_permission_denied() {
     let dir = tempdir();
     let file = write_script(&dir, "plain-pgm", "data\n", 0o644);
-    let outcome = ProcessRunner::with_program(file.display().to_string())
-        .run(Vec::new())
-        .await;
+    let outcome = run_gated(
+        &ProcessRunner::with_program(file.display().to_string()),
+        Vec::new(),
+    )
+    .await;
     assert_eq!(
         outcome.unwrap_err().to_string(),
         format!("exec: \"{}\": permission denied", file.display())
@@ -248,9 +279,11 @@ async fn slash_program_non_executable_reports_permission_denied() {
 async fn executable_but_invalid_format_reports_fork_exec_exec_format_error() {
     let dir = tempdir();
     let file = write_script(&dir, "garbage-pgm", "not a valid binary\n", 0o755);
-    let outcome = ProcessRunner::with_program(file.display().to_string())
-        .run(Vec::new())
-        .await;
+    let outcome = run_gated(
+        &ProcessRunner::with_program(file.display().to_string()),
+        Vec::new(),
+    )
+    .await;
     assert_eq!(
         outcome.unwrap_err().to_string(),
         format!("fork/exec {}: exec format error", file.display())
@@ -263,9 +296,11 @@ async fn signal_death_reports_go_signal_name() {
         ("kill -9 $$", "signal: killed"),
         ("kill -15 $$", "signal: terminated"),
     ] {
-        let outcome = ProcessRunner::with_program("/bin/sh")
-            .run(vec!["-c".into(), self_kill.into()])
-            .await;
+        let outcome = run_gated(
+            &ProcessRunner::with_program("/bin/sh"),
+            vec!["-c".into(), self_kill.into()],
+        )
+        .await;
         let output = outcome.unwrap();
         assert!(!output.success, "{output:?}");
         assert_eq!(output.error, expected, "script: {self_kill}");
@@ -274,9 +309,11 @@ async fn signal_death_reports_go_signal_name() {
 
 #[tokio::test]
 async fn exit_status_and_combined_output_preserve_write_order() {
-    let outcome = ProcessRunner::with_program("/bin/sh")
-        .run(vec!["-c".into(), "echo out; echo err >&2; exit 7".into()])
-        .await;
+    let outcome = run_gated(
+        &ProcessRunner::with_program("/bin/sh"),
+        vec!["-c".into(), "echo out; echo err >&2; exit 7".into()],
+    )
+    .await;
     let output = outcome.unwrap();
     assert!(!output.success);
     // Go's CombinedOutput interleaves on one shared pipe, and its ExitError
@@ -287,9 +324,11 @@ async fn exit_status_and_combined_output_preserve_write_order() {
 
 #[tokio::test]
 async fn success_reports_success() {
-    let outcome = ProcessRunner::with_program("/bin/sh")
-        .run(vec!["-c".into(), "printf ok".into()])
-        .await;
+    let outcome = run_gated(
+        &ProcessRunner::with_program("/bin/sh"),
+        vec!["-c".into(), "printf ok".into()],
+    )
+    .await;
     let output = outcome.unwrap();
     assert!(output.success);
     assert_eq!(String::from_utf8_lossy(&output.output), "ok");
@@ -327,7 +366,7 @@ async fn dropping_the_run_future_kills_the_child() {
     }
 
     let runner = ProcessRunner::with_program(probe.display().to_string());
-    let task = tokio::spawn(async move { runner.run(vec!["30".into()]).await });
+    let task = tokio::spawn(async move { run_gated(&runner, vec!["30".into()]).await });
     let started = Instant::now();
     while probe_processes(&probe) == 0 {
         assert!(

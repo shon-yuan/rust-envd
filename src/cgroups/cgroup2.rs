@@ -263,6 +263,115 @@ impl Cgroup2Manager {
 mod tests {
     use super::*;
     use std::os::unix::io::IntoRawFd;
+    use std::sync::Mutex;
+
+    /// The v2 manager's downstream contract over an injected tree. `new` is
+    /// the only constructor that touches a cgroup2 mount (and the statfs gate
+    /// is pinned separately), so the field table is filled directly here: the
+    /// methods under test are the same ones the guest main drives, and every
+    /// path operation is real filesystem work.
+    #[test]
+    fn manager_contract_runs_over_an_injected_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let user = dir.path().join("user");
+        let ptys = dir.path().join("ptys");
+        for path in [&user, &ptys] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("cgroup.freeze"), "0\n").unwrap();
+            std::fs::write(path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        }
+        let manager = Cgroup2Manager {
+            fds: Mutex::new(HashMap::new()),
+            paths: HashMap::from([
+                (ProcessType::User, user.clone()),
+                (ProcessType::Pty, ptys.clone()),
+            ]),
+            root: dir.path().to_path_buf(),
+        };
+        assert_eq!(manager.get_file_descriptor(ProcessType::User), None);
+        manager.freeze(ProcessType::User).unwrap();
+        assert!(freeze_requested(&user).unwrap());
+        manager.unfreeze(ProcessType::User).unwrap();
+        assert!(!freeze_requested(&user).unwrap());
+        assert!(!manager.frozen(ProcessType::User).unwrap());
+        std::fs::write(user.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        assert!(manager.frozen(ProcessType::User).unwrap());
+        for error in [
+            manager.freeze(ProcessType::Socat).unwrap_err(),
+            manager.unfreeze(ProcessType::Socat).unwrap_err(),
+            manager.frozen(ProcessType::Socat).unwrap_err(),
+        ] {
+            assert!(
+                matches!(error, CgroupError::UnknownProcessType(ProcessType::Socat)),
+                "{error:?}"
+            );
+        }
+        assert!(manager.close().is_ok());
+        assert!(manager.close().is_ok());
+
+        let paths = manager.as_path_manager().expect("v2 manager is a walker");
+        assert_eq!(paths.root(), dir.path());
+        assert_eq!(paths.path_of(ProcessType::User), Some(user.clone()));
+        assert_eq!(paths.path_of(ProcessType::Socat), None);
+        let mut children: Vec<String> = paths
+            .children_of(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        children.sort();
+        assert_eq!(children, ["ptys", "user"]);
+        paths.freeze_at(&user).unwrap();
+        assert!(paths.freeze_requested_at(&user).unwrap());
+        std::fs::write(user.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        assert!(paths.frozen_at(&user).unwrap());
+        paths.unfreeze_at(&user).unwrap();
+        assert!(!paths.freeze_requested_at(&user).unwrap());
+
+        // IO failures surface unchanged through every path method.
+        let missing = dir.path().join("gone");
+        assert!(paths.children_of(&missing).is_err());
+        assert!(paths.freeze_at(&missing).is_err());
+        assert!(paths.unfreeze_at(&missing).is_err());
+        assert!(paths.frozen_at(&missing).is_err());
+        assert!(paths.freeze_requested_at(&missing).is_err());
+    }
+
+    #[test]
+    fn close_drains_live_descriptors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fd = std::fs::File::create(dir.path().join("cgroup"))
+            .unwrap()
+            .into_raw_fd();
+        let manager = Cgroup2Manager {
+            fds: Mutex::new(HashMap::from([(ProcessType::User, fd)])),
+            paths: HashMap::new(),
+            root: dir.path().to_path_buf(),
+        };
+        assert_eq!(manager.get_file_descriptor(ProcessType::User), Some(fd));
+        manager.close().unwrap();
+        assert_eq!(manager.get_file_descriptor(ProcessType::User), None);
+        manager.close().unwrap();
+    }
+
+    /// A root that cannot even be statfs'd fails before any cgroup work.
+    #[test]
+    fn new_reports_a_statfs_failure_before_touching_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("no-such-root");
+        let error = Cgroup2Manager::new(Cgroup2Options {
+            root: Some(missing.clone()),
+            entries: vec![Cgroup2Entry {
+                process_type: ProcessType::User,
+                relative_path: "user".into(),
+                properties: Vec::new(),
+            }],
+        })
+        .err()
+        .expect("a missing root cannot be statfs'd");
+        assert!(error.contains("failed to statfs cgroup root"), "{error}");
+        assert!(!dir.path().join("no-such-root/user").exists());
+    }
 
     #[test]
     fn close_is_idempotent_like_gos_map_delete() {
