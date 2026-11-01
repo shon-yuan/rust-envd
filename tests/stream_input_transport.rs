@@ -510,3 +510,58 @@ async fn gzip_remains_supported_for_messages_and_terminal_frames() {
         vec![(0, json!({})), (2, json!({}))]
     );
 }
+
+/// Go encoding/json unmarshals the end-stream body into
+/// connect.endStreamMessage: top-level non-objects report the Go
+/// "cannot unmarshal ... into Go value of type" wording, while null is a
+/// no-op and null members inside the struct are ignored.
+#[tokio::test]
+async fn terminal_non_object_bodies_and_null_members_use_go_unmarshal_rules() {
+    for (payload, kind) in [
+        ("[]", "array"),
+        (r#""text""#, "string"),
+        ("true", "bool"),
+        ("42", "number"),
+        ("-1", "number"),
+        ("1.5", "number"),
+    ] {
+        assert_eq!(
+            request(Body::from(frame(2, payload.as_bytes())), "json", false).await,
+            error(
+                "internal",
+                &format!(
+                    "unmarshal end stream message: json: cannot unmarshal {kind} into Go value of type connect.connectEndStreamMessage"
+                )
+            ),
+            "{payload}"
+        );
+    }
+    // A nested array where the element must be a string reports the element
+    // mismatch, exactly as encoding/json does for map[string][]string.
+    assert_eq!(
+        request(
+            Body::from(frame(2, br#"{"metadata":{"x":["a",[]]}}"#)),
+            "json",
+            false
+        )
+        .await,
+        error(
+            "internal",
+            "unmarshal end stream message: json: cannot unmarshal array into Go struct field connectEndStreamMessage.metadata of type string"
+        )
+    );
+    // null bodies and null members are accepted: the stream completes with
+    // the empty response message and a clean end-stream frame.
+    let clean_end = vec![(0, json!({})), (2, json!({}))];
+    for payload in [
+        b"null".as_slice(),
+        br#"{"metadata":{"x":null},"error":{"code":"c","details":[null]}}"#,
+    ] {
+        assert_eq!(
+            request(Body::from(frame(2, payload)), "json", false).await,
+            clean_end,
+            "{}",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}

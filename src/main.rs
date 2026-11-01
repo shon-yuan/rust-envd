@@ -1239,6 +1239,35 @@ mod tests {
         assert_eq!(PORT_SCANNER_INTERVAL, std::time::Duration::from_secs(1));
     }
 
+    /// Go main.go:534-536: only a non-empty --cgroup-root reaches the manager.
+    #[test]
+    fn cgroup_root_option_is_appended_only_when_set() {
+        assert_eq!(cgroup2_root(""), None);
+        assert_eq!(
+            cgroup2_root("/tmp/cgroup2"),
+            Some(std::path::PathBuf::from("/tmp/cgroup2"))
+        );
+    }
+
+    /// Go host.GetMetrics reads MemTotal from /proc/meminfo and reports bytes
+    /// (host/metrics.go), so the value must match the host's kB figure.
+    #[test]
+    fn mem_total_bytes_matches_proc_meminfo() {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+        let expected: u64 = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))
+            .expect("MemTotal in /proc/meminfo")
+            .trim()
+            .trim_end_matches(" kB")
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+            * 1024;
+        assert_eq!(mem_total_bytes(), Some(expected));
+        assert!(expected > 0);
+    }
+
     /// Go main.go:344-360: a guest daemon wires the scanner and forwarder and
     /// starts both tasks (the build can forward, so Forwards() is true); a
     /// development daemon gets the oracle's own "unavailable" forwarder and

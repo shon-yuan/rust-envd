@@ -257,3 +257,140 @@ async fn exact_legacy_user_agent_converts_json_and_protobuf_without_extra_entry_
         )
     );
 }
+
+/// Oracle conversion.go:103-127 (conversion_test.go:245-274): watcher responses
+/// convert CreateWatcher/GetWatcherEvents payloads, keep the keepalive arm,
+/// and pass RemoveWatcher through while still marking the response.
+#[tokio::test]
+async fn legacy_watcher_payloads_convert_and_remove_passes_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = nix::unistd::User::from_uid(nix::unistd::geteuid())
+        .unwrap()
+        .unwrap();
+    let router = app_with_filesystem(Arc::new(Daemon::new()));
+    let init = router
+        .clone()
+        .oneshot(
+            Request::post("/init")
+                .body(Body::from(json!({"defaultUser":user.name}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(init.status(), 204);
+
+    let response = request(
+        &router,
+        "CreateWatcher",
+        json!({"path":dir.path(),"includeEntry":true}),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-e2b-legacy-sdk"], "true");
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    let watcher = created["watcherId"].as_str().unwrap().to_owned();
+
+    std::fs::write(dir.path().join("new-file"), b"data").unwrap();
+
+    let mut events = Vec::new();
+    for _ in 0..60 {
+        let response = request(
+            &router,
+            "GetWatcherEvents",
+            json!({"watcherId":watcher}),
+            true,
+            false,
+        )
+        .await;
+        assert_eq!(response.headers()["x-e2b-legacy-sdk"], "true");
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        events = value["events"].as_array().cloned().unwrap_or_default();
+        if !events.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!events.is_empty(), "watcher never observed the new file");
+    // Legacy FilesystemEvent carries only name and type (conversion.go:120-127).
+    let event = events[0].as_object().unwrap();
+    assert_eq!(
+        event.len(),
+        2,
+        "legacy event leaked modern fields: {event:?}"
+    );
+    assert!(event.contains_key("name"));
+    assert!(event.contains_key("type"));
+
+    // Modern watchers keep the entry that includeEntry asked for.
+    let response = request(
+        &router,
+        "CreateWatcher",
+        json!({"path":dir.path(),"includeEntry":true}),
+        false,
+        false,
+    )
+    .await;
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    let mut watcher = created["watcherId"].as_str().unwrap().to_owned();
+    std::fs::write(dir.path().join("modern-file"), b"data").unwrap();
+    let mut modern = Vec::new();
+    for _ in 0..60 {
+        let response = request(
+            &router,
+            "GetWatcherEvents",
+            json!({"watcherId":watcher}),
+            false,
+            false,
+        )
+        .await;
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        modern = value["events"].as_array().cloned().unwrap_or_default();
+        if !modern.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!modern.is_empty());
+    assert!(
+        modern[0].as_object().unwrap().contains_key("entry"),
+        "modern watcher dropped includeEntry: {:?}",
+        modern[0]
+    );
+
+    for legacy in [true, false] {
+        if !legacy {
+            // Each watcher can only be removed once; create a fresh one.
+            let response = request(
+                &router,
+                "CreateWatcher",
+                json!({"path":dir.path()}),
+                false,
+                false,
+            )
+            .await;
+            let created: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            watcher = created["watcherId"].as_str().unwrap().to_owned();
+        }
+        let response = request(
+            &router,
+            "RemoveWatcher",
+            json!({"watcherId":watcher}),
+            legacy,
+            false,
+        )
+        .await;
+        assert_eq!(response.headers().contains_key("x-e2b-legacy-sdk"), legacy);
+        assert_eq!(response.status(), 200);
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(value, json!({}));
+    }
+}

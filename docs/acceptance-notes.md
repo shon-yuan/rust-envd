@@ -292,6 +292,37 @@ seven same-hash VM gate families (standard 14-group
 three times, guest probes `/tmp/envd-guestprobe-vm-5ody7tny` twice) pinning
 126 crate inputs; the full suite is 626 top-level tests in 45 suites with
 strict all-target Clippy clean.
+A coverage-parity slice then met the requirement that Rust coverage reach or
+exceed the original Go envd. Under a like-for-like convention on both sides
+(implementation lines, generated code excluded, `main.rs` included), Rust
+measures 89.29–89.30% lines (±1 load-sensitive line in cpus/manager.rs),
+88.03% regions and 85.81% functions against a fair 72.91% for the Go oracle
+(bounds 70.24–73.90%: the root package cannot run offline because
+kin-openapi v0.152.0 is absent from the module cache; raw 50.98%; two
+bindfs-failing filesystem tests disclosed). Twenty-one new test functions
+closed the Go-ahead modules RED-first and surfaced two real production
+defects, now fixed: terminal process-state rendering is byte-exact against
+Go's `ProcessState.String()` including the " (core dumped)" suffix
+(exec_posix.go:149-150), and the signal-name table lives once in
+`src/errno_text.rs` with `mmds/route.rs` delegating to it. Residual
+Go-ahead modules (cabundle −11.5pp, cgroups aggregate −2.2pp) are tracked
+for follow-up slices. Immutable candidate
+`5fbd8bae80b6bc008459418c698c5a423c549f233b49efcd35c3202adc4a7174` passes
+the same seven same-hash VM gate families (standard 14-group
+`/tmp/envd-oracle-vm-zn9h4uxa`, CPU `/tmp/envd-cpus-vm-jmzfzbcg`, OOM
+`/tmp/envd-oom-vm-2gawene4`, MMDS `/tmp/envd-mmds-vm-3t6j4l7g`, expanded
+`/tmp/envd-oracle-vm-dwzk41zr` twice, freeze `/tmp/envd-freeze-vm-tf44t8xg`
+three times, guest probes `/tmp/envd-guestprobe-vm-jfwf7jp2` twice); the
+full suite is 650 top-level tests in 45 suites. An external rewrite of the
+host `/etc` group database on 2026-11-01 dropped unnamed gid 950, so this
+checkpoint's totals were "measured under a disclosed test-harness-only
+getgroups LD_PRELOAD shim necessitated by the external /etc rewrite; changes
+no assertions; suite passes identically without it once the group db is
+restored or the session runs 950-free" (the oracle fails identically under
+the same condition, so this is not a parity defect). Remaining follow-ups: a
+root-cause slice for two known flakes (cacerts restart repair-path race,
+~1-in-7; process_runtime slow-observer 200 ms windows under load) plus the
+Go-ahead cabundle and cgroups-aggregate coverage modules.
 Guest mode enables the OOM watcher unless `--isnotfc` is supplied; development mode
 keeps it disabled. Known history is returned oldest first, up to 32 kills, while
 unknown history is omitted. A dedicated dual-VM run validated one real kernel OOM,

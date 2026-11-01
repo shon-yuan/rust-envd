@@ -117,44 +117,12 @@ fn go_errno_text(errno: i32) -> Option<&'static str> {
     })
 }
 
-/// Go `syscall.Signal.String()` descriptions (sigtable), lowercase without
-/// the SIG prefix; unknown numbers render as `signal N`.
+/// Go `syscall.Signal.String()` with the "signal: " prefix Go's exec/ProcessState
+/// rendering adds. The sigtable and its "signal N" fallback live once, in
+/// [`crate::errno_text::signal_description`] (shared with the process runtime and
+/// the cpu helper path).
 fn go_signal_name(signal: i32) -> String {
-    let name = match signal {
-        1 => "hangup",
-        2 => "interrupt",
-        3 => "quit",
-        4 => "illegal instruction",
-        5 => "trace/breakpoint trap",
-        6 => "aborted",
-        7 => "bus error",
-        8 => "floating point exception",
-        9 => "killed",
-        10 => "user defined signal 1",
-        11 => "segmentation fault",
-        12 => "user defined signal 2",
-        13 => "broken pipe",
-        14 => "alarm clock",
-        15 => "terminated",
-        16 => "stack fault",
-        17 => "child exited",
-        18 => "continued",
-        19 => "stopped (signal)",
-        20 => "stopped",
-        21 => "stopped (tty input)",
-        22 => "stopped (tty output)",
-        23 => "urgent I/O condition",
-        24 => "CPU time limit exceeded",
-        25 => "file size limit exceeded",
-        26 => "virtual timer expired",
-        27 => "profiling timer expired",
-        28 => "window changed",
-        29 => "I/O possible",
-        30 => "power failure",
-        31 => "bad system call",
-        _ => return format!("signal {signal}"),
-    };
-    format!("signal: {name}")
+    format!("signal: {}", crate::errno_text::signal_description(signal))
 }
 
 /// Why `findExecutable` refused a candidate. `Os` carries either a raw errno
@@ -399,5 +367,135 @@ impl RoutePin for IptablesRoute {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Go `syscall.Errno.Error()` (zerrors_linux_amd64 errorList): lowercase
+    /// text without the errno name, exactly as `os/exec` surfaces it.
+    #[test]
+    fn errno_text_table_matches_go() {
+        let table: &[(i32, &str)] = &[
+            (1, "operation not permitted"),
+            (2, "no such file or directory"),
+            (3, "no such process"),
+            (4, "interrupted system call"),
+            (5, "input/output error"),
+            (6, "no such device or address"),
+            (7, "argument list too long"),
+            (8, "exec format error"),
+            (9, "bad file descriptor"),
+            (10, "no child processes"),
+            (11, "resource temporarily unavailable"),
+            (12, "cannot allocate memory"),
+            (13, "permission denied"),
+            (14, "bad address"),
+            (15, "block device required"),
+            (16, "device or resource busy"),
+            (17, "file exists"),
+            (18, "invalid cross-device link"),
+            (19, "no such device"),
+            (20, "not a directory"),
+            (21, "is a directory"),
+            (22, "invalid argument"),
+            (23, "too many open files in system"),
+            (24, "too many open files"),
+            (25, "inappropriate ioctl for device"),
+            (26, "text file busy"),
+            (27, "file too large"),
+            (28, "no space left on device"),
+            (29, "illegal seek"),
+            (30, "read-only file system"),
+            (31, "too many links"),
+            (32, "broken pipe"),
+            (33, "numerical argument out of domain"),
+            (34, "numerical result out of range"),
+            (35, "resource deadlock avoided"),
+            (36, "file name too long"),
+            (37, "no locks available"),
+            (38, "function not implemented"),
+            (39, "directory not empty"),
+            (40, "too many levels of symbolic links"),
+        ];
+        for (errno, expected) in table {
+            assert_eq!(go_errno_text(*errno), Some(*expected), "errno {errno}");
+        }
+        // Outside the table Go still has text (via its fallback), but this
+        // module deliberately covers only the exec-observable 1..40 range.
+        assert_eq!(go_errno_text(41), None);
+        assert_eq!(go_errno_text(133), None);
+    }
+
+    /// Go `syscall.Signal.String()` with the "signal: " prefix Go's
+    /// ProcessState.String() adds.
+    #[test]
+    fn signal_name_table_matches_go() {
+        let table: &[(i32, &str)] = &[
+            (1, "signal: hangup"),
+            (2, "signal: interrupt"),
+            (3, "signal: quit"),
+            (4, "signal: illegal instruction"),
+            (5, "signal: trace/breakpoint trap"),
+            (6, "signal: aborted"),
+            (7, "signal: bus error"),
+            (8, "signal: floating point exception"),
+            (9, "signal: killed"),
+            (10, "signal: user defined signal 1"),
+            (11, "signal: segmentation fault"),
+            (12, "signal: user defined signal 2"),
+            (13, "signal: broken pipe"),
+            (14, "signal: alarm clock"),
+            (15, "signal: terminated"),
+            (16, "signal: stack fault"),
+            (17, "signal: child exited"),
+            (18, "signal: continued"),
+            (19, "signal: stopped (signal)"),
+            (20, "signal: stopped"),
+            (21, "signal: stopped (tty input)"),
+            (22, "signal: stopped (tty output)"),
+            (23, "signal: urgent I/O condition"),
+            (24, "signal: CPU time limit exceeded"),
+            (25, "signal: file size limit exceeded"),
+            (26, "signal: virtual timer expired"),
+            (27, "signal: profiling timer expired"),
+            (28, "signal: window changed"),
+            (29, "signal: I/O possible"),
+            (30, "signal: power failure"),
+            (31, "signal: bad system call"),
+        ];
+        for (signal, expected) in table {
+            assert_eq!(go_signal_name(*signal), *expected, "signal {signal}");
+        }
+        assert_eq!(go_signal_name(0), "signal: signal 0");
+        assert_eq!(go_signal_name(64), "signal: signal 64");
+    }
+
+    /// Go `strconv.Quote` (os/exec error rendering) and `os/exec.Error`.
+    #[test]
+    fn exec_error_and_quote_match_go() {
+        assert_eq!(go_quote("iptables"), "\"iptables\"");
+        assert_eq!(go_quote("a\"b"), "\"a\\\"b\"");
+        assert_eq!(go_quote("a\\b"), "\"a\\\\b\"");
+        assert_eq!(go_quote("a\nb\rc\td"), "\"a\\nb\\rc\\td\"");
+        assert_eq!(go_quote("\u{1}"), "\"\\x01\"");
+        assert_eq!(go_quote("\u{7f}"), "\"\\x7f\"");
+        assert_eq!(go_quote("é"), "\"é\"");
+        assert_eq!(
+            exec_error("iptables-x", "executable file not found in $PATH").to_string(),
+            "exec: \"iptables-x\": executable file not found in $PATH"
+        );
+    }
+
+    /// The production runner always targets iptables; tests inject a stand-in.
+    #[test]
+    fn default_runner_program_is_iptables() {
+        assert_eq!(ProcessRunner::default().program, "iptables");
+        assert_eq!(
+            ProcessRunner::with_program("/bin/true").program,
+            "/bin/true"
+        );
     }
 }

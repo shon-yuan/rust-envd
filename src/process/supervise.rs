@@ -265,18 +265,88 @@ async fn read(
 
 fn terminal(status: std::process::ExitStatus) -> pb::process_event::EndEvent {
     let code = status.code();
-    let description = match (code, status.signal()) {
+    let mut description = match (code, status.signal()) {
         (Some(code), _) => format!("exit status {code}"),
-        (None, Some(9)) => "signal: killed".into(),
-        (None, Some(15)) => "signal: terminated".into(),
-        (None, Some(signal)) => format!("signal: {signal}"),
+        // Go ProcessState.String(): "signal: " + syscall.Signal.String().
+        (None, Some(signal)) => {
+            format!("signal: {}", crate::errno_text::signal_description(signal))
+        }
         (None, None) => "exit status -1".into(),
     };
+    // Go appends the WCOREDUMP note to the rendered state text
+    // (os/exec_posix.go:149-150); core_dumped reads the same wait-status bit
+    // children.rs does.
+    if status.core_dumped() {
+        description.push_str(" (core dumped)");
+    }
     pb::process_event::EndEvent {
         exit_code: code.unwrap_or(-1),
         exited: code.is_some(),
         error: (!status.success()).then(|| description.clone()),
         status: description,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn status(raw: i32) -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(raw)
+    }
+
+    /// Oracle handler.go:677-679 stores `ProcessState.String()`, i.e.
+    /// "exit status N" or "signal: " + `syscall.Signal.String()`.
+    #[test]
+    fn terminal_status_strings_match_go_process_state() {
+        let clean = terminal(status(0));
+        assert_eq!(clean.exit_code, 0);
+        assert!(clean.exited);
+        assert_eq!(clean.status, "exit status 0");
+        assert_eq!(clean.error, None);
+
+        let failed = terminal(status(7 << 8));
+        assert_eq!(failed.exit_code, 7);
+        assert!(failed.exited);
+        assert_eq!(failed.status, "exit status 7");
+        assert_eq!(failed.error.as_deref(), Some("exit status 7"));
+
+        let killed = terminal(status(9));
+        assert_eq!(killed.exit_code, -1);
+        assert!(!killed.exited);
+        assert_eq!(killed.status, "signal: killed");
+        assert_eq!(killed.error.as_deref(), Some("signal: killed"));
+
+        let terminated = terminal(status(15));
+        assert_eq!(terminated.status, "signal: terminated");
+
+        // Go syscall.Signal.String renders names, not numbers: SIGINT is
+        // "signal: interrupt" (os/exec_posix.go String + syscall sigtable).
+        let interrupted = terminal(status(2));
+        assert_eq!(interrupted.status, "signal: interrupt");
+
+        let fault = terminal(status(11));
+        assert_eq!(fault.status, "signal: segmentation fault");
+
+        let unknown = terminal(status(40));
+        assert_eq!(unknown.status, "signal: signal 40");
+    }
+
+    /// Go ProcessState.String() appends " (core dumped)" when the wait
+    /// status carries WCOREDUMP (os/exec_posix.go:149-150) — the same bit
+    /// `children.rs` reads via `ExitStatus::core_dumped`. Raw wait status
+    /// 0x80|11: died by SIGSEGV with a core dump.
+    #[test]
+    fn terminal_reports_go_core_dumped_suffix() {
+        let dumped = terminal(status(0x80 | 11));
+        assert_eq!(dumped.exit_code, -1);
+        assert!(!dumped.exited);
+        assert_eq!(dumped.status, "signal: segmentation fault (core dumped)");
+        assert_eq!(
+            dumped.error.as_deref(),
+            Some("signal: segmentation fault (core dumped)")
+        );
     }
 }

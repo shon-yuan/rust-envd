@@ -1311,3 +1311,26 @@ async fn start_places_the_child_into_the_admitted_cgroup() {
         "the child must write itself into the admitted cgroup before exec"
     );
 }
+
+/// Oracle start.go:40-44 arms `procCtx` from connect-timeout-ms and Go
+/// os/exec CommandContext kills the child with SIGKILL when it expires;
+/// ProcessState.String() then reports "signal: killed".
+#[tokio::test]
+async fn deadline_kills_a_live_child_and_reports_go_signal_text() {
+    let rt = runtime();
+    let mut stream = rt
+        .start(
+            request("/bin/sleep", &["10"]),
+            Some(Duration::from_millis(100)),
+        )
+        .await
+        .unwrap();
+    start_pid(&mut stream).await;
+    let (_, stderr, end) = tokio::time::timeout(Duration::from_secs(5), finish(&mut stream))
+        .await
+        .expect("deadline must terminate the live child");
+    assert_eq!(end.status, "signal: killed", "{stderr:?}");
+    assert_eq!(end.exit_code, -1);
+    assert!(!end.exited);
+    assert_eq!(end.error.as_deref(), Some("signal: killed"));
+}

@@ -129,7 +129,7 @@ impl ChildRegistry {
             Some(code) => format!("exit status {code}"),
             None => {
                 let signal = output.status.signal().unwrap_or_default();
-                let description = signal_description(signal);
+                let description = crate::errno_text::signal_description(signal);
                 format!(
                     "signal: {description}{}",
                     if output.status.core_dumped() {
@@ -151,44 +151,8 @@ impl ChildRegistry {
 }
 
 // Go's syscall.Signal.String uses these Linux descriptions rather than Rust's
-// platform-dependent ExitStatus display format.
-fn signal_description(signal: i32) -> String {
-    let name = match signal {
-        1 => "hangup",
-        2 => "interrupt",
-        3 => "quit",
-        4 => "illegal instruction",
-        5 => "trace/breakpoint trap",
-        6 => "aborted",
-        7 => "bus error",
-        8 => "floating point exception",
-        9 => "killed",
-        10 => "user defined signal 1",
-        11 => "segmentation fault",
-        12 => "user defined signal 2",
-        13 => "broken pipe",
-        14 => "alarm clock",
-        15 => "terminated",
-        16 => "stack fault",
-        17 => "child exited",
-        18 => "continued",
-        19 => "stopped (signal)",
-        20 => "stopped",
-        21 => "stopped (tty input)",
-        22 => "stopped (tty output)",
-        23 => "urgent I/O condition",
-        24 => "CPU time limit exceeded",
-        25 => "file size limit exceeded",
-        26 => "virtual timer expired",
-        27 => "profiling timer expired",
-        28 => "window changed",
-        29 => "I/O possible",
-        30 => "power failure",
-        31 => "bad system call",
-        _ => return format!("signal {signal}"),
-    };
-    name.to_owned()
-}
+// platform-dependent ExitStatus display format; the table lives in
+// crate::errno_text so the process runtime can share it.
 
 impl ChildWrites for ChildRegistry {
     fn write(&self, path: &Path, online: bool) -> io::Result<()> {
@@ -243,6 +207,18 @@ mod tests {
         registry
             .run(Command::new("/bin/sh").args(["-c", "printf 'ignored' >&2; exit 0"]))
             .unwrap();
+    }
+
+    /// A helper killed by a signal reports Go's `exec.ExitError` text:
+    /// "signal: " + syscall.Signal.String() (no numeric rendering).
+    #[test]
+    fn helper_killed_by_signal_reports_go_signal_text() {
+        let registry = ChildRegistry::default();
+        let error = registry
+            .run(Command::new("/bin/sh").args(["-c", "kill -INT $$"]))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "signal: interrupt");
+        assert!(registry.export_hold().pids().is_empty());
     }
 
     #[test]

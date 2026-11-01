@@ -57,6 +57,47 @@ pub(crate) fn go_text(error: &std::io::Error) -> String {
     }
 }
 
+/// Go `syscall.Signal.String()` descriptions (sigtable), lowercase without the
+/// SIG prefix; unknown numbers render as `signal N`. Used wherever Go renders
+/// `os.ProcessState.String()` or an `exec.ExitError` ("signal: " + name).
+pub(crate) fn signal_description(signal: i32) -> String {
+    let name = match signal {
+        1 => "hangup",
+        2 => "interrupt",
+        3 => "quit",
+        4 => "illegal instruction",
+        5 => "trace/breakpoint trap",
+        6 => "aborted",
+        7 => "bus error",
+        8 => "floating point exception",
+        9 => "killed",
+        10 => "user defined signal 1",
+        11 => "segmentation fault",
+        12 => "user defined signal 2",
+        13 => "broken pipe",
+        14 => "alarm clock",
+        15 => "terminated",
+        16 => "stack fault",
+        17 => "child exited",
+        18 => "continued",
+        19 => "stopped (signal)",
+        20 => "stopped",
+        21 => "stopped (tty input)",
+        22 => "stopped (tty output)",
+        23 => "urgent I/O condition",
+        24 => "CPU time limit exceeded",
+        25 => "file size limit exceeded",
+        26 => "virtual timer expired",
+        27 => "profiling timer expired",
+        28 => "window changed",
+        29 => "I/O possible",
+        30 => "power failure",
+        31 => "bad system call",
+        _ => return format!("signal {signal}"),
+    };
+    name.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +127,51 @@ mod tests {
         );
         // A non-OS error keeps its own Display text.
         assert_eq!(go_text(&std::io::Error::other("made up")), "made up");
+    }
+
+    /// Go `syscall.Signal.String()` (sigtable, zerrors_linux_amd64). These are
+    /// the names `os.ProcessState.String()` and `exec.ExitError.Error()` embed.
+    #[test]
+    fn signal_descriptions_match_go_sigtable() {
+        let table: &[(i32, &str)] = &[
+            (1, "hangup"),
+            (2, "interrupt"),
+            (3, "quit"),
+            (4, "illegal instruction"),
+            (5, "trace/breakpoint trap"),
+            (6, "aborted"),
+            (7, "bus error"),
+            (8, "floating point exception"),
+            (9, "killed"),
+            (10, "user defined signal 1"),
+            (11, "segmentation fault"),
+            (12, "user defined signal 2"),
+            (13, "broken pipe"),
+            (14, "alarm clock"),
+            (15, "terminated"),
+            (16, "stack fault"),
+            (17, "child exited"),
+            (18, "continued"),
+            (19, "stopped (signal)"),
+            (20, "stopped"),
+            (21, "stopped (tty input)"),
+            (22, "stopped (tty output)"),
+            (23, "urgent I/O condition"),
+            (24, "CPU time limit exceeded"),
+            (25, "file size limit exceeded"),
+            (26, "virtual timer expired"),
+            (27, "profiling timer expired"),
+            (28, "window changed"),
+            (29, "I/O possible"),
+            (30, "power failure"),
+            (31, "bad system call"),
+        ];
+        for (signal, expected) in table {
+            assert_eq!(signal_description(*signal), *expected, "signal {signal}");
+        }
+        // Go falls back to "signal N" for numbers outside the table.
+        assert_eq!(signal_description(0), "signal 0");
+        assert_eq!(signal_description(32), "signal 32");
+        assert_eq!(signal_description(64), "signal 64");
     }
 }

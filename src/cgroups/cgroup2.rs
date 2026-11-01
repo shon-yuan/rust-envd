@@ -290,4 +290,195 @@ mod tests {
         assert!(close_fd_table(&mut fds).is_ok());
         assert!(fds.is_empty());
     }
+
+    /// Oracle cgroup2_test.go:24-32 (TestNewCgroup2Manager_NonCgroup2FS):
+    /// a non-cgroup2 root is refused with "not a cgroup2 filesystem" before
+    /// any directory is created.
+    #[test]
+    fn statfs_gate_refuses_a_non_cgroup2_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = Cgroup2Manager::new(Cgroup2Options {
+            root: Some(dir.path().to_path_buf()),
+            entries: vec![Cgroup2Entry {
+                process_type: ProcessType::User,
+                relative_path: "user".into(),
+                properties: vec![("cgroup.freeze".into(), "0".into())],
+            }],
+        });
+        let error = result.err().expect("tmpfs root must be refused");
+        assert!(
+            error.contains("not a cgroup2 filesystem"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "gate must run before any cgroup is created"
+        );
+    }
+
+    #[test]
+    fn create_cgroup_writes_properties_and_keeps_a_directory_fd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("user");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["memory.max", "cpu.max"] {
+            std::fs::write(target.join(name), b"old").unwrap();
+        }
+        let fd = create_cgroup(
+            &target,
+            &[
+                ("memory.max".into(), "1024".into()),
+                ("cpu.max".into(), "50000 100000".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("memory.max")).unwrap(),
+            "1024"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("cpu.max")).unwrap(),
+            "50000 100000"
+        );
+        // The returned descriptor is a live directory fd.
+        let opened = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_eq!(opened, 0);
+        nix::unistd::close(fd).unwrap();
+    }
+
+    /// Oracle cgroup2.go:130-132: a newly created cgroup directory is 0755.
+    #[test]
+    fn create_cgroup_makes_new_directories_0755() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("a/b/c");
+        let fd = create_cgroup(&target, &[]).unwrap();
+        assert!(target.is_dir());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        nix::unistd::close(fd).unwrap();
+    }
+
+    /// Oracle cgroup2.go:133-140: an existing directory keeps its own mode
+    /// (os.MkdirAll only applies 0755 on creation).
+    #[test]
+    fn create_cgroup_leaves_an_existing_directory_mode_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("ptys");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fd = create_cgroup(&target, &[]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        nix::unistd::close(fd).unwrap();
+    }
+
+    /// Oracle cgroup2.go:135-141: properties whose controller is not enabled
+    /// (ENOENT / EACCES) are skipped with a stderr note, not treated as
+    /// failures.
+    #[test]
+    fn create_cgroup_skips_missing_and_denied_properties_like_go() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("socats");
+        std::fs::create_dir(&target).unwrap();
+        // Present but unwritable: open(O_WRONLY|O_TRUNC) is EACCES for a
+        // non-root owner on a 000 file.
+        let denied = target.join("cgroup.freeze");
+        std::fs::write(&denied, "0").unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Writable property files must pre-exist: write_cgroup_prop never
+        // creates (cgroup2.go:115-120), so a plain directory stands in for
+        // the controller files a real cgroupfs materializes.
+        let writable = target.join("memory.max");
+        std::fs::write(&writable, b"old").unwrap();
+        let fd = create_cgroup(
+            &target,
+            &[
+                ("io.max".into(), "8:0 rbps=1024".into()), // ENOENT: skipped
+                ("cgroup.freeze".into(), "1".into()),      // EACCES: skipped
+                ("memory.max".into(), "2048".into()),      // written
+            ],
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&writable).unwrap(), "2048");
+        // The ENOENT property must not have been materialized: Go opens with
+        // O_WRONLY|O_TRUNC (cgroup2.go:115-120), no O_CREATE — a regression to
+        // O_CREATE would fabricate controller files a real cgroupfs would not
+        // have.
+        assert!(!target.join("io.max").exists());
+        nix::unistd::close(fd).unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// Oracle cgroup2.go:142-145: every unskippable property error is joined
+    /// and reported; no descriptor is returned.
+    #[test]
+    fn create_cgroup_aggregates_unskippable_property_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("user");
+        std::fs::create_dir(&target).unwrap();
+        // Opening a directory for write with O_TRUNC is EISDIR: neither
+        // os.ErrNotExist nor os.ErrPermission, so it must be reported.
+        for name in ["memory.max", "cpu.max"] {
+            std::fs::create_dir(target.join(name)).unwrap();
+        }
+        let error = create_cgroup(
+            &target,
+            &[
+                ("memory.max".into(), "1".into()),
+                ("cpu.max".into(), "1".into()),
+            ],
+        )
+        .expect_err("unskippable property errors must fail creation");
+        assert!(
+            error.contains("failed to write cgroup property \"memory.max\""),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("failed to write cgroup property \"cpu.max\""),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Oracle cgroup2.go:203-223: settled state comes from cgroup.events and
+    /// the requested state is the trimmed cgroup.freeze body.
+    #[test]
+    fn freeze_state_readers_parse_cgroup_files_like_go() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("cgroup.events"), b"populated 1\nfrozen 1\n").unwrap();
+        assert!(settled_frozen(dir.path()).unwrap());
+        std::fs::write(dir.path().join("cgroup.events"), b"populated 0\n").unwrap();
+        assert!(!settled_frozen(dir.path()).unwrap());
+        std::fs::write(dir.path().join("cgroup.freeze"), b"1\n").unwrap();
+        assert!(freeze_requested(dir.path()).unwrap());
+        std::fs::write(dir.path().join("cgroup.freeze"), b" 0 \n").unwrap();
+        assert!(!freeze_requested(dir.path()).unwrap());
+    }
+
+    /// Oracle cgroup2.go:179-193: only immediate child directories are
+    /// returned; regular files and symlinks are ignored.
+    #[test]
+    fn child_cgroups_lists_directories_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("user")).unwrap();
+        std::fs::create_dir(dir.path().join("ptys")).unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), b"").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("user"), dir.path().join("alias")).unwrap();
+        let mut children: Vec<String> = child_cgroups(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        children.sort();
+        assert_eq!(children, ["ptys", "user"]);
+    }
 }
