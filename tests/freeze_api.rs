@@ -124,28 +124,165 @@ async fn init_thaw_inline_and_unknown_values_thaw_without_a_header() {
     }
 }
 
+/// A mount executor whose mount point creation always fails, so a
+/// volumeMounts /init answers the oracle's 400 without exec'ing anything.
+struct FailingMkdir;
+
+impl coorworker_envd::daemon::nfs::NfsMounter for FailingMkdir {
+    fn mount(
+        &self,
+        _nfs_target: &str,
+        _path: &str,
+        _deadline: tokio::time::Instant,
+    ) -> coorworker_envd::daemon::nfs::BoxFut<'_, coorworker_envd::daemon::nfs::CommandOutcome>
+    {
+        Box::pin(async { coorworker_envd::daemon::nfs::CommandOutcome::failure("must not run") })
+    }
+
+    fn make_dir(
+        &self,
+        path: &str,
+        _deadline: tokio::time::Instant,
+    ) -> coorworker_envd::daemon::nfs::BoxFut<'_, coorworker_envd::daemon::nfs::CommandOutcome>
+    {
+        let path = path.to_owned();
+        Box::pin(async move {
+            coorworker_envd::daemon::nfs::CommandOutcome::failure(format!(
+                "`mkdir -p {path}` failed: exit status 1: mkdir: permission denied"
+            ))
+        })
+    }
+
+    fn unmount(&self, _path: &str) -> coorworker_envd::daemon::nfs::BoxFut<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn mount_id(
+        &self,
+        _path: &str,
+    ) -> coorworker_envd::daemon::nfs::BoxFut<'_, Result<u64, String>> {
+        Box::pin(async { Ok(1) })
+    }
+}
+
+/// The oracle's mount-failure response contract (init.go:336-341 -> :730-747,
+/// finding 15): the 400 lands AFTER the audit and the thaw defer, so it still
+/// carries X-Envd-Freeze-Audit and X-Envd-Failed-Volume, still thaws the
+/// workload, and carries none of the success-only headers.
 #[tokio::test]
-async fn init_volume_mounts_stays_501_with_zero_partial_application() {
-    let router = app(Arc::new(Daemon::new()));
-    // A NON-empty volumeMounts list is the pending-effect refusal; a null or
-    // empty list is the oracle's successful no-op (init.go:480 /
-    // init.go:796-874 — pinned by tests/daemon.rs).
-    let response = post(&router, "/init", r#"{"volumeMounts":[{"path":"/data"}]}"#).await;
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    // All-or-nothing staging: no thaw header, no freeze-audit header, nothing
-    // applied (coordinator constraint 1).
-    assert!(response.headers().get("x-envd-thaw").is_none());
-    assert!(response.headers().get("x-envd-freeze-audit").is_none());
-    assert!(response.headers().get("x-envd-init-unobserved").is_none());
-    // thaw alongside volumeMounts is refused whole, not partially applied.
+async fn init_volume_mount_failure_keeps_the_deferred_thaw_and_the_error_headers() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fs = Arc::new(FakeCgroupfs::new(
+        dir.path(),
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    ));
+    std::fs::write(dir.path().join("proc"), "0::/\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("system.slice/envd.service")).unwrap();
+    let opts = FreezeOptions {
+        max_wait: Duration::from_millis(20),
+        mode: coorworker_envd::cgroups::FreezeMode::Hierarchy,
+        ..Default::default()
+    };
+    let freezer = Arc::new(WorkloadFreezer::new(fs).with_proc_self_cgroup(dir.path().join("proc")));
+    let router = app(Arc::new(
+        Daemon::new()
+            .with_freezer(freezer.clone())
+            .with_nfs_mounter(Arc::new(FailingMkdir)),
+    ));
+    let (result, error) = freezer.freeze(opts).await;
+    assert!(error.is_none());
+    assert_eq!(result.mode, coorworker_envd::cgroups::FreezeMode::Hierarchy);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("user/cgroup.freeze")).unwrap(),
+        "1"
+    );
     let response = post(
         &router,
         "/init",
-        r#"{"volumeMounts":[{"path":"/data"}],"thaw":"skip"}"#,
+        r#"{"volumeMounts":[{"nfs_target":"t","path":"/data"}]}"#,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-    assert!(response.headers().get("x-envd-thaw").is_none());
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Set before SetData, so the error response carries them.
+    assert!(
+        response.headers().get("x-envd-freeze-audit").is_some(),
+        "the audit ran before the mount attempt (init.go:301 -> :336)"
+    );
+    assert_eq!(response.headers()["x-envd-failed-volume"], "/data");
+    assert!(response.headers().get("x-envd-version").is_some());
+    assert!(response.headers().get("x-envd-memory").is_some());
+    // Set only after the success-only thaw (init.go:367-385), so the error
+    // response carries none of them.
+    for absent in [
+        "x-envd-defaults",
+        "x-envd-cpus",
+        "x-envd-init-unobserved",
+        "cache-control",
+    ] {
+        assert!(
+            response.headers().get(absent).is_none(),
+            "{absent} must not ride a failed /init"
+        );
+    }
+    // The deferred thaw covers the error return (init.go:313): the workload
+    // is live again even though the /init failed.
+    for cgroup in ["user", "ptys"] {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(cgroup).join("cgroup.freeze")).unwrap(),
+            "0",
+            "{cgroup} thaws on the mount-failure return"
+        );
+    }
+}
+
+/// The `thaw:"skip"` corner of the same error path (init.go:309-310): the
+/// skip decision is recorded before SetData, so even a failing volume mount
+/// advertises it — and, unlike the inline case above, the frozen workload
+/// stays frozen on both the success and the error return.
+#[tokio::test]
+async fn failed_volume_mount_still_advertises_thaw_skip_and_keeps_the_freeze() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fs = Arc::new(FakeCgroupfs::new(
+        dir.path(),
+        &[("user", ProcessType::User), ("ptys", ProcessType::Pty)],
+    ));
+    std::fs::write(dir.path().join("proc"), "0::/\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("system.slice/envd.service")).unwrap();
+    let opts = FreezeOptions {
+        max_wait: Duration::from_millis(20),
+        mode: coorworker_envd::cgroups::FreezeMode::Hierarchy,
+        ..Default::default()
+    };
+    let freezer = Arc::new(WorkloadFreezer::new(fs).with_proc_self_cgroup(dir.path().join("proc")));
+    let router = app(Arc::new(
+        Daemon::new()
+            .with_freezer(freezer.clone())
+            .with_nfs_mounter(Arc::new(FailingMkdir)),
+    ));
+    let (result, error) = freezer.freeze(opts).await;
+    assert!(error.is_none());
+    assert_eq!(result.mode, coorworker_envd::cgroups::FreezeMode::Hierarchy);
+    let response = post(
+        &router,
+        "/init",
+        r#"{"thaw":"skip","volumeMounts":[{"nfs_target":"t","path":"/data"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()["x-envd-thaw"],
+        "skip",
+        "the skip header is set when decided, before the SetData error return"
+    );
+    assert!(response.headers().get("x-envd-freeze-audit").is_some());
+    assert_eq!(response.headers()["x-envd-failed-volume"], "/data");
+    for cgroup in ["user", "ptys"] {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(cgroup).join("cgroup.freeze")).unwrap(),
+            "1",
+            "{cgroup} stays frozen under thaw:skip despite the mount failure"
+        );
+    }
 }
 
 #[tokio::test]

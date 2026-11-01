@@ -10,6 +10,9 @@ tower = { version = "0.5", features = ["util"] }
 nix = { version = "0.29", features = ["user", "fs", "signal", "process", "term", "time"] }
 xattr = "1"
 inotify = { version = "=0.11.5", default-features = false }
+# nfs_mount_linux.go: umount2 and the statx(STATX_MNT_ID) mount-ID probe. The
+# version is pinned to the one already in Cargo.lock (transitive of nix).
+libc = "0.2.190"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "process", "io-util", "sync", "fs"] }
 futures-util = "0.3"

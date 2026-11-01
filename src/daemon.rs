@@ -1,5 +1,5 @@
-//! HTTP surface and `/init` effects. NFS volume mounts alone are still refused
-//! (external authorization); every other SetData effect is implemented.
+//! HTTP surface and `/init` effects. NFS volume mounts are implemented with
+//! oracle parity through the [`nfs`] module; every SetData effect is live.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +54,7 @@ mod compose;
 mod download;
 mod filesystem_rpc;
 mod metrics;
+pub mod nfs;
 mod process_rpc;
 mod upload;
 
@@ -97,12 +98,18 @@ pub struct Daemon {
     /// needs the shared [`Daemon`], so main wires it after `Arc::new` the way
     /// Go registers the handler on the already-built services.
     upgrade_run: std::sync::Mutex<Option<crate::upgrade::UpgradeRun>>,
-    /// Oracle api.mounts_handover.go: the NFS mount ledger (path -> lifecycle).
-    /// A non-empty volumeMounts list refuses with 501 in this build, so the
-    /// ledger is empty in production; the export/import machinery exists so a
-    /// handover blob is round-tripped faithfully and a future NFS slice only
-    /// fills the map.
+    /// Oracle api.mounts_handover.go: the NFS mount ledger (path -> lifecycle),
+    /// written only after a VERIFIED mount (init.go:976) and exported into the
+    /// live-upgrade handover blob so a still-live mount with an unchanged
+    /// lifecycle is not remounted.
     mounts: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Oracle store.go:72 nfsFailure, guarded by initLock upstream: the last
+    /// mount failure and the lifecycle it failed under, so same-lifecycle
+    /// retries (including `volumeMounts: []`) short-circuit to the same 400.
+    nfs_failure: std::sync::Mutex<Option<nfs::NfsFailure>>,
+    /// Oracle store.go:71 nfs (execNFSMounter): the mount executor seam tests
+    /// replace. The guest keeps the exec default.
+    nfs_mounter: Arc<dyn nfs::NfsMounter>,
     /// Oracle api/fsfreeze.go: the FIFREEZE/FITHAW freezer behind /fsfreeze
     /// and /fsthaw, and the rootfs mountpoint both ioctls target. The seam
     /// keeps route tests off real host mounts.
@@ -254,6 +261,20 @@ impl Daemon {
         for mount in mounts {
             ledger.insert(mount.path.clone(), mount.lifecycle_id.clone());
         }
+    }
+
+    /// Oracle init.go:480-484 + :796-864: the /init setupNFS arm, run under
+    /// initLock with the daemon's ledger, failure memo and mount executor.
+    pub(super) async fn setup_nfs(
+        &self,
+        lifecycle_id: &str,
+        mounts: &[nfs::VolumeMount],
+    ) -> Result<(), nfs::NfsVolumeError> {
+        let books = nfs::NfsBooks {
+            mounted: &self.mounts,
+            failure: &self.nfs_failure,
+        };
+        nfs::setup_nfs(&books, self.nfs_mounter.as_ref(), lifecycle_id, mounts).await
     }
 
     /// Wire the outgoing upgrade choreography (Go's doUpgrade closure,
@@ -431,6 +452,13 @@ impl Daemon {
         self
     }
 
+    /// Oracle store.go:71 nfs: swap the mount executor. Route tests inject a
+    /// scripted mounter that never execs; the guest keeps the exec default.
+    pub fn with_nfs_mounter(mut self, mounter: Arc<dyn nfs::NfsMounter>) -> Self {
+        self.nfs_mounter = mounter;
+        self
+    }
+
     pub fn with_oom_watcher(watcher: Arc<crate::oom::OomWatcher>) -> Self {
         Self {
             oom: Some(watcher),
@@ -473,6 +501,8 @@ impl Daemon {
             handover: std::sync::Mutex::new(None),
             upgrade_run: std::sync::Mutex::new(None),
             mounts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            nfs_failure: std::sync::Mutex::new(None),
+            nfs_mounter: Arc::new(nfs::ExecNfsMounter),
             fsfreeze: Arc::new(crate::fsfreeze::LinuxFsFreezer),
             fsfreeze_mountpoint: crate::fsfreeze::ROOTFS_MOUNTPOINT,
             fsfreeze_lock: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1121,7 +1151,16 @@ struct InitRequest {
     // enum values "inline"/"skip" (api.gen.go:68-79). Go decodes any string;
     // only "skip" withholds the thaw (init.go:695-697).
     thaw: Option<String>,
-    volume_mounts: bool,
+    // Go api.gen.go:380: *string json:"lifecycleID,omitempty"; nil behaves as
+    // "" everywhere the ledger and the failure memo read it (init.go:797,
+    // :1009-1015 derefString).
+    lifecycle_id: Option<String>,
+    // Go api.gen.go:387: *[]VolumeMount json:"volumeMounts,omitempty".
+    // Absent and JSON null decode to None (the nil pointer that skips
+    // setupNFS, init.go:480); an empty slice is Some(vec![]) — setupNFS still
+    // runs for it, including the memoized-failure short-circuit; any other
+    // JSON type fails the whole-body decode as 400.
+    volume_mounts: Option<Vec<nfs::VolumeMount>>,
 }
 
 // Go encoding/json folds ASCII case plus Unicode simple-fold equivalents.
@@ -1191,20 +1230,19 @@ impl<'de> Deserialize<'de> for InitRequest {
                         // Go api.gen.go:383: any non-string JSON value is a
                         // decode error failing the whole /init as a 400.
                         "THAW" => init.thaw = map.next_value::<Option<String>>()?,
-                        // Needs the real guest NFS implementation; staging
-                        // refuses the whole request rather than partially
-                        // applying it.
-                        //
-                        // Go api.gen.go decodes VolumeMounts as
-                        // *[]VolumeMount, so JSON null is a nil pointer
-                        // (init.go:480 treats it as absent) and an empty
-                        // slice is setupNFS's successful no-op — only a
-                        // non-empty list reaches the staging refusal. Any
-                        // other JSON type fails the whole-body decode as 400.
+                        // Go api.gen.go:380: *string json:"lifecycleID";
+                        // null/absent is the nil pointer, any other JSON type
+                        // a decode error.
+                        "LIFECYCLEID" => init.lifecycle_id = map.next_value::<Option<String>>()?,
+                        // Go api.gen.go:387 decodes VolumeMounts as
+                        // *[]VolumeMount: absent/null is None (init.go:480
+                        // treats it as absent), [] is Some(vec![]) and still
+                        // runs setupNFS (init.go:796-864), a null ELEMENT is
+                        // the zero VolumeMount, and any other JSON type fails
+                        // the whole-body decode as 400.
                         "VOLUMEMOUNTS" => {
-                            init.volume_mounts = map
-                                .next_value::<Option<Vec<serde::de::IgnoredAny>>>()?
-                                .is_some_and(|mounts| !mounts.is_empty());
+                            init.volume_mounts =
+                                map.next_value::<Option<Vec<nfs::VolumeMount>>>()?;
                         }
                         _ => {
                             map.next_value::<serde::de::IgnoredAny>()?;
@@ -1286,7 +1324,7 @@ async fn init(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Resp
         }
     }
     let _guard = GoneFlag(client_gone.clone());
-    let mut response = apply_init(&daemon, request, client_gone).await;
+    let mut response = apply_init(daemon.clone(), request, client_gone).await;
     // Go init.go:211-218: a handover-booted envd advertises the outcome on
     // EVERY /init response — error and stale responses included (this runs
     // before any status-specific header logic).
@@ -1349,7 +1387,7 @@ async fn collect_init_body(body: Body) -> Result<Zeroizing<Vec<u8>>, axum::Error
 }
 
 async fn apply_init(
-    daemon: &Daemon,
+    daemon: Arc<Daemon>,
     request: Request<Body>,
     client_gone: Arc<std::sync::atomic::AtomicBool>,
 ) -> Response {
@@ -1397,22 +1435,10 @@ async fn apply_init(
     {
         return (StatusCode::UNAUTHORIZED, error.to_string()).into_response();
     }
-    // A non-empty volumeMounts list needs the real guest NFS implementation
-    // (a null or empty list never reaches this gate — daemon decode treats
-    // them as absent, like the oracle). Never acknowledge the refused request
-    // as successful while only the bootstrap surface exists; staging is
-    // all-or-nothing, so a refused request produces no thaw and no audit
-    // either (thaw itself moved out of this gate with the freeze slice).
-    // Unlike the oracle's NFS failure — which lands after SetData effects 1-7
-    // with the thaw defer registered and emits X-Envd-Failed-Volume — this
-    // refusal happens before any effect; inherent to refusing the feature.
-    if payload.volume_mounts {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "guest system init effects are not implemented yet",
-        )
-            .into_response();
-    }
+    // Go init.go:480-484: setupNFS runs INSIDE SetData below (the arm sits
+    // after the CA install, the last SetData effect before it), so a mount
+    // failure lands after the audit and the thaw defer, exactly like the
+    // oracle's writeInitError path; the oracle /init has no 501.
     // Go init.go:301: audit the frozen set BEFORE anything thaws it, and
     // advertise the counts on the response header so the orchestrator can
     // record them fleet-wide. Advisory throughout — an observer must never be
@@ -1562,6 +1588,73 @@ async fn apply_init(
                     // workload frozen. The success path drops at the same
                     // relative point, before its own waits.
                     drop(state);
+                    return finalize_init_response(
+                        thaw_task,
+                        freeze_generation,
+                        thaw_header,
+                        audit_header,
+                        response,
+                    )
+                    .await;
+                }
+            }
+        }
+        // Go init.go:480-484: setupNFS, the LAST SetData effect. A failure
+        // leaves effects 1-7 applied and `initialized` unset, and still thaws
+        // through the deferred task (finding 15). The mounts run in a task
+        // DETACHED from this future — Go passes context.WithoutCancel into
+        // setupNFS (init.go:805), so a client that leaves mid-mount never
+        // aborts the flow; in axum the equivalent hazard is this future being
+        // dropped, and the detached task is what survives it. The state guard
+        // drops before the await for the same reason the CA error path drops
+        // it: the thaw task and the mount task must not deadlock against an
+        // in-flight upgrade's state read.
+        if let Some(volume_mounts) = payload.volume_mounts {
+            drop(state);
+            let nfs_daemon = daemon.clone();
+            let lifecycle_id = payload.lifecycle_id.clone().unwrap_or_default();
+            let mounted =
+                tokio::spawn(
+                    async move { nfs_daemon.setup_nfs(&lifecycle_id, &volume_mounts).await },
+                )
+                .await;
+            match mounted {
+                // Go init.go:356: only a SetData that RETURNED marks the
+                // daemon initialized, so the failure paths below never do.
+                Ok(Ok(())) => {
+                    state = daemon.state.lock().await;
+                }
+                Ok(Err(volume_error)) => {
+                    // Go init.go:730-747 writeInitError: an nfsVolumeError
+                    // anywhere in the wrap chain sets X-Envd-Failed-Volume to
+                    // the raw failing path (an empty path sets an empty
+                    // value); the default branch answers a bare 400 whose
+                    // body is err.Error() — no JSON envelope, no forced
+                    // Content-Type.
+                    eprintln!("Failed to set data: failed to setup NFS volumes: {volume_error}");
+                    let body = format!("failed to setup NFS volumes: {volume_error}");
+                    let mut response =
+                        write_init_error(StatusCode::BAD_REQUEST, &body, correction_header);
+                    if let Ok(value) =
+                        header::HeaderValue::from_bytes(volume_error.path().as_bytes())
+                    {
+                        response.headers_mut().insert("x-envd-failed-volume", value);
+                    }
+                    return finalize_init_response(
+                        thaw_task,
+                        freeze_generation,
+                        thaw_header,
+                        audit_header,
+                        response,
+                    )
+                    .await;
+                }
+                // A panic in the mount flow has no oracle counterpart (the
+                // Go process would die); answer 500 rather than hang.
+                Err(join_error) => {
+                    eprintln!("NFS setup task failed: {join_error}");
+                    let response =
+                        json_error(StatusCode::INTERNAL_SERVER_ERROR, "NFS setup task failed");
                     return finalize_init_response(
                         thaw_task,
                         freeze_generation,
@@ -1964,7 +2057,7 @@ mod init_error_path_tests {
         let init_daemon = daemon.clone();
         let init_task = tokio::spawn(async move {
             apply_init(
-                &init_daemon,
+                init_daemon,
                 request,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )

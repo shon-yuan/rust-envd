@@ -319,6 +319,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "inotify",
+ "libc",
  "mime_guess",
  "multer",
  "nix",

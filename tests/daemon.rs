@@ -109,8 +109,9 @@ async fn empty_cabundle_is_absent_not_a_pending_effect() {
 async fn null_and_empty_volume_mounts_are_not_a_pending_effect() {
     // Go init.go:480 gates on `data.VolumeMounts != nil` (a *[]VolumeMount:
     // JSON null decodes to a nil pointer) and init.go:796-874's setupNFS
-    // mounts nothing for an empty slice — both answer a successful /init.
-    // Only a NON-empty list reaches the unimplemented NFS staging refusal.
+    // mounts nothing for an empty slice — both answer a successful /init
+    // without touching the mount executor (the full setupNFS matrix lives in
+    // tests/daemon_nfs_volume.rs).
     let daemon = Arc::new(Daemon::new());
     for body in [r#"{"volumeMounts":null}"#, r#"{"volumeMounts":[]}"#] {
         let response = app(daemon.clone())
@@ -127,17 +128,15 @@ async fn null_and_empty_volume_mounts_are_not_a_pending_effect() {
 }
 
 #[tokio::test]
-async fn a_non_empty_volume_mounts_list_remains_refused_and_scalars_fail_decode() {
-    // A non-empty list reaches the still-blocked NFS staging refusal (501),
-    // and anything that is not an array (or null) fails the whole-body decode
-    // the way a Go *[]VolumeMount would (api.gen.go), answering 400.
-    for (body, status) in [
-        (
-            r#"{"volumeMounts":[{"path":"/data","lifecycleId":"l"}]}"#,
-            StatusCode::NOT_IMPLEMENTED,
-        ),
-        (r#"{"volumeMounts":42}"#, StatusCode::BAD_REQUEST),
-        (r#"{"volumeMounts":"[]"}"#, StatusCode::BAD_REQUEST),
+async fn non_array_volume_mounts_fail_decode_with_an_empty_body() {
+    // Anything that is not an array (or null) fails the whole-body decode the
+    // way a Go *[]VolumeMount would (api.gen.go:387), answering init.go:257's
+    // bare 400 with no body and no Content-Type. A non-empty list mounts for
+    // real now (tests/daemon_nfs_volume.rs) — there is no 501 in the oracle.
+    for body in [
+        r#"{"volumeMounts":42}"#,
+        r#"{"volumeMounts":"[]"}"#,
+        r#"{"volumeMounts":{}}"#,
     ] {
         let response = app(Arc::new(Daemon::new()))
             .oneshot(
@@ -147,7 +146,7 @@ async fn a_non_empty_volume_mounts_list_remains_refused_and_scalars_fail_decode(
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), status, "{body}");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
     }
 }
 

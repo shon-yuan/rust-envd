@@ -366,6 +366,45 @@ ledgered unconverted (no observed flake, loud asserts, and the current
 Docker load policy cannot reproduce the historical reds, so a conversion
 would be unverifiable). Remaining follow-ups: the cacerts structural
 residual and those two ledgered loops.
+
+An NFS/volumeMounts slice then completed the last system-init effect. The
+whole /init body now decodes the way Go `encoding/json` decodes a
+`*[]VolumeMount` (case-folded names, null/absent/empty three-state, null
+elements as zero values, any other JSON type failing the whole body as a bare
+400), a non-empty list mounts for real, and the 501 stub is gone. `setup_nfs`
+mirrors the oracle's ordering (raw-depth sort, unconditional stale detach,
+symlink-resolved re-sort, sequential mounts, statx `STATX_MNT_ID`
+verification, hidden-by-overmount recheck, ledger last) and `mount_nfs`
+mirrors the retry matrix (20s per-volume budget, 10s mkdir and per-attempt
+deadlines, at most two timed-out attempts with a forced unmount between,
+500ms immediate retries to the 10s window, `after %d attempts` wrapping,
+process-group SIGKILL with a 2s WaitDelay, 512-byte cap before trim); the
+lifecycle ledger and failure memoization ride the upgrade handover. Failures
+answer 400 with `X-Envd-Failed-Volume` and a plain-text body while the
+deferred thaw still runs, and success-only headers stay off the error path.
+The unit tests caught two real parity bugs before any review did: the
+`filepath.Clean` port left a trailing separator after a `..` pop, and a
+deadline-SIGKILLed mount was misclassified as an immediate failure, which
+would have driven the 500ms retry path instead of the forced-unmount retry.
+An adversarial review re-derived the oracle contract from the pinned source,
+ran three mutations (argv corruption, memoized-failure short-circuit removal,
+lifecycleID nil/empty flip) — each turned the predicted tests red and was
+restored byte-identical — and approved with corrections: the slice adds a
+direct `libc = "0.2.190"` dependency (nix exposes neither `umount2` nor the
+statx mount-ID probe; already in the lock as a transitive dependency, so the
+lock changes by one dependency-list line and no new packages), and the net
+test accounting is +34 over the previous checkpoint. The review's LOW-1
+(thaw-skip unpinned on the failing mount path) closed with a test: a frozen
+daemon asked to `thaw:"skip"` that fails a mount still advertises
+`x-envd-thaw: skip` on the 400 and stays frozen. The known corner: when the
+2s WaitDelay fires after the deadline kill, partial child output is dropped
+where Go's CombinedOutput would keep it; loss is limited to that hang corner
+and mount output is small and capped. Immutable candidate
+`f6a3865c61a8b04225d5b6bbb75fe2962f4741a4b7ed723455f2fdf43c57c1a7` passed the
+eleven-gate differential battery (14-group regular, real CPU, real OOM,
+MMDS, expanded 22-group twice, freeze lifecycle thrice, guest probes twice)
+with 712 tests green over 47 suites. Serving processes and guest
+images have not been switched.
 Guest mode enables the OOM watcher unless `--isnotfc` is supplied; development mode
 keeps it disabled. Known history is returned oldest first, up to 32 kills, while
 unknown history is omitted. A dedicated dual-VM run validated one real kernel OOM,

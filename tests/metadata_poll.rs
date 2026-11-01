@@ -126,6 +126,7 @@ async fn boot_fc_starts_poll_while_auth_and_pending_effects_failures_do_not_refr
     let (client, transport, _, _) = setup(vec![]);
     let daemon = Arc::new(
         Daemon::new()
+            .with_nfs_mounter(Arc::new(FailingMkdir))
             .with_metadata_polling(client, dir.path().into(), false)
             .await,
     );
@@ -148,17 +149,17 @@ async fn boot_fc_starts_poll_while_auth_and_pending_effects_failures_do_not_refr
         .oneshot(
             Request::post("/init")
                 .body(Body::from(
-                    // A non-empty volumeMounts list is the pending-effect
-                    // refusal: a null or empty list is the oracle's successful
-                    // no-op (init.go:480 / init.go:796-874), covered by
-                    // tests/daemon.rs.
+                    // A FAILING volume mount is a SetData failure (a 400, like
+                    // the oracle's init.go:730-747): neither it nor a decode
+                    // failure may start a refresh. The full setupNFS matrix
+                    // lives in tests/daemon_nfs_volume.rs.
                     r#"{"volumeMounts":[{"path":"/data"}]}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     step(100).await;
     assert!(transport.calls.lock().unwrap().is_empty());
     router
@@ -706,4 +707,46 @@ async fn post_init_budgets_report_deadline_outcome_and_boot_reports_stopped() {
     lifecycle.start_boot();
     step(100).await;
     assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+}
+
+/// A mount executor whose mount point creation always fails, so a
+/// volumeMounts /init fails SetData like the oracle's 400 (init.go:730-747)
+/// without exec'ing anything.
+struct FailingMkdir;
+
+impl coorworker_envd::daemon::nfs::NfsMounter for FailingMkdir {
+    fn mount(
+        &self,
+        _nfs_target: &str,
+        _path: &str,
+        _deadline: tokio::time::Instant,
+    ) -> coorworker_envd::daemon::nfs::BoxFut<'_, coorworker_envd::daemon::nfs::CommandOutcome>
+    {
+        Box::pin(async { coorworker_envd::daemon::nfs::CommandOutcome::failure("must not run") })
+    }
+
+    fn make_dir(
+        &self,
+        path: &str,
+        _deadline: tokio::time::Instant,
+    ) -> coorworker_envd::daemon::nfs::BoxFut<'_, coorworker_envd::daemon::nfs::CommandOutcome>
+    {
+        let path = path.to_owned();
+        Box::pin(async move {
+            coorworker_envd::daemon::nfs::CommandOutcome::failure(format!(
+                "`mkdir -p {path}` failed: exit status 1: mkdir: permission denied"
+            ))
+        })
+    }
+
+    fn unmount(&self, _path: &str) -> coorworker_envd::daemon::nfs::BoxFut<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn mount_id(
+        &self,
+        _path: &str,
+    ) -> coorworker_envd::daemon::nfs::BoxFut<'_, Result<u64, String>> {
+        Box::pin(async { Ok(1) })
+    }
 }
