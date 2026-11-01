@@ -1,0 +1,24 @@
+Upstream: https://github.com/e2b-dev/runtime
+Commit: 51083a83cc0903185d992725ea6bb33683814b29
+Daemon release: 0.10.2 (packages/envd/pkg/version.go)
+License: Apache-2.0; full upstream LICENSE included alongside this file.
+Root tree at this pin contains LICENSE and no root NOTICE.
+Modification status: all vendored files below are byte-for-byte unchanged.
+
+SHA256                                                            Local path                            Upstream path
+8edd9358c7dbfcad96796b3f0ed8d14c262b8b14d6bc7d5e84d468941511b8e0  spec/process/process.proto            packages/envd/spec/process/process.proto
+5024f6f6c9a62cab94e29a209389313fd259c8eaa847b5093356308dc2f711b9  spec/filesystem/filesystem.proto      packages/envd/spec/filesystem/filesystem.proto
+914bec4be34d5e7b35d098e62f0f360452248a6297a6b4e4caf2b7f3c34f04b3  spec/upgrade/handover.proto            packages/envd/spec/upgrade/handover.proto
+0a5cfaa724763d771bab1d60164e184edb1f756228fa2d54733169580c907d95  spec/envd.yaml                        packages/envd/spec/envd.yaml
+1225059a366c499de20bde865684c42d66e4cc6887419d5566bdbb3913cf3e32  legacy/legacyfilesystem.proto         packages/envd/internal/services/legacy/legacyfilesystem.proto
+357e6e662d8338c6c72752f4735a8470f061ad1e0cd3c3e4c201c38352258932  legacy/legacyprocess.proto            packages/envd/internal/services/legacy/legacyprocess.proto
+b4ef1bf811cb4095229fb86b574199e467c78f0ac4078cf8be62189e1fbd0818  LICENSE                               LICENSE
+
+Generated output is produced locally by build.rs using connectrpc-build 0.9.0,
+connectrpc 0.9.1 and buffa 0.9.1, with exact transitive versions in Cargo.lock.
+The build script never downloads schemas or compilers. Generated code inherits
+upstream schema attribution; distribute this directory's LICENSE/PROVENANCE
+with any binary or image containing those generated types.
+
+This pin is independent of agent_server/third_party/e2b/PROVENANCE. Earlier
+host bindings retain their original provenance and have not been relabeled.
