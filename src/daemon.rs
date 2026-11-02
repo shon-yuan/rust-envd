@@ -55,6 +55,7 @@ mod cors;
 mod download;
 mod filesystem_rpc;
 mod frontdoor;
+pub mod http1;
 mod metrics;
 pub mod nfs;
 mod process_rpc;
@@ -542,6 +543,7 @@ pub fn app_with_execution(state: Arc<Daemon>, runtime: crate::process::ProcessRu
 /// inside authorization because Go's auth middleware wraps the mux, so an
 /// unauthenticated unknown path is 401, not 404.
 fn layered(router: Router, state: Arc<Daemon>) -> Router {
+    crate::transport::ensure_protojson_schema();
     router
         .layer(middleware::from_fn(frontdoor::gate))
         .layer(middleware::from_fn_with_state(state, authorize))

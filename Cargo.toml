@@ -32,13 +32,14 @@ zeroize = { version = "1", features = ["alloc"] }
 seckey = "=0.12.1"
 region = "=4.0.1"
 buffa = { version = "=0.9.1", features = ["json"] }
+buffa-descriptor = { version = "=0.9.1", features = ["reflect"] }
 buffa-types = { version = "=0.9.1", features = ["json"] }
 connectrpc = { version = "=0.9.1", default-features = false, features = ["json", "gzip", "server", "axum"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 bytes = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 rustls-native-certs = "=0.8.5"

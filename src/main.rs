@@ -699,11 +699,14 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         });
         daemon.set_upgrade_run(run);
     }
-    let result = axum::serve(listener, app_with_execution(daemon.clone(), runtime))
-        .with_graceful_shutdown(async {
+    let result = coorworker_envd::daemon::http1::serve(
+        listener,
+        app_with_execution(daemon.clone(), runtime),
+        async {
             let _ = tokio::signal::ctrl_c().await;
-        })
-        .await;
+        },
+    )
+    .await;
     daemon.shutdown_metadata().await?;
     port_wiring.shutdown().await;
     if let Some(tasks) = log_tasks {

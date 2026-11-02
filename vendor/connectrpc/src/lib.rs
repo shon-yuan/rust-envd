@@ -206,6 +206,8 @@ pub mod handler;
 pub mod interceptor;
 pub mod payload;
 pub mod protocol;
+#[cfg(feature = "json")]
+pub mod protojson;
 pub mod request;
 pub mod response;
 pub mod router;

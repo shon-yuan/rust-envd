@@ -17,7 +17,7 @@ connectrpc = { path = "vendor/connectrpc" }
 Only `crates/envd` uses the crate (server side). The fork exists solely for
 wire-parity with the pinned oracle, official Go envd 0.10.2 (commit
 `51083a83cc0903185d992725ea6bb33683814b29`), whose RPC layer is connect-go
-1.19.2. Every change below makes a malformed-request error text or frame
+1.18.1. Every change below makes a malformed-request error text or frame
 byte-identical to that oracle; no API surface used by callers changed beyond
 trait bounds.
 
@@ -25,9 +25,10 @@ trait bounds.
 
 | File | Change |
 | --- | --- |
-| `src/lib.rs` | Declares `mod go_json` under the `json` feature. |
+| `src/lib.rs` | Declares `mod go_json` under the `json` feature and `pub mod protojson`. |
 | `src/go_json.rs` | **New.** Go `protojson` syntax-error scanner: reports `proto: unexpected EOF`, `proto: syntax error (line L:C): invalid value <token>`, or `proto: unexpected token <token>` with Go's token regexp (`^([-+._a-zA-Z0-9]{1,32}|.)`), rune-based columns and lossy-replacement formatting. A token decoded from an invalid UTF-8 byte is flagged so the encoder can reproduce Go's escaping. Unit tests pin the oracle corpus texts. |
-| `src/codec.rs` | `decode_json` now takes `M: DeserializeOwned + MessageName` and produces connect-go's texts: empty body → `unmarshal message: zero-length payload is not a valid JSON object`; syntax failures → `unmarshal message: unmarshal into *<package>.<Type>: <protojson detail>` (nested names joined with `_`). A token decoded from invalid UTF-8 marks the error so its U+FFFD is JSON-escaped as in Go (see `src/error.rs`). Syntactically valid but schema-invalid JSON keeps serde's text (outside the campaign corpus). |
+| `src/protojson.rs` | **New.** `DiscardUnknown` message walker: per-field value/kind checks with Go's `(line L:C)` positions and field names, duplicate fields and map keys, oneof double sets, enum names/numbers/ranges, quoted-number re-lexing, strict base64, unknown fields, extension-key type errors and Go's global 10,000-message recursion budget. Well-known types dispatch before the token read, as in `unmarshalMessage`: `Timestamp`, `Duration`, the nine wrappers, `Struct`/`ListValue`/`Value`, `FieldMask` and `Empty` reproduce Go's decoders (including its timestamp layout, duration grammar, FieldMask `JSONSnakeCase` validation and `out of range` texts); `Any` falls back to serde. `SchemaSet` comes from a caller-registered descriptor graph (`register`), so the crate stays message-agnostic. |
+| `src/codec.rs` | `decode_json` now takes `M: DeserializeOwned + MessageName` and produces connect-go's texts: empty body → `unmarshal message: zero-length payload is not a valid JSON object`; syntax and schema failures → `unmarshal message: unmarshal into *<package>.<Type>: <protojson detail>` (nested names joined with `_`). A token decoded from invalid UTF-8 marks the error so its U+FFFD is JSON-escaped as in Go (see `src/error.rs`). When a schema is registered the walker decides the message; with none registered it keeps serde's text. |
 | `src/error.rs` | `ConnectError` gains a private `escapes_replacement` flag (skipped by serde) and `to_json` rewrites each raw U+FFFD in the body as Go's six-character JSON escape. Go's `encoding/json` coerces strings from invalid UTF-8 this way; serde_json writes the raw bytes. Only the protojson malformed-token path sets the flag. |
 | `src/envelope.rs` | Adds `incomplete_envelope_error`: short prefix → `protocol error: incomplete envelope: unexpected EOF`; otherwise `protocol error: promised N bytes in enveloped message, got M bytes`. Unsupported compression → `protocol error: sent compressed message without compression support`. `decode_eof` uses the helper. |
 | `src/service.rs` | Connect and gRPC unary paths use connect-go's cardinality and framing texts: `unary request has zero messages`, `unary request has multiple messages`, the envelope helper, and the compression text. |
@@ -35,10 +36,16 @@ trait bounds.
 
 ## Keeping the fork honest
 
-- The regression corpus lives in `crates/envd/tests/malformed_rpc.rs` and is
-  captured from the pinned oracle by
-  `scripts/tests/envd-parity/malformed_vm.py`.
+- The malformed-request regression corpus lives in `crates/envd/tests/malformed_rpc.rs`
+  and is captured from the pinned oracle by
+  `scripts/tests/envd-parity/malformed_vm.py`. The schema-error corpus lives in
+  `crates/envd/tests/fixtures/protojson_schema.json` and is captured by
+  `scripts/tests/envd-parity/schema_vm.py --rust-fixture`; both are replayed by
+  `crates/envd/tests/protojson_schema.rs` and `malformed_rpc.rs`.
+- `SchemaSet` registration is the caller's job
+  (`crates/envd/src/transport/protojson_schema.rs` projects the compiled
+  descriptor set into it); the fork carries no envd message names.
 - To update the upstream base, re-copy the registry crate and re-apply these
-  patches; re-run the malformed gate before freezing a candidate.
+  patches; re-run both gates before freezing a candidate.
 - Do not add unrelated features here. Changes that are not oracle-parity
   fixes belong upstream or in `crates/envd`.

@@ -1,7 +1,7 @@
 //! Wire text for malformed Connect requests, byte-compared against the pinned
 //! oracle corpus captured by `scripts/tests/envd-parity/malformed_vm.py`.
 //!
-//! The oracle's texts come from connect-go 1.19.2 plus
+//! The oracle's texts come from connect-go 1.18.1 plus
 //! google.golang.org/protobuf's JSON decoder; the vendored connectrpc fork
 //! (`vendor/connectrpc`) reproduces them. Every request here is malformed
 //! before any handler action, so a daemon with its default runtime suffices.

@@ -1,4 +1,4 @@
-//! The oracle's request mux (chi v1.5.5 + connect-go v1.19.2 handlers), which
+//! The oracle's request mux (chi v1.5.5 + connect-go v1.18.1 handlers), which
 //! decides four outcomes before any handler code runs:
 //!
 //! - a known HTTP operation with the wrong method → 405, empty body, no headers

@@ -82,11 +82,34 @@ fn event(value: &pb::FilesystemEvent) -> old::FilesystemEvent {
     }
 }
 
+/// Decode a response the guest itself just encoded.
+///
+/// Go's interceptor converts the handler's typed message, so it never runs
+/// protojson over its own output. `Payload::message` would, and Go's
+/// protojson limits a document to 10,000 decoded messages — a `ListDir` of a
+/// large directory exceeds that. Trusted internal output therefore uses plain
+/// serde for JSON and `Payload::message` for protobuf.
+fn decode<M>(payload: &Payload) -> Result<M, ConnectError>
+where
+    M: buffa::Message
+        + buffa::MessageName
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + Clone
+        + 'static,
+{
+    match payload.format() {
+        connectrpc::CodecFormat::Json => serde_json::from_slice(payload.bytes())
+            .map_err(|error| ConnectError::internal(format!("legacy response decode: {error}"))),
+        _ => Ok(payload.message::<M>()?.clone()),
+    }
+}
+
 fn convert(path: &str, payload: Payload) -> Result<Payload, ConnectError> {
     let format = payload.format();
     macro_rules! entry_response {
         ($modern:ty, $legacy:ident) => {{
-            let value = payload.message::<$modern>()?;
+            let value = decode::<$modern>(&payload)?;
             let converted = old::$legacy {
                 entry: value
                     .entry
@@ -105,8 +128,7 @@ fn convert(path: &str, payload: Payload) -> Result<Payload, ConnectError> {
         "MakeDir" => entry_response!(pb::MakeDirResponse, MakeDirResponse),
         "ListDir" => Payload::from_message(
             old::ListDirResponse {
-                entries: payload
-                    .message::<pb::ListDirResponse>()?
+                entries: decode::<pb::ListDirResponse>(&payload)?
                     .entries
                     .iter()
                     .map(entry)
@@ -118,8 +140,7 @@ fn convert(path: &str, payload: Payload) -> Result<Payload, ConnectError> {
         "Remove" => Payload::from_message(old::RemoveResponse::default(), format),
         "CreateWatcher" => Payload::from_message(
             old::CreateWatcherResponse {
-                watcher_id: payload
-                    .message::<pb::CreateWatcherResponse>()?
+                watcher_id: decode::<pb::CreateWatcherResponse>(&payload)?
                     .watcher_id
                     .clone(),
                 ..Default::default()
@@ -128,8 +149,7 @@ fn convert(path: &str, payload: Payload) -> Result<Payload, ConnectError> {
         ),
         "GetWatcherEvents" => Payload::from_message(
             old::GetWatcherEventsResponse {
-                events: payload
-                    .message::<pb::GetWatcherEventsResponse>()?
+                events: decode::<pb::GetWatcherEventsResponse>(&payload)?
                     .events
                     .iter()
                     .map(event)
@@ -139,7 +159,8 @@ fn convert(path: &str, payload: Payload) -> Result<Payload, ConnectError> {
             format,
         ),
         "WatchDir" => {
-            Payload::from_message(watch(payload.message::<pb::WatchDirResponse>()?), format)
+            let value = decode::<pb::WatchDirResponse>(&payload)?;
+            Payload::from_message(watch(&value), format)
         }
         // Go has no converter for RemoveWatcher, but still sends the notification.
         _ => payload,

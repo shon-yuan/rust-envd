@@ -15,9 +15,21 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, Interest, ReadBuf};
 use tokio::process::ChildStdin;
 
+/// A read-end the entry owns and the pump reads, without allocating a second
+/// descriptor: Go's `Readopt` stores `args.Stdout` and both the handler and
+/// the pump use that one `*os.File`, so a chained export reports the same
+/// number the pump is registered on.
+pub(super) struct SharedFd(pub(super) std::sync::Arc<OwnedFd>);
+
+impl AsRawFd for SharedFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
 /// A pipe read-end relocated off the handover slot (readopt.go's `fileOrNil`
 /// result as a pump reader).
-pub(super) struct FdReader(pub(super) AsyncFd<std::fs::File>);
+pub(super) struct FdReader(pub(super) AsyncFd<SharedFd>);
 
 impl AsyncRead for FdReader {
     fn poll_read(

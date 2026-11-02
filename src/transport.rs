@@ -4,7 +4,9 @@ use connectrpc::{ConnectError, ConnectRpcService, DeadlinePolicy, Interceptor, P
 
 mod input;
 mod legacy;
+mod protojson_schema;
 pub(crate) use input::{encode_input_response, input_response_encoding, observe_request};
+pub(crate) use protojson_schema::ensure_registered as ensure_protojson_schema;
 
 struct ProtocolVersion;
 

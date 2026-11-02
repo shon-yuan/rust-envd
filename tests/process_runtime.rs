@@ -1778,6 +1778,64 @@ async fn handover_readopt_relocates_a_real_export_slot_window_body() {
     drop(guard);
 }
 
+async fn handover_chained_export_carries_readopted_stdio_body() {
+    let rt1 = runtime();
+    let mut stream = rt1
+        .start(request("/bin/cat", &[]), Some(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    let pid = start_pid(&mut stream).await;
+    let (procs, guard1) = rt1.export_processes().await.unwrap();
+    assert_eq!(procs.len(), 1);
+
+    let rt2 = runtime();
+    let (thawed_tx, thawed) = tokio::sync::watch::channel(());
+    thawed_tx.send(()).unwrap();
+    let (adopted, failed) = rt2.readopt_processes(&procs, thawed).await;
+    assert_eq!((adopted, failed), (1, 0));
+    // readopt consumed the slot window; the old guard must not close numbers
+    // the next export is about to reuse.
+    std::mem::forget(guard1);
+
+    // A second handover out of a re-adopted runtime: Go's HandoverFds reads
+    // the live handler files, so the endpoints must still be carried even
+    // though this runtime only inherited them.
+    let (again, guard2) = rt2.export_processes().await.unwrap();
+    assert_eq!(again.len(), 1);
+    let carried = &again[0];
+    assert_eq!(carried.pid, pid);
+    let base = HANDOVER_FD_BASE;
+    assert_eq!(carried.stdout_fd, base, "readopted stdout must be carried");
+    assert_eq!(
+        carried.stderr_fd,
+        base + 1,
+        "readopted stderr must be carried"
+    );
+    assert_eq!(
+        carried.stdin_fd,
+        base + 2,
+        "readopted stdin must be carried"
+    );
+    for fd in [carried.stdout_fd, carried.stderr_fd, carried.stdin_fd] {
+        let stat = nix::sys::stat::fstat(fd).expect("a carried endpoint must stay open");
+        assert_eq!(
+            stat.st_mode & nix::libc::S_IFMT,
+            nix::libc::S_IFIFO,
+            "slot {fd} must be the inherited pipe"
+        );
+        assert_eq!(
+            fd_flags(fd).expect("carried slot open") & nix::libc::FD_CLOEXEC,
+            0,
+            "slot {fd} kept CLOEXEC"
+        );
+    }
+    drop(guard2);
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+}
+
 /// The handover slot window (fds 200-203) is the TEST PROCESS's real fd
 /// table, and a full parallel suite parks sockets there — a dup2 would
 /// clobber a sibling test's descriptor and an export would abort. Like the
@@ -1845,4 +1903,34 @@ async fn handover_readopt_relocates_a_real_export_slot_window() {
         return;
     }
     run_in_dedicated_handover_child("handover_readopt_relocates_a_real_export_slot_window").await;
+}
+
+#[tokio::test]
+async fn handover_chained_export_carries_readopted_stdio() {
+    if std::env::var(HANDOVER_CHILD).is_ok() {
+        handover_chained_export_carries_readopted_stdio_body().await;
+        return;
+    }
+    run_in_dedicated_handover_child("handover_chained_export_carries_readopted_stdio").await;
+}
+
+#[tokio::test]
+async fn failed_adoption_reaps_the_inherited_child() {
+    // A carried child whose adoption failed has no entry or reaper; the
+    // helper must kill and collect it. `pid <= 1` is a no-op guard because
+    // kill(0, …) would target the test's own process group.
+    runtime::supervise::reap_unadopted(0).await;
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    runtime::supervise::reap_unadopted(pid).await;
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None),
+        Err(nix::errno::Errno::ESRCH),
+        "unadopted child still exists after reap"
+    );
+    // The helper already collected the status; this only releases the handle.
+    let _ = child.wait();
 }

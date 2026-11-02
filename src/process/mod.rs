@@ -61,7 +61,7 @@ use tokio::time::Instant;
 mod pipe;
 mod pty;
 mod spawn;
-mod supervise;
+pub(crate) mod supervise;
 /// Shared with the handover blob writer, whose refusal body carries the same
 /// Go `*fs.PathError` Display shape (upgrade.go:270-276).
 #[allow(unused_imports)] // Unused only where the test harness compiles this file directly.
@@ -166,10 +166,13 @@ struct Entry {
     /// handler's files). Absent for PTY children and dropped on end — the
     /// kernel object lives as long as either handle does, and the entry
     /// leaves the live map when the process ends, matching Go's handler
-    /// lifetime. Adopted entries carry None: their supervise task owns the
-    /// only daemon-side handle, which the next handover relocates directly.
-    stdout_dup: Option<std::os::fd::OwnedFd>,
-    stderr_dup: Option<std::os::fd::OwnedFd>,
+    /// lifetime. Adopted entries keep the relocated endpoints here too, so a
+    /// CHAINED handover carries them again exactly like Go's readopted
+    /// handler (whose `stdoutF`/`stderrF` stay live); their supervision
+    /// registers this same descriptor number rather than allocating a
+    /// duplicate, so adoption uses one fd per stream like Go.
+    stdout_dup: Option<Arc<std::os::fd::OwnedFd>>,
+    stderr_dup: Option<Arc<std::os::fd::OwnedFd>>,
     /// The absolute kill deadline (request timeout) this process was started
     /// with, as Go's `Deadline()` reports it. Set for started processes at
     /// spawn; for adopted ones `run_adopted` records it when the carried
@@ -431,8 +434,8 @@ impl ProcessRuntime {
             stderr_bytes: Arc::new(AtomicI64::new(0)),
             pty_bytes: Arc::new(AtomicI64::new(0)),
             operation_id: operation_id.clone(),
-            stdout_dup: dup_end(child.stdout.as_ref()),
-            stderr_dup: dup_end(child.stderr.as_ref()),
+            stdout_dup: dup_end(child.stdout.as_ref()).map(Arc::new),
+            stderr_dup: dup_end(child.stderr.as_ref()).map(Arc::new),
             deadline_at: Mutex::new(deadline_at),
         });
         registry.retained.retain(|old_pid, exit| {
@@ -692,12 +695,12 @@ impl ProcessRuntime {
             let stdout = entry
                 .stdout_dup
                 .as_ref()
-                .map(|fd| fd.as_raw_fd())
+                .map(|fd| fd.as_ref().as_raw_fd())
                 .unwrap_or(-1);
             let stderr = entry
                 .stderr_dup
                 .as_ref()
-                .map(|fd| fd.as_raw_fd())
+                .map(|fd| fd.as_ref().as_raw_fd())
                 .unwrap_or(-1);
             let stdin = entry
                 .stdin
@@ -784,6 +787,9 @@ impl ProcessRuntime {
                 Ok(()) => adopted += 1,
                 Err(error) => {
                     eprintln!("handover: readopt pid {}: {error}", proc.pid);
+                    // No entry will supervise this inherited child; reap it
+                    // instead of leaving an invisible, unreaped process.
+                    supervise::reap_unadopted(proc.pid).await;
                     failed += 1;
                 }
             }
@@ -800,31 +806,51 @@ impl ProcessRuntime {
             |slot: i32| -> Option<std::os::fd::OwnedFd> { pipe::relocate_carried_fd(slot).ok() };
         let is_pty = proc.cg_type == "pty";
         // A PTY child's I/O is the master; its carried stdout/stderr (absent
-        // from the outgoing side) are dropped rather than wrapped.
-        let (terminal, stdout, stderr) = if is_pty {
+        // from the outgoing side) are dropped rather than wrapped. Non-PTY
+        // endpoints are relocated first and stay owned by the entry, so the
+        // next handover can carry them (Go `HandoverFds` reports the
+        // readopted handler's live files).
+        let (terminal, stdout_owned, stderr_owned) = if is_pty {
             let tty = relocate(proc.tty_fd)
                 .ok_or_else(|| format!("tty descriptor absent for pty pid {}", proc.pid))?;
             let terminal = pty::Terminal::from_master(tty)
                 .map_err(|error| format!("adopted master for pid {}: {error}", proc.pid))?;
             (Some(terminal), None, None)
         } else {
-            let stdout = relocate(proc.stdout_fd).and_then(|fd| {
-                tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))
-                    .ok()
-                    .map(pipe::FdReader)
-            });
-            let stderr = relocate(proc.stderr_fd).and_then(|fd| {
-                tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))
-                    .ok()
-                    .map(pipe::FdReader)
-            });
-            (None, stdout, stderr)
+            (
+                None,
+                relocate(proc.stdout_fd).map(Arc::new),
+                relocate(proc.stderr_fd).map(Arc::new),
+            )
         };
-        let stdin = relocate(proc.stdin_fd).and_then(|fd| {
-            tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))
-                .ok()
-                .map(pipe::StdinPipe::Adopted)
-        });
+        // Relocate every carried descriptor before any fallible registration:
+        // on failure the owned values below drop and close every slot this
+        // process owned, so no CLOEXEC-cleared handover fd survives into the
+        // next export (which keys slots by sorted-pid index).
+        let stdin_fd = relocate(proc.stdin_fd);
+        // The pump registers the entry's own descriptor: Go's `Readopt` keeps
+        // `args.Stdout` and both the handler and the pump share that one
+        // `*os.File`, so a chained export reports the same endpoint. A failed
+        // registration fails the adoption instead of leaving the child with
+        // an unread pipe and reporting a clean handover.
+        let read_side = |fd: &Option<Arc<std::os::fd::OwnedFd>>| -> Result<_, String> {
+            let Some(fd) = fd else {
+                return Ok(None);
+            };
+            tokio::io::unix::AsyncFd::new(pipe::SharedFd(fd.clone()))
+                .map(pipe::FdReader)
+                .map(Some)
+                .map_err(|error| format!("adopted reader for pid {}: {error}", proc.pid))
+        };
+        let stdout = read_side(&stdout_owned)?;
+        let stderr = read_side(&stderr_owned)?;
+        let stdin = match stdin_fd {
+            None => None,
+            Some(fd) => Some(pipe::StdinPipe::Adopted(
+                tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))
+                    .map_err(|error| format!("adopted stdin for pid {}: {error}", proc.pid))?,
+            )),
+        };
         let (control, controls) = mpsc::channel(1);
         let entry = Arc::new(Entry {
             info: pb::ProcessInfo {
@@ -842,8 +868,8 @@ impl ProcessRuntime {
             stderr_bytes: Arc::new(AtomicI64::new(0)),
             pty_bytes: Arc::new(AtomicI64::new(0)),
             operation_id: None,
-            stdout_dup: None,
-            stderr_dup: None,
+            stdout_dup: stdout_owned,
+            stderr_dup: stderr_owned,
             deadline_at: Mutex::new(None),
         });
         // Register before the supervision starts, so a Connect racing the

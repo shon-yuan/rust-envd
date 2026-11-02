@@ -1,6 +1,6 @@
 //! Go protojson syntax-error text for JSON request payloads.
 //!
-//! The pinned oracle (envd 0.10.2, connect-go 1.19.2) answers a malformed
+//! The pinned oracle (envd 0.10.2, connect-go 1.18.1) answers a malformed
 //! JSON request with the connect-go wrapping
 //! `unmarshal message: unmarshal into *<package>.<Message>: <detail>`
 //! (`envelope.go:312` and `codec.go:181`), where `<detail>` is produced by

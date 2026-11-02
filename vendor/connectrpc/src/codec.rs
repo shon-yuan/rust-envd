@@ -164,6 +164,31 @@ pub fn decode_json<M: DeserializeOwned + MessageName>(data: &[u8]) -> Result<M, 
             "unmarshal message: zero-length payload is not a valid JSON object",
         ));
     }
+    if let Some(result) = crate::protojson::decode(M::FULL_NAME, data) {
+        let detail = match result {
+            // The Go walker already produced canonical JSON; buffa is only the
+            // final typed projection. A failure here is unreachable for a
+            // complete schema and falls back to the serde text below.
+            Ok(canonical) => match serde_json::from_slice(&canonical) {
+                Ok(message) => return Ok(message),
+                Err(_) => None,
+            },
+            Err(detail) => Some(detail),
+        };
+        if let Some(detail) = detail {
+            let connect = ConnectError::invalid_argument(format!(
+                "unmarshal message: unmarshal into *{}.{}: proto: {}",
+                M::PACKAGE,
+                M::NAME.replace('.', "_"),
+                detail.text,
+            ));
+            return Err(if detail.escapes_replacement {
+                connect.escaping_replacement()
+            } else {
+                connect
+            });
+        }
+    }
     serde_json::from_slice(data).map_err(|error| {
         let (detail, escapes_replacement) = match crate::go_json::syntax_error(data) {
             Some(syntax) => (syntax.text(data), syntax.escapes_replacement()),

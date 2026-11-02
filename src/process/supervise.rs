@@ -481,6 +481,21 @@ fn wait_adopted_raw(
     Ok(Some(std::process::ExitStatus::from_raw(status)))
 }
 
+/// A carried process whose adoption failed has no entry, no readers and no
+/// reaper: kill it and collect the status so it neither keeps running unseen
+/// nor becomes a zombie. Go's `Readopt` cannot fail on a valid carried
+/// descriptor, so this path is Rust-only; terminating is the conservative
+/// choice because the dropped read ends would fail the child on its next
+/// write anyway. `pid <= 1` is refused because `kill(0, …)` targets our own
+/// process group.
+pub(crate) async fn reap_unadopted(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
+    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    let _ = wait_adopted(pid).await;
+}
+
 /// readopt.go `reapByPidfd`'s terminal rendering. Deliberately different
 /// from the live path's `ProcessState.String()` text: a normal exit renders
 /// `"exited"` (not "exit status N") and a signal death renders the bare

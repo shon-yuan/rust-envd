@@ -303,6 +303,7 @@ dependencies = [
  "axum",
  "base64",
  "buffa",
+ "buffa-descriptor",
  "buffa-types",
  "bytes",
  "connectrpc",

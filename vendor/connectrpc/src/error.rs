@@ -620,30 +620,41 @@ impl ConnectError {
             // Fallback: produce minimal valid Connect error JSON.
             format!(r#"{{"code":"{}"}}"#, self.code.as_str()).into_bytes()
         });
-        if self.escapes_replacement {
-            Bytes::from(escape_replacement(&body))
-        } else {
-            Bytes::from(body)
-        }
+        Bytes::from(go_json_string_escapes(&body, self.escapes_replacement))
     }
 }
 
-/// Rewrite each UTF-8 encoding of U+FFFD as its six-character JSON escape,
-/// the form Go's `encoding/json` uses for a replacement rune produced from
-/// invalid UTF-8 (encode.go's `string` fast path).
-fn escape_replacement(bytes: &[u8]) -> Vec<u8> {
+/// Apply the transformations Go's `encoding/json` applies to strings that
+/// serde leaves alone: HTML-sensitive runes, U+2028/U+2029, and — when the
+/// message echoed invalid request bytes — a replacement rune written as its
+/// six-character escape.
+fn go_json_string_escapes(bytes: &[u8], escape_replacement: bool) -> Vec<u8> {
     const REPLACEMENT: [u8; 3] = [0xEF, 0xBF, 0xBD];
-    // The six JSON characters backslash-u-f-f-f-d, spelled as bytes so the
-    // source needs no escape sequence of its own.
     const REPLACEMENT_ESCAPE: [u8; 6] = [0x5C, b'u', b'f', b'f', b'f', b'd'];
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index..].starts_with(&REPLACEMENT) {
-            out.extend_from_slice(&REPLACEMENT_ESCAPE);
+        let remaining = &bytes[index..];
+        if remaining.starts_with(&REPLACEMENT) {
+            if escape_replacement {
+                out.extend_from_slice(&REPLACEMENT_ESCAPE);
+            } else {
+                out.extend_from_slice(&REPLACEMENT);
+            }
             index += REPLACEMENT.len();
+        } else if remaining.starts_with(&[0xE2, 0x80, 0xA8]) {
+            out.extend_from_slice(b"\\u2028");
+            index += 3;
+        } else if remaining.starts_with(&[0xE2, 0x80, 0xA9]) {
+            out.extend_from_slice(b"\\u2029");
+            index += 3;
         } else {
-            out.push(bytes[index]);
+            match bytes[index] {
+                b'<' => out.extend_from_slice(b"\\u003c"),
+                b'>' => out.extend_from_slice(b"\\u003e"),
+                b'&' => out.extend_from_slice(b"\\u0026"),
+                byte => out.push(byte),
+            }
             index += 1;
         }
     }
