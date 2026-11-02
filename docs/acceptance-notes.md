@@ -541,20 +541,21 @@ Gaps closed in this campaign, each bound to the candidate:
   and well-known-type decoding; the schema is registered from the compile-time
   descriptor set in `src/transport/protojson_schema.rs`, and
   `tests/protojson_schema.rs` replays the oracle fixture on the host router.
-- **Live-upgrade handover, chained.** Four guests per side: both `reexec` and
+- **Live-upgrade handover, chained.** Five guests per side: both `reexec` and
   `install` modes with plain/PTY/tagged processes, a retained exit, watcher,
   socat listeners and a failure guest; OOM history rebuilt after the swap;
-  and four consecutive handovers per side over three concurrent forwarder
-  ports. The re-adopted process stdio defect is fixed: the entry keeps the
+  eight consecutive handovers per side over three concurrent forwarder ports
+  plus a ninth after a forwarder restart; and a binding-filter guest. The
+  re-adopted process stdio defect is fixed: the entry keeps the
   relocated endpoints and the pump registers the same descriptor
   (`pipe::SharedFd`, one fd per stream like Go's shared `*os.File`), pinned by
   `tests/process_runtime.rs::handover_chained_export_carries_readopted_stdio`;
   a failed registration fails that adoption, and the inherited child is killed
   and reaped rather than left running with no entry or reaper
   (`tests/process_runtime.rs::failed_adoption_reaps_the_inherited_child`). The
-  two sides' documents are identical (`/tmp/upgrade-*-v7.json`,
-  `/tmp/upgrade-v7-diff.txt`; artifacts
-  `/tmp/envd-upgrade-vm-{2z8f9rgx,umz6k9le,9dz5n5kv,omppai2y}`).
+  two sides' documents are identical (`/tmp/upgrade-*-v8.json`; the v7
+  documents remain as earlier evidence; artifacts
+  `/tmp/envd-upgrade-vm-{eccdmcqm,9x_i9_kp,tvizmb5a,9knbtz6c}`).
 - **Multi-port and socat crash/restart.** Three concurrent loopback
   forwarders are probed before and after every handover with all three
   observed; SIGKILLing the daemon-spawned socat leaves its port dark (the
@@ -608,7 +609,7 @@ Explicitly **not** claimed:
   Go stop reading after the response while the guard still parses the tail;
   non-100-continue `Expect` values and URI forms Go accepts but hyper rejects
   are outside the corpus;
-- chains longer than four consecutive swaps (they repeat the same
+- chains longer than eight consecutive swaps (they repeat the same
   export/relocate path);
 - cgroup OOM inside a nested/limited hierarchy other than the helper's own
   cgroup, and stalls long enough to trigger `memory.oom.group`;
@@ -665,8 +666,16 @@ Gaps closed in this campaign, each bound to the same candidate:
   `relay_confounded`, not asserted: `169.254.0.21` is a guest-local address,
   so the wildcard listener answers that probe itself even with zero
   daemon-spawned socats. A post-handover read proves the carried set keeps
-  only the control. All four upgrade documents per side and mode are identical
-  (`/tmp/upgrade-*-v8.json`).
+  only the control.
+- **Chained handover depth.** The chained guest now performs eight consecutive
+  swaps, the requested mode alternating with the other, plus a ninth after the
+  forwarder-restart sequence. Every handover re-proves the dropped connection,
+  handover header, three forwarder probes, post-handover watcher delivery and
+  unchanged live set, so the export/relocate and forwarder-refresh paths are
+  exercised past the former four-swap boundary. All four upgrade documents
+  (oracle/candidate × reexec/install) record the eight `chained.upgrades` and
+  the post-restart handover, and are identical per mode after removing
+  `side`/identity/`retained` (`/tmp/upgrade-*-v8.json`).
 
 Every previously existing gate was re-run on this candidate and passed
 (`result-1.json`: `passed=true`, `failure=null`, candidate manifest binding
@@ -690,7 +699,7 @@ Explicitly **not** claimed:
 - inputs outside the captured corpora, including arbitrary malformed protocol
   traffic and unenumerated system behavior;
 - TLS, a completed h2c switch, and response trailers;
-- chains longer than four consecutive swaps (they repeat the same
+- chains longer than eight consecutive swaps (they repeat the same
   export/relocate path);
 - the production Firecracker transport path (P2/P3) and the host facade (S4);
 - a clean-tree distribution until the mirror commit is made; the provenance
