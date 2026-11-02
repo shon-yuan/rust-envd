@@ -27,4 +27,6 @@ Code generation runs locally in `build.rs` via `protoc` and
 `connectrpc-build`; nothing is downloaded. The engineering acceptance log —
 capability narrative, differential evidence, and the current limitation
 list — lives in [docs/acceptance-notes.md](docs/acceptance-notes.md). NFS
-volume mounts are not implemented and answer `501`.
+`volumeMounts` mounts through the real `mount.nfs` path and passes the
+isolated QEMU differential gate against the pinned Go oracle; the sandbox
+serving images have not switched.

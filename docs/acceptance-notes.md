@@ -33,9 +33,9 @@ This opt-in is a test startup guard, not full guest initialization. The CLI now
 reproduces all eight oracle flags with Go `flag` semantics (both dash forms,
 `=value`, base-0 int64 parsing, help output, `bad flag syntax` diagnostics,
 `--`/bare-`-` terminators, exit codes); the metrics lifecycle inventory is
-verified complete; and every system-init effect is implemented except a
-non-empty `volumeMounts` list, which keeps answering 501 because NFS mounting
-remains unfinished pending separate authorization. MMDS init authentication now
+verified complete; and every system-init effect is implemented, including a
+non-empty `volumeMounts` list, which mounts through the real `mount.nfs` path
+and has its own isolated QEMU differential gate. MMDS init authentication now
 has an injected provider and separate cancellation-safe init serialization. Guarded
 Firecracker guest startup wires a fresh v2 token/metadata client and route repair;
 development and `--isnotfc` retain the noop provider. The envd-side transparent
@@ -405,6 +405,30 @@ eleven-gate differential battery (14-group regular, real CPU, real OOM,
 MMDS, expanded 22-group twice, freeze lifecycle thrice, guest probes twice)
 with 712 tests green over 47 suites. Serving processes and guest
 images have not been switched.
+
+The NFS P1 differential gate (2026-11-02) then bound the same candidate
+`f6a3865c…c1a7` and the pinned Go oracle `2fe9ca62…91a55` (test NFS server
+`e26c44f4…7f4a`) to the volumeMounts gate in identical disposable QEMU
+guests: the six default cases (`nfs-mount-success`, `nfs-lifecycle-ledger`,
+`nfs-overmount-hidden`, `nfs-empty-and-decode`, `nfs-bad-address`,
+`nfs-stale-timestamp`) ran twice (`/tmp/envd-nfs-vm-013vxoip`,
+`/tmp/envd-nfs-vm-s9jffuj9`) and the helper-missing variant twice
+(`/tmp/envd-nfs-vm-e7xpzq16`, `/tmp/envd-nfs-vm-fy8227tf`), both sides with
+`mismatches=[]` and no failures. The dead-target case is answered by an RPC
+PROG_UNAVAIL refuser — slirp guestfwd accepts the guest SYN, so a
+connection-level refusal never reaches the guest and only the RPC reply can.
+Findings kept as gate constraints: the musl guest needs `/etc/mtab` →
+`/proc/mounts` or `mount.nfs` hangs inside `sigismember`; the oracle's
+daemon-reported mount `duration` is a guest clock-jump artifact, not a real
+mount time; and the gate must run with `--repeat 1` because guest mounts
+outlive the per-run host NFS server. Harness coverage under the gate:
+`fixtures_nfs.py` 69%, `nfs_vm.py` 44% (integration paths excluded; the
+gate's authority is the real-guest differential evidence). This validates
+NFSv3 mount semantics in the parity guest only — the sandbox Firecracker
+image still has no NFS client or helper, the production transport decision
+(P2/P3) remains unauthorized, and serving processes and guest images have
+not been switched.
+
 Guest mode enables the OOM watcher unless `--isnotfc` is supplied; development mode
 keeps it disabled. Known history is returned oldest first, up to 32 kills, while
 unknown history is omitted. A dedicated dual-VM run validated one real kernel OOM,
@@ -431,8 +455,9 @@ the same binary, with OOM evidence at `/tmp/envd-oom-vm-qo8kvboi/result-1.json`.
 At that checkpoint, 255 Rust tests passed and implementation line coverage was 88.71%
 (main included, generated code excluded). Subsequent MMDS work requires new acceptance.
 This remains a subset of the full differential and lifecycle gates; arbitrary malformed
-protocol inputs and system behavior remain unfinished. Requests for
-unimplemented system init effects return 501. Existing serving processes and
+protocol inputs and system behavior remain unfinished. At that checkpoint,
+requests for unimplemented system init effects returned 501. Existing serving
+processes and
 images have not been switched.
 
 Run from the workspace:
