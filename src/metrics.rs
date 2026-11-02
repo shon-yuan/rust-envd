@@ -22,6 +22,11 @@ pub struct CpuStatus {
 pub struct Metrics {
     pub ts: i64,
     pub cpu_count: u32,
+    /// Go's encoding/json renders a float32 with strconv's 'f' format and no
+    /// forced fraction: 0.0 is `0`, not `0.0`. serde_json always emits the
+    /// fraction, so the shortest round-trip digits are serialized as a raw
+    /// number here.
+    #[serde(serialize_with = "go_float32")]
     pub cpu_used_pct: f32,
     pub cpu_possible: u32,
     pub cpu_target: u32,
@@ -32,6 +37,15 @@ pub struct Metrics {
     pub mem_cache: u64,
     pub disk_used: u64,
     pub disk_total: u64,
+}
+
+/// Serialize an f32 the way Go's encoding/json does: shortest round-trip
+/// digits in plain decimal form, with no `.0` for whole numbers.
+fn go_float32<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::Error as _;
+    let text = value.to_string();
+    let number: serde_json::Number = serde_json::from_str(&text).map_err(S::Error::custom)?;
+    number.serialize(serializer)
 }
 
 /// Read roots, injectable without changing environment variables or host files.

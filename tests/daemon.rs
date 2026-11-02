@@ -176,7 +176,8 @@ async fn daemon_bootstrap_sets_defaults_and_enforces_body_token() {
         .unwrap();
     assert_eq!(health.status(), StatusCode::NO_CONTENT);
     assert_eq!(health.headers()["cache-control"], "no-store");
-    assert!(!health.headers().contains_key("content-type"));
+    // store.go:193 sets an empty Content-Type, which net/http still writes.
+    assert_eq!(health.headers()["content-type"], "");
     let init = json!({"accessToken":"daemon-test-token", "envVars":{"VALUE":"雪"}, "defaultUser":"root", "defaultWorkdir":"/tmp"});
     let request = || {
         Request::post("/init")

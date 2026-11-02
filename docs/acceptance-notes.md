@@ -435,8 +435,10 @@ unknown history is omitted. A dedicated dual-VM run validated one real kernel OO
 rejection of a userspace-forged kmsg record, and repeated nonconsuming snapshots at
 `/tmp/envd-oom-vm-az03i6p_/result-1.json`. The corrected harness enforces a host
 absolute stream deadline; independent source review closed the original timeout
-finding. It does not establish the 32-entry limit or
-reopen/recovery behavior against real kernel logs; those currently have injected tests.
+finding. The 2026-11-02 campaign then extended the gate to 33 real kills per
+side (32-entry cap, oldest-first eviction, non-consuming reads, unrelated-kill
+isolation) and linked it to the live-upgrade gate, which proves the restarted
+watcher rebuilds the same snapshot from `/dev/kmsg`; see the closure section.
 Malformed proc data has explicit defensive differences, recorded
 in the internal generation-gate record. GET/POST `/files` now stream downloads/uploads with gzip,
 Range/conditional responses, multipart and metadata replacement. POST
@@ -458,7 +460,11 @@ This remains a subset of the full differential and lifecycle gates; arbitrary ma
 protocol inputs and system behavior remain unfinished. At that checkpoint,
 requests for unimplemented system init effects returned 501. Existing serving
 processes and
-images have not been switched.
+images have not been switched. The 2026-11-02 parity campaign closed the
+malformed-input, real-kernel OOM/history-rebuild, live-upgrade, and forwarder
+gaps and re-ran every gate on the final candidate; see “Parity campaign
+closure (2026-11-02)” at the end, which states exactly what is and is not
+claimed.
 
 Run from the workspace:
 
@@ -475,6 +481,84 @@ Any distributed binary/image using these schemas must include
 those notices. The Go-derived redirect URL helper in `src/mmds/go_url.rs` retains
 The Go Authors' BSD-3-Clause license; binary redistribution must reproduce that
 notice too. The HTTP/TLS path also links dependencies with ISC and Unicode-3.0
-obligations, including ring, WebPKI and ICU. Cargo metadata has been inspected; a
-complete distributable dependency notice bundle and guest/image packaging are still
-pending.
+obligations, including ring, WebPKI and ICU. The distributable notice bundle is
+now generated from the locked graph and checked in: `third_party/NOTICES.md`
+plus 388 verbatim license files covering 216 crates
+(`python3 scripts/generate_notices.py --check`), including the
+Apache-2.0 in-tree fork `vendor/connectrpc` selected by `[patch.crates-io]`
+(its `LICENSE` and `PATCHES.md` provenance are covered by the bundle and by
+`third_party/PACKAGING.md`). `scripts/packaging_manifest.py` emits the
+per-artifact provenance manifest (source commit, dirty state, toolchain,
+canonical `--locked` build command, binary and covered-file SHA-256, license
+tree digest) and refuses a dirty tree unless explicitly allowed; the guest
+artifact is the static `x86_64-unknown-linux-musl` release build. The 2026-11-02
+manifest run against that build recorded schema 1, `notice_check: ok`, and a
+2098-byte document (the trial run honestly records `dirty: true` because the
+parity sync is not committed yet; a distributable release must be built from a
+clean tree).
+
+## Parity campaign closure (2026-11-02)
+
+Final candidate: `dbbd9f9f3677a29a84fd52930e153ac2ec740fa3428e73badb3d909710191421`
+(`/tmp/rust-envd-candidate-r5gsGQ/coorworker-envd`). Its `src/` and `tests/`
+are byte-identical to the copies in this repository (`cmp`-verified), the
+in-tree `vendor/connectrpc` fork is mirrored with its `PATCHES.md`, and this
+repository builds the same static musl artifact. This repository's suite:
+743 passed, 0 failed; the agent workspace reports 742 for the same 760-name
+test inventory (the difference is one doctest execution, not a missing test).
+
+Gaps closed in this campaign, each bound to the candidate:
+
+- **Malformed input, routes and CORS.** A deterministic corpus (13 HTTP
+  operations × 10 malformed shapes, 17 Connect procedures × 9 framing
+  faults, preflight/HEAD/random) is driven against both sides and the
+  normalized documents diffed (`/tmp/envd-malformed-vm-fn7z3seh`,
+  `/tmp/malformed-diff-v5.txt`). Connect/JSON decode, envelope framing,
+  compression refusal and unary cardinality texts are byte-identical after the
+  in-tree connectrpc fork; regression tests live in
+  `tests/malformed_rpc.rs`.
+- **Live-upgrade handover.** Both `reexec` and `install` modes run in
+  disposable guests with plain/PTY/tagged processes, a retained exit,
+  undrained watcher, socat listener and the pre-exec failure guest. The two
+  sides' normalized documents are identical; the forwarder is re-adopted and
+  relays a fresh probe after the handover
+  (`/tmp/upgrade-g3-diff.txt`, `/tmp/upgrade-g3-*.json`).
+- **Real-kernel OOM boundary and rebuild.** 33 real OOM kills per side leave
+  exactly the latest 32 oldest-first, non-consuming, unaffected by an
+  unrelated SIGKILL; a third upgrade guest proves the restarted watcher
+  rebuilds the same snapshot from `/dev/kmsg`
+  (`/tmp/oom-run-g3.json`, `/tmp/envd-oom-vm-tq1rk97h`).
+- **Loopback forwarder.** The guest ships real socat; the upgrade gate now
+  *fails* unless the re-adopted forwarding mapping relays a probe end to end.
+- **Distribution.** `third_party/NOTICES.md` covers 216 third-party crates
+  and 388 verbatim license files, including the Apache-2.0 connectrpc fork;
+  `scripts/packaging_manifest.py` binds an artifact to commit, dirty state,
+  toolchain, build command and SHA-256 digests; `PACKAGING.md` states the
+  musl release build and completeness checklist.
+
+Every previously existing gate was re-run on this candidate and passed
+(`result-1.json`: `passed=true`, `failure=null`): oracle 13-group
+`/tmp/envd-oracle-vm-g1c7rr5c`, expanded 8-group
+`/tmp/envd-oracle-vm-9bcaykve`, CPU `/tmp/envd-cpus-vm-b87odl0_`, MMDS
+`/tmp/envd-mmds-vm-dz95_abe`, freeze `/tmp/envd-freeze-vm-t1i8vpmw`, guest
+probes `/tmp/envd-guestprobe-vm-homviny_`, NFS default
+`/tmp/envd-nfs-vm-biqcz3c2` and helper-missing `/tmp/envd-nfs-vm-ljcdl8ev`,
+OOM `/tmp/envd-oom-vm-tq1rk97h`, malformed
+`/tmp/envd-malformed-vm-fn7z3seh`, and upgrade
+`/tmp/envd-upgrade-vm-{hswumyzb,7d1guexp,55ez0rli,nk31akk8}`.
+
+Explicitly **not** claimed:
+
+- inputs outside the captured corpora, including arbitrary malformed protocol
+  traffic and unenumerated system behavior;
+- the 21 probes where Go's `net/http` rejects a request with its own
+  `400 Bad Request` body and hyper answers with an empty 400;
+- protojson schema-error texts for syntactically valid but schema-invalid
+  JSON (outside the captured corpus);
+- cgroup-scoped OOM, memory-pressure stalls, and more than one chained
+  upgrade;
+- multi-port/concurrent forwarding and socat crash-restart;
+- the production Firecracker transport path (P2/P3) and the host facade (S4);
+- a clean-tree distribution: this working tree is uncommitted, so the trial
+  manifest records `dirty: true`. Commits and pushes await explicit
+  authorization.

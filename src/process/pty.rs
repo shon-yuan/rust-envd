@@ -1,10 +1,10 @@
 //! Linux PTY ownership and nonblocking readiness; no blocking worker or forkpty.
 use crate::proto::process as pb;
 use nix::fcntl::OFlag;
-use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt, PtyMaster, Winsize};
+use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt, Winsize};
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd as _};
 use std::os::unix::fs::OpenOptionsExt;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -16,7 +16,10 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 pub(super) struct Terminal {
-    fd: std::sync::Mutex<Option<Arc<AsyncFd<PtyMaster>>>>,
+    // A plain File, not nix's PtyMaster: nix 0.29 offers no constructor from
+    // a relocated OwnedFd (readopt.go's carried Tty), and File closes the
+    // descriptor on drop exactly as PtyMaster would.
+    fd: std::sync::Mutex<Option<Arc<AsyncFd<std::fs::File>>>>,
     closed: tokio::sync::watch::Sender<bool>,
     writing: Mutex<()>,
 }
@@ -42,6 +45,11 @@ impl Terminal {
             grantpt(&master)?;
             unlockpt(&master)?;
             let slave_path = ptsname_r(&master)?;
+            // SAFETY: `into_raw_fd` surrenders nix's owned master descriptor
+            // and the File adopts it, closing it on drop exactly as
+            // PtyMaster's own drop would. The nonblocking flag lives on the
+            // shared open-file description and rides along unchanged.
+            let master = unsafe { std::fs::File::from_raw_fd(master.into_raw_fd()) };
             let slave = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -79,12 +87,34 @@ impl Terminal {
         setup()
     }
 
-    fn descriptor(&self) -> io::Result<Arc<AsyncFd<PtyMaster>>> {
+    fn descriptor(&self) -> io::Result<Arc<AsyncFd<std::fs::File>>> {
         self.fd
             .lock()
             .map_err(|_| io::Error::other("terminal ownership lock poisoned"))?
             .clone()
             .ok_or_else(|| io::ErrorKind::BrokenPipe.into())
+    }
+
+    /// The master descriptor a chained upgrade relocates (Go `HandoverFds`
+    /// reads `p.tty` the same way). Absent once closed or fully detached.
+    pub(super) fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.fd
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|fd| fd.get_ref().as_raw_fd())
+    }
+
+    /// Rebuild the terminal around a master descriptor inherited across the
+    /// upgrade execve (readopt.go's `Tty` file). The relocated fd shares its
+    /// open-file-description with the outgoing master, so nonblocking and the
+    /// kernel terminal state (winsize, termios) ride along unchanged.
+    pub(super) fn from_master(fd: std::os::fd::OwnedFd) -> io::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            fd: std::sync::Mutex::new(Some(Arc::new(AsyncFd::new(std::fs::File::from(fd))?))),
+            closed: tokio::sync::watch::channel(false).0,
+            writing: Mutex::new(()),
+        }))
     }
 
     pub fn close(&self) {

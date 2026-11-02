@@ -55,3 +55,8 @@ tokio = { version = "1", features = ["sync", "test-util"] }
 
 [features]
 client = ["connectrpc/client"]
+
+# In-tree fork of connectrpc 0.9.1 (Apache-2.0; see vendor/connectrpc/PATCHES.md)
+# carrying the connect-go error-text parity required by the pinned oracle.
+[patch.crates-io]
+connectrpc = { path = "vendor/connectrpc" }

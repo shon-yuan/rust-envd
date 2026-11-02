@@ -1385,3 +1385,464 @@ async fn deadline_kills_a_live_child_and_reports_go_signal_text() {
     assert!(!end.exited);
     assert_eq!(end.error.as_deref(), Some("signal: killed"));
 }
+
+// --- the live-upgrade process carry (upgrade.go dupKeep + readopt.go) ---
+
+/// Oracle upgrade.go:58-77 (`fdBase` + per-process stride of 5).
+const HANDOVER_FD_BASE: i32 = 200;
+
+/// A scalar F_GETFD query; `None` when the descriptor number is closed, so
+/// assertions read "slot parked" without naming errnos.
+fn fd_flags(fd: i32) -> Option<i32> {
+    // SAFETY: F_GETFD is a scalar query over an owned descriptor number.
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+    (flags >= 0).then_some(flags)
+}
+
+async fn expect_stdout(stream: &mut Subscription, expected: &[u8]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut got = Vec::new();
+        loop {
+            match stream.recv().await.unwrap().event.unwrap() {
+                process_event::Event::Data(data) => match data.output.unwrap() {
+                    process_event::data_event::Output::Stdout(bytes) => got.extend(bytes),
+                    process_event::data_event::Output::Stderr(_) => {}
+                    other => panic!("unexpected output: {other:?}"),
+                },
+                event => panic!("expected data, got {event:?}"),
+            }
+            if got.windows(expected.len()).any(|window| window == expected) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("expected stdout never arrived");
+}
+
+/// Dup one end of a child's stdio onto its handover slot, leaving the
+/// original number for the caller to close, exactly as a real export leaves
+/// the live descriptor reachable only through the slot window.
+fn dup_onto_slot(fd: i32, slot: i32) {
+    nix::unistd::dup2(fd, slot).unwrap();
+}
+
+/// A handover proc over real pipe ends parked on the slot window: the execve
+/// stand-in for "the outgoing envd carried these descriptors across".
+fn carried_plain_proc(pid: u32) -> proto::upgrade::HandoverProc {
+    proto::upgrade::HandoverProc {
+        pid,
+        tag: "carry".into(),
+        has_tag: true,
+        cg_type: "user".into(),
+        config: serde_json::from_value::<pb::ProcessConfig>(json!({"cmd":"/bin/cat"}))
+            .unwrap()
+            .into(),
+        stdout_fd: HANDOVER_FD_BASE,
+        stderr_fd: HANDOVER_FD_BASE + 1,
+        stdin_fd: HANDOVER_FD_BASE + 2,
+        tty_fd: -1,
+        timeout_ms: 0,
+        ..Default::default()
+    }
+}
+
+async fn handover_export_maps_live_children_onto_the_slot_window_body() {
+    let rt = runtime();
+    let mut plain = rt
+        .start(request("/bin/cat", &[]), Some(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    let pid = start_pid(&mut plain).await;
+    let mut pty = rt
+        .start(
+            pty_request("/bin/sleep", &["30"], 80, 24),
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+    let pty_pid = start_pid(&mut pty).await;
+
+    let (procs, guard) = rt.export_processes().await.unwrap();
+    assert_eq!(procs.len(), 2);
+    // Sorted pid order fixes each index and its slot window (fdBase + i*5).
+    let indices: Vec<(usize, u32)> = (0..2).map(|index| (index, procs[index].pid)).collect();
+    let user = indices
+        .iter()
+        .find(|(_, proc_pid)| *proc_pid == pid)
+        .expect("the plain child is carried");
+    let pty_proc = indices
+        .iter()
+        .find(|(_, proc_pid)| *proc_pid == pty_pid)
+        .expect("the pty child is carried");
+    let user = &procs[user.0];
+    let pty_proc = &procs[pty_proc.0];
+
+    // The plain child: stdout/stderr/stdin slots set, tty absent.
+    assert_eq!(user.cg_type, "user");
+    assert_eq!(user.tag, "test");
+    assert!(user.has_tag);
+    let base = HANDOVER_FD_BASE + (indices.iter().find(|(_, p)| *p == pid).unwrap().0 as i32) * 5;
+    assert_eq!(user.stdout_fd, base);
+    assert_eq!(user.stderr_fd, base + 1);
+    assert_eq!(user.stdin_fd, base + 2);
+    assert_eq!(user.tty_fd, -1);
+    assert!((1..=30_000).contains(&user.timeout_ms));
+    // A pty child carries ONLY its master (Go upgrade.go:218-250: stdin,
+    // stdout and stderr stay nil for cgType "pty").
+    assert_eq!(pty_proc.cg_type, "pty");
+    assert!(pty_proc.has_tag);
+    let pty_base =
+        HANDOVER_FD_BASE + (indices.iter().find(|(_, p)| *p == pty_pid).unwrap().0 as i32) * 5;
+    assert_eq!(pty_proc.tty_fd, pty_base + 3);
+    assert_eq!(pty_proc.stdout_fd, -1);
+    assert_eq!(pty_proc.stderr_fd, -1);
+    assert_eq!(pty_proc.stdin_fd, -1);
+
+    // The slots are CLOEXEC-clear: that is the whole carry mechanism.
+    for fd in [
+        user.stdout_fd,
+        user.stderr_fd,
+        user.stdin_fd,
+        pty_proc.tty_fd,
+    ] {
+        let flags = fd_flags(fd).expect("a carried slot must be open");
+        assert_eq!(flags & nix::libc::FD_CLOEXEC, 0, "slot {fd} kept CLOEXEC");
+    }
+    assert_eq!(fd_flags(-1), None);
+
+    // Dropping the guard closes the slots (the failure-path cleanup), and a
+    // fresh export parks the SAME slot numbers again (chained-upgrade ready).
+    let slots = vec![
+        user.stdout_fd,
+        user.stderr_fd,
+        user.stdin_fd,
+        pty_proc.tty_fd,
+    ];
+    drop(guard);
+    for slot in &slots {
+        assert_eq!(fd_flags(*slot), None, "slot {slot} survived the guard");
+    }
+    let (again, guard) = rt.export_processes().await.unwrap();
+    let again_user = again
+        .iter()
+        .find(|proc| proc.pid == pid)
+        .expect("the plain child survives the retry");
+    assert_eq!(again_user.stdout_fd, user.stdout_fd);
+    assert_eq!(again_user.stderr_fd, user.stderr_fd);
+    assert_eq!(again_user.stdin_fd, user.stdin_fd);
+    let again_pty = again
+        .iter()
+        .find(|proc| proc.pid == pty_pid)
+        .expect("the pty child survives the retry");
+    assert_eq!(again_pty.tty_fd, pty_proc.tty_fd);
+    drop(guard);
+
+    for pid in [pid, pty_pid] {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
+
+async fn handover_readopt_carries_a_plain_child_across_the_swap_body() {
+    use std::process::Stdio;
+    let mut child = tokio::process::Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    use std::os::fd::AsRawFd as _;
+    dup_onto_slot(stdout.as_raw_fd(), HANDOVER_FD_BASE);
+    dup_onto_slot(stderr.as_raw_fd(), HANDOVER_FD_BASE + 1);
+    dup_onto_slot(stdin.as_raw_fd(), HANDOVER_FD_BASE + 2);
+    // The originals are gone; the slot window holds the only ends.
+    drop((stdout, stderr, stdin));
+
+    let rt = runtime();
+    let (thawed_tx, thawed) = tokio::sync::watch::channel(());
+    thawed_tx.send(()).unwrap();
+    let (adopted, failed) = rt
+        .readopt_processes(&[carried_plain_proc(pid)], thawed)
+        .await;
+    assert_eq!((adopted, failed), (1, 0), "readopt must adopt the child");
+    assert!(rt.list().await.iter().any(|info| info.pid == pid));
+
+    let mut stream = rt.connect(&pid_selector(pid)).await.unwrap();
+    assert_eq!(start_pid(&mut stream).await, pid);
+    rt.send_input(
+        &pid_selector(pid),
+        &pb::ProcessInput {
+            input: Some(process_input::Input::Stdin(b"carry\n".to_vec())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    rt.close_stdin(&pid_selector(pid)).await.unwrap();
+    let (out, err, end) = finish(&mut stream).await;
+    assert_eq!(out, b"carry\n", "the relocated stdin must reach the child");
+    assert!(err.is_empty());
+    // The readopt end text differs from the live path BY DESIGN
+    // (readopt.go vs ProcessState.String()): "exited", no error field.
+    assert_eq!(end.exit_code, 0);
+    assert!(end.exited);
+    assert_eq!(end.status, "exited");
+    assert_eq!(end.error, None);
+    assert!(rt.list().await.is_empty());
+    let mut retained = rt.connect(&pid_selector(pid)).await.unwrap();
+    assert_eq!(start_pid(&mut retained).await, pid);
+    let (_, _, retained_end) = finish(&mut retained).await;
+    assert_eq!(retained_end, end);
+}
+
+async fn handover_readopt_end_event_reports_the_signal_verbatim_body() {
+    use std::process::Stdio;
+    let mut child = tokio::process::Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    use std::os::fd::AsRawFd as _;
+    dup_onto_slot(stdout.as_raw_fd(), HANDOVER_FD_BASE);
+    dup_onto_slot(stderr.as_raw_fd(), HANDOVER_FD_BASE + 1);
+    dup_onto_slot(stdin.as_raw_fd(), HANDOVER_FD_BASE + 2);
+    drop((stdout, stderr, stdin));
+
+    let rt = runtime();
+    let (thawed_tx, thawed) = tokio::sync::watch::channel(());
+    thawed_tx.send(()).unwrap();
+    let (adopted, failed) = rt
+        .readopt_processes(&[carried_plain_proc(pid)], thawed)
+        .await;
+    assert_eq!((adopted, failed), (1, 0));
+    let mut stream = rt.connect(&pid_selector(pid)).await.unwrap();
+    assert_eq!(start_pid(&mut stream).await, pid);
+    rt.send_signal(&pid_selector(pid), 9).await.unwrap();
+    let (_, _, end) = finish(&mut stream).await;
+    // readopt.go's signal rendering: the bare signal name and 128+signal,
+    // never the live path's "signal: killed" text.
+    assert_eq!(end.status, "killed");
+    assert_eq!(end.exit_code, 128 + 9);
+    assert!(!end.exited);
+    assert_eq!(end.error, None);
+    let mut retained = rt.connect(&pid_selector(pid)).await.unwrap();
+    assert_eq!(start_pid(&mut retained).await, pid);
+    assert_eq!(finish(&mut retained).await.2, end);
+}
+
+async fn handover_readopt_pty_rebuilds_the_master_and_pumps_the_terminal_body() {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::process::Stdio;
+    let master = nix::pty::posix_openpt(
+        nix::fcntl::OFlag::O_RDWR
+            | nix::fcntl::OFlag::O_NOCTTY
+            | nix::fcntl::OFlag::O_CLOEXEC
+            | nix::fcntl::OFlag::O_NONBLOCK,
+    )
+    .unwrap();
+    nix::pty::grantpt(&master).unwrap();
+    nix::pty::unlockpt(&master).unwrap();
+    let slave_path = nix::pty::ptsname_r(&master).unwrap();
+    let slave = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_NOCTTY | nix::libc::O_CLOEXEC)
+        .open(&slave_path)
+        .unwrap();
+    let child = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "stty -echo; read line; printf 'got:%s' \"$line\"; read x",
+        ])
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    // SAFETY: `into_raw_fd` surrenders the owned master; the slot dup keeps
+    // it open for the handover and the original number closes immediately.
+    let raw = std::os::fd::IntoRawFd::into_raw_fd(master);
+    dup_onto_slot(raw, HANDOVER_FD_BASE + 3);
+    nix::unistd::close(raw).unwrap();
+
+    let carried = proto::upgrade::HandoverProc {
+        pid,
+        tag: "carry-pty".into(),
+        has_tag: true,
+        cg_type: "pty".into(),
+        config: serde_json::from_value::<pb::ProcessConfig>(
+            json!({"cmd":"/bin/sh","args":["-c","read line"]}),
+        )
+        .unwrap()
+        .into(),
+        stdout_fd: -1,
+        stderr_fd: -1,
+        stdin_fd: -1,
+        tty_fd: HANDOVER_FD_BASE + 3,
+        timeout_ms: 0,
+        ..Default::default()
+    };
+    let rt = runtime();
+    let (thawed_tx, thawed) = tokio::sync::watch::channel(());
+    thawed_tx.send(()).unwrap();
+    let (adopted, failed) = rt.readopt_processes(&[carried], thawed).await;
+    assert_eq!((adopted, failed), (1, 0));
+
+    let mut stream = rt.connect(&pid_selector(pid)).await.unwrap();
+    assert_eq!(start_pid(&mut stream).await, pid);
+    // The adopted resize path walks the rebuilt master (TIOCSWINSZ).
+    rt.update(
+        &serde_json::from_value(json!({
+            "process":{"pid":pid},
+            "pty":{"size":{"cols":101,"rows":25}}
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    rt.send_input(
+        &pid_selector(pid),
+        &pb::ProcessInput {
+            input: Some(process_input::Input::Pty(b"hi\n".to_vec())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        pty_until(&mut stream, b"got:hi").await.ends_with(b"got:hi"),
+        "the adopted master must pump the terminal both ways"
+    );
+    rt.send_signal(&pid_selector(pid), 9).await.unwrap();
+    let (_, end) = pty_finish(&mut stream).await;
+    assert_eq!(end.status, "killed");
+    assert_eq!(end.exit_code, 128 + 9);
+}
+
+async fn handover_readopt_relocates_a_real_export_slot_window_body() {
+    let rt1 = runtime();
+    let mut stream = rt1
+        .start(request("/bin/cat", &[]), Some(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    let pid = start_pid(&mut stream).await;
+    let (procs, guard) = rt1.export_processes().await.unwrap();
+    assert_eq!(procs.len(), 1);
+    assert_eq!(procs[0].pid, pid);
+
+    let rt2 = runtime();
+    let (_thawed_tx, thawed) = tokio::sync::watch::channel(());
+    let (adopted, failed) = rt2.readopt_processes(&procs, thawed).await;
+    assert_eq!((adopted, failed), (1, 0));
+    // The relocated slots are freed: a second handover could dup3 onto them.
+    let slots = [procs[0].stdout_fd, procs[0].stderr_fd, procs[0].stdin_fd];
+    for slot in slots {
+        assert_eq!(fd_flags(slot), None, "slot {slot} leaked after readopt");
+    }
+
+    // Output and stdin flow through the relocated descriptors of the SAME
+    // live child. The two runtimes' waiters stay pid-specific, so this race
+    // check only exercises the pump — terminal-event fidelity lives in the
+    // controlled-child tests above.
+    let mut adopted_stream = rt2.connect(&pid_selector(pid)).await.unwrap();
+    assert_eq!(start_pid(&mut adopted_stream).await, pid);
+    rt2.send_input(
+        &pid_selector(pid),
+        &pb::ProcessInput {
+            input: Some(process_input::Input::Stdin(b"via-rt2\n".to_vec())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    expect_stdout(&mut adopted_stream, b"via-rt2").await;
+
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    drop(guard);
+}
+
+/// The handover slot window (fds 200-203) is the TEST PROCESS's real fd
+/// table, and a full parallel suite parks sockets there — a dup2 would
+/// clobber a sibling test's descriptor and an export would abort. Like the
+/// PTY EMFILE probe, each carry test therefore runs in a dedicated child
+/// process with its own small fd table (the production guest's shape).
+const HANDOVER_CHILD: &str = "ENVD_PROCESS_RUNTIME_HANDOVER_CHILD";
+
+async fn run_in_dedicated_handover_child(name: &str) {
+    let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(HANDOVER_CHILD, "1")
+        .status()
+        .await
+        .unwrap();
+    assert!(
+        status.success(),
+        "the isolated handover child failed: {status}"
+    );
+}
+
+#[tokio::test]
+async fn handover_export_maps_live_children_onto_the_slot_window() {
+    if std::env::var(HANDOVER_CHILD).is_ok() {
+        handover_export_maps_live_children_onto_the_slot_window_body().await;
+        return;
+    }
+    run_in_dedicated_handover_child("handover_export_maps_live_children_onto_the_slot_window")
+        .await;
+}
+
+#[tokio::test]
+async fn handover_readopt_carries_a_plain_child_across_the_swap() {
+    if std::env::var(HANDOVER_CHILD).is_ok() {
+        handover_readopt_carries_a_plain_child_across_the_swap_body().await;
+        return;
+    }
+    run_in_dedicated_handover_child("handover_readopt_carries_a_plain_child_across_the_swap").await;
+}
+
+#[tokio::test]
+async fn handover_readopt_end_event_reports_the_signal_verbatim() {
+    if std::env::var(HANDOVER_CHILD).is_ok() {
+        handover_readopt_end_event_reports_the_signal_verbatim_body().await;
+        return;
+    }
+    run_in_dedicated_handover_child("handover_readopt_end_event_reports_the_signal_verbatim").await;
+}
+
+#[tokio::test]
+async fn handover_readopt_pty_rebuilds_the_master_and_pumps_the_terminal() {
+    if std::env::var(HANDOVER_CHILD).is_ok() {
+        handover_readopt_pty_rebuilds_the_master_and_pumps_the_terminal_body().await;
+        return;
+    }
+    run_in_dedicated_handover_child(
+        "handover_readopt_pty_rebuilds_the_master_and_pumps_the_terminal",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn handover_readopt_relocates_a_real_export_slot_window() {
+    if std::env::var(HANDOVER_CHILD).is_ok() {
+        handover_readopt_relocates_a_real_export_slot_window_body().await;
+        return;
+    }
+    run_in_dedicated_handover_child("handover_readopt_relocates_a_real_export_slot_window").await;
+}

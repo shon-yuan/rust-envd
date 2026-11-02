@@ -10,15 +10,18 @@
 //! pinned `third_party/e2b/spec/upgrade/handover.proto`, so encoding is
 //! protobuf-identical to Go's `proto.Marshal` by construction.
 //!
-//! Runtime differences are disclosed at their use sites: this crate's process
-//! runtime keeps its children as `tokio::process::Child` with runtime-owned
-//! pipes, so the Go choreography that dup3's live children's fds onto a fixed
-//! fd range across the execve (upgrade.go:156-250, fdBase 200) and re-adopts
-//! them on the far side (`handler.Readopt`) has no equivalent here — the
-//! carried process table is always empty and a resumed child cannot be
-//! re-adopted. Everything else about the swap (freeze hold, watchers, mounts,
-//! forwards, helpers, the retention cache, guest-frozen cgroups, defaults,
-//! schema gating, argv/env of the exec, the failure thaw) is carried 1:1.
+//! Runtime differences are disclosed at their use sites. The process carry
+//! now follows the oracle's choreography (`process/mod.rs`, `process/pipe.rs`,
+//! `process/supervise::run_adopted`): the outgoing envd dup3's each live
+//! child's daemon-side descriptors onto the fixed slot window with CLOEXEC
+//! cleared (upgrade.go:156-250), the blob carries them, and the incoming envd
+//! relocates them and rebuilds readers, stdin and terminals around the
+//! inherited descriptors (readopt.go `Readopt`). The children themselves keep
+//! running as this process's children across the execve — the pid never
+//! changes — so the reaper collects their status with a pid-specific wait.
+//! Everything else about the swap (freeze hold, watchers, mounts, forwards,
+//! helpers, the retention cache, guest-frozen cgroups, defaults, schema
+//! gating, argv/env of the exec, the failure thaw) is carried 1:1.
 
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -162,6 +165,17 @@ pub fn write_handover(path: &Path, state: &wire::HandoverState) -> Result<u32, U
     };
     stamped.schema = schema_for(&stamped);
     let blob = stamped.encode_to_vec();
+    // The Go failure text is os.WriteFile's *fs.PathError Display —
+    // `open <path>: <errno>` on the open and `write <path>: <errno>` on the
+    // write — which the handler's "write handover: %w" wraps into the 500
+    // body (upgrade.go:270-276).
+    let path_error = |op: &str, error: std::io::Error| {
+        UpgradeError::Write(crate::process::path_text_error(
+            op,
+            &path.to_string_lossy(),
+            error,
+        ))
+    };
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -170,8 +184,9 @@ pub fn write_handover(path: &Path, state: &wire::HandoverState) -> Result<u32, U
         // its mode (upgrade.go:274).
         .mode(0o600)
         .open(path)
-        .map_err(UpgradeError::Write)?;
-    file.write_all(&blob).map_err(UpgradeError::Write)?;
+        .map_err(|error| path_error("open", error))?;
+    file.write_all(&blob)
+        .map_err(|error| path_error("write", error))?;
     Ok(stamped.schema)
 }
 
@@ -180,10 +195,20 @@ pub fn write_handover(path: &Path, state: &wire::HandoverState) -> Result<u32, U
 /// — post-execve there is no old binary to fall back to, so refusing is the
 /// contract (upgrade.go:354-361).
 pub fn read_handover(path: &Path) -> Result<Option<wire::HandoverState>, UpgradeError> {
+    // The Go refusal text mirrors the write side: os.ReadFile's
+    // *fs.PathError under "read handover: %w" (upgrade.go:341-361). A missing
+    // blob stays the no-op resume.
+    let path_error = |error: std::io::Error| {
+        UpgradeError::Read(crate::process::path_text_error(
+            "open",
+            &path.to_string_lossy(),
+            error,
+        ))
+    };
     let blob = match std::fs::read(path) {
         Ok(blob) => blob,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(UpgradeError::Read(error)),
+        Err(error) => return Err(path_error(error)),
     };
     let state = wire::HandoverState::decode_from_slice(&blob).map_err(UpgradeError::Unmarshal)?;
     if state.schema > HANDOVER_SCHEMA {
@@ -224,10 +249,29 @@ impl HandoverOutcome {
     /// Oracle upgrade.go:522-534: the successful resume's summary from the
     /// decoded state and the re-arm counts.
     pub fn resumed(state: &wire::HandoverState, watchers: i64, watchers_failed: i64) -> Self {
+        Self::resumed_with_failures(
+            state.processes.len() as i64,
+            0,
+            state,
+            watchers,
+            watchers_failed,
+        )
+    }
+
+    /// The same summary when the re-adoption loop reported failures
+    /// (readopt.go's `procsFailed`): every item is total + failed-subset
+    /// (ok = total - failed).
+    pub fn resumed_with_failures(
+        procs: i64,
+        procs_failed: i64,
+        state: &wire::HandoverState,
+        watchers: i64,
+        watchers_failed: i64,
+    ) -> Self {
         Self {
             failed: false,
-            procs: state.processes.len() as i64,
-            procs_failed: 0,
+            procs,
+            procs_failed,
             retained: state.terminated.len() as i64,
             retained_failed: 0,
             watchers,
@@ -265,5 +309,25 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Oracle os.WriteFile renders its failure as the *fs.PathError Display —
+    /// `open <path>: <errno text>` — and the handler's `write handover: %w`
+    /// wraps it: this is the failure guest's 500 body on the wire
+    /// (upgrade.go:270-276 via main.go's writeHandover call).
+    #[test]
+    fn write_handover_refusal_carries_the_go_path_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the blob's parent directory would live makes
+        // the open fail with ENOTDIR deterministically.
+        let blocker = dir.path().join("e2b");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("envd-handover.pb");
+        let error = write_handover(&path, &wire::HandoverState::default()).unwrap_err();
+        assert!(matches!(error, UpgradeError::Write(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            format!("write handover: open {}: not a directory", path.display())
+        );
     }
 }

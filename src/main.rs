@@ -672,8 +672,11 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Live-upgrade outgoing trigger (Go main.go:369-420): guest-only here, a
     // disclosed deviation — Go has no development mode, and a development
     // daemon must never freeze host cgroups, write /run/e2b or execve. Its
-    // /upgrade answers 500 "upgrade is not wired".
-    if guest && !is_not_fc {
+    // /upgrade answers 500 "upgrade is not wired". Go wires doUpgrade
+    // unconditionally, so every guest boot gets it regardless of --isnotfc:
+    // the parity upgrade gate caught the earlier isnotfc exclusion (oracle
+    // re-exec'd under the same flag while this daemon answered 500).
+    if guest {
         // The guest always has the real freezer (built above); the daemon
         // default keeps the type total for the dev path.
         let upgrade_freezer = freezer.clone().unwrap_or_else(|| daemon.freezer());
@@ -803,6 +806,14 @@ async fn resume_incoming_handover(
             coorworker_envd::upgrade::HandoverOutcome::default()
         }
         Ok(Some(state)) => {
+            // Re-adopt the live children FIRST (upgrade.go:429-470 before
+            // :488-493): the retention restore below skips a pid that came
+            // back as a live process. The thaw watch is captured before the
+            // adoption so each carried kill timer starts counting only when
+            // the workload actually runs again (readopt.go's Thawed).
+            let thawed = resume_freezer.thawed();
+            let (adopted, adopted_failed) =
+                runtime.readopt_processes(&state.processes, thawed).await;
             // Restore the retention cache (upgrade.go:488-493); restore_retained
             // skips a pid that came back as a live process (upgrade.go:543-545).
             runtime
@@ -830,12 +841,15 @@ async fn resume_incoming_handover(
                 .str("event_type", "handover_resumed")
                 .str("from_ver", &state.from_ver)
                 .int("procs", state.processes.len() as i64)
-                .int("procs_failed", 0)
+                .int("procs_failed", adopted_failed as i64)
                 .int("retained", state.terminated.len() as i64)
                 .int("retained_failed", 0)
                 .int("watchers", (rearmed + failed) as i64)
                 .int("watchers_failed", failed as i64)
                 .msg("re-adopted workload after envd self-upgrade");
+            let adopted_total = state.processes.len() as i64;
+            let adopted_failed_total = adopted_failed as i64;
+            let _ = adopted;
             // Restore the guest-frozen record before any thaw, so a later
             // freeze adopts the guest's own cgroups and the /init thaw leaves
             // them frozen (upgrade.go:525-531). Empty restores empty — the safe
@@ -852,7 +866,9 @@ async fn resume_incoming_handover(
                      probe guards process starts until /init: {error}"
                 );
             }
-            coorworker_envd::upgrade::HandoverOutcome::resumed(
+            coorworker_envd::upgrade::HandoverOutcome::resumed_with_failures(
+                adopted_total,
+                adopted_failed_total,
                 state,
                 (rearmed + failed) as i64,
                 failed as i64,
@@ -955,9 +971,26 @@ async fn do_upgrade(
         // The live exec context, read before the watcher hold is taken (the
         // std lock must never sit across an await).
         let defaults = daemon.current_defaults().await;
+        // The process table (upgrade.go:218-250): dup3 each live child's
+        // daemon-side pipe ends onto the fixed slot window with CLOEXEC
+        // cleared. Concurrent forks are excluded for the rest of the window
+        // by the per-subsystem holds this block already carries — the freeze
+        // hold gates process starts, the forwards hold gates socat spawns,
+        // the helpers hold gates cpu helpers — so no concurrent fork can
+        // inherit the CLOEXEC-cleared descriptors the way Go's ForkLock
+        // prevented. The guard closes the relocated slots on any failure
+        // path (upgrade.go's deferred cleanup); on the exec path the process
+        // image is replaced first and the guard never drops. This is the
+        // block's last await: everything below, once the std-locked watcher
+        // hold is taken, is synchronous through the execve.
+        let (processes, _handover_fds) = runtime
+            .export_processes()
+            .await
+            .map_err(|error| format!("relocate handover fds: {error}"))?;
         // ExportWatchersHold: the snapshot with the registry lock KEPT, so a
         // concurrent GetWatcherEvents cannot drain events the snapshot already
-        // carried (watch_handover.go:49-57).
+        // carried (watch_handover.go:49-57). No await may sit under this std
+        // lock — and none does from here to the execve.
         let (watchers, _watchers_hold) = daemon
             .watcher_registry()
             .export_watchers_hold()
@@ -973,6 +1006,7 @@ async fn do_upgrade(
         let state = coorworker_envd::proto::upgrade::HandoverState {
             from_ver: "0.10.2".into(),
             terminated: terminated.iter().map(|exit| exit.to_wire()).collect(),
+            processes,
             watchers,
             mounts,
             forwards: forwards.iter().map(|port| port.to_wire()).collect(),
@@ -987,7 +1021,6 @@ async fn do_upgrade(
             defaults: coorworker_envd::upgrade::handover_defaults(&defaults).into(),
             ..Default::default()
         };
-        // processes stays empty: the disclosure above.
         coorworker_envd::upgrade::write_handover(
             std::path::Path::new(coorworker_envd::upgrade::HANDOVER_PATH),
             &state,
