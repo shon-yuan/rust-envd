@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    body::{Body, HttpBody},
+    body::{to_bytes, Body, HttpBody},
     extract::State,
-    http::{header, Request, StatusCode},
+    http::{header, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::any,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -542,29 +542,98 @@ pub fn app_with_execution(state: Arc<Daemon>, runtime: crate::process::ProcessRu
 /// mux (here [`frontdoor::gate`] followed by the two routers). The gate sits
 /// inside authorization because Go's auth middleware wraps the mux, so an
 /// unauthenticated unknown path is 401, not 404.
+///
+/// The two outermost layers reproduce `net/http`'s connection-level checks,
+/// which run before any handler: a failed `Expect` is answered 417
+/// (`server.go:2059-2068`) and `OPTIONS *` is answered by the general options
+/// handler (`server.go:3327`).
 fn layered(router: Router, state: Arc<Daemon>) -> Router {
     crate::transport::ensure_protojson_schema();
     router
         .layer(middleware::from_fn(frontdoor::gate))
         .layer(middleware::from_fn_with_state(state, authorize))
         .layer(middleware::from_fn(cors::cors))
+        .layer(middleware::from_fn(options_asterisk))
+        .layer(middleware::from_fn(expectation))
+}
+
+/// `net/http`'s Expect handling (`server.go:2059-2068`): a non-empty `Expect`
+/// whose first value has no `100-continue` token is answered 417 before any
+/// handler runs, with `Connection: close` set (`sendExpectationFailed`).
+async fn expectation(request: Request<Body>, next: Next) -> Response {
+    let expect = request.headers().get(header::EXPECT);
+    let continue_expected = expect.is_some_and(|value| {
+        value
+            .as_bytes()
+            .split(|&byte| byte == b',')
+            .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"100-continue"))
+    });
+    if expect.is_some_and(|value| !value.is_empty()) && !continue_expected {
+        let mut response = StatusCode::EXPECTATION_FAILED.into_response();
+        response.headers_mut().insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_static("0"),
+        );
+        return response;
+    }
+    next.run(request).await
+}
+
+/// `serverHandler.ServeHTTP` answers `OPTIONS *` with the general options
+/// handler before the mux (`server.go:3327`): 200 with `Content-Length: 0`,
+/// draining at most 4 KiB of body — anything larger aborts the read and the
+/// connection closes (`globalOptionsHandler`).
+async fn options_asterisk(request: Request<Body>, next: Next) -> Response {
+    if request.method() != Method::OPTIONS || request.uri().path() != "*" {
+        return next.run(request).await;
+    }
+    let mut response = StatusCode::OK.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_static("0"),
+    );
+    if to_bytes(request.into_body(), 4 << 10).await.is_err() {
+        response.headers_mut().insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
+    }
+    response
 }
 
 fn http_routes(state: Arc<Daemon>) -> Router {
+    // Every route uses `any` so axum's method router cannot append an `Allow`
+    // header to fallback responses (including the 401 authorization returns
+    // before the mux); Go's chi mux answers those methods itself, and
+    // [`frontdoor::gate`] reproduces its 405/404 before a handler is reached.
     Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics::get_metrics))
-        .route("/envs", get(envs))
-        .route("/init", post(init))
-        .route("/upgrade", post(upgrade))
-        .route("/freeze", post(freeze))
-        .route("/unfreeze", post(unfreeze))
-        .route("/collapse", post(collapse))
-        .route("/fsfreeze", post(fsfreeze))
-        .route("/fsthaw", post(fsthaw))
-        .route("/files", get(download::get_files).post(upload::upload))
-        .route("/files/compose", post(compose::compose))
+        .route("/health", any(health))
+        .route("/metrics", any(metrics::get_metrics))
+        .route("/envs", any(envs))
+        .route("/init", any(init))
+        .route("/upgrade", any(upgrade))
+        .route("/freeze", any(freeze))
+        .route("/unfreeze", any(unfreeze))
+        .route("/collapse", any(collapse))
+        .route("/fsfreeze", any(fsfreeze))
+        .route("/fsthaw", any(fsthaw))
+        .route("/files", any(files))
+        .route("/files/compose", any(compose::compose))
         .with_state(state)
+}
+
+/// chi registers GET and POST on `/files`; the gate has already rejected every
+/// other method, so the dispatcher only routes the two.
+async fn files(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
+    match *request.method() {
+        Method::GET => download::get_files(State(daemon), request).await,
+        Method::POST => upload::upload(State(daemon), request).await,
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
 }
 
 /// Go http.Error: plain text, newline-terminated, nosniff.

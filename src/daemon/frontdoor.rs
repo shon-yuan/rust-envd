@@ -1,8 +1,10 @@
 //! The oracle's request mux (chi v1.5.5 + connect-go v1.18.1 handlers), which
 //! decides four outcomes before any handler code runs:
 //!
-//! - a known HTTP operation with the wrong method → 405, empty body, no headers
-//!   (chi's `methodNotAllowedHandler`);
+//! - a method chi does not know → 405, empty body, no headers (chi resolves
+//!   the method before the route, `mux.go:476-480`);
+//! - a known HTTP operation with the wrong method → 405, empty body, one
+//!   `Allow` header per method (`chi.methodNotAllowedHandler`);
 //! - a known Connect procedure with a non-POST method → 405 + `Allow: POST`
 //!   (connect-go `Handler.ServeHTTP` has no handler for that method);
 //! - a known Connect procedure whose Content-Type is not one its protocol
@@ -109,17 +111,39 @@ fn canonical_content_type(headers: &axum::http::HeaderMap) -> String {
         .to_ascii_lowercase()
 }
 
+/// chi's `methodMap` (v5.5.0 `mux.go:128`): the only methods it routes. The
+/// lookup is case-sensitive, so `get` or `PRI` is as unknown as `FOO`.
+const CHI_METHODS: &[&str] = &[
+    "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "QUERY", "TRACE",
+];
+
 fn empty(status: StatusCode) -> Response {
     status.into_response()
 }
 
 pub(crate) async fn gate(request: Request, next: Next) -> Response {
+    let method = request.method().as_str();
+    // `routeHTTP` resolves the method before it touches the tree: an unknown
+    // method is the no-methods `MethodNotAllowedHandler` — a 405 with no
+    // `Allow` — whatever the path is (`mux.go:476-480`).
+    if !CHI_METHODS.contains(&method) {
+        return empty(StatusCode::METHOD_NOT_ALLOWED);
+    }
     let path = request.uri().path().to_owned();
     if let Some(methods) = http_methods(&path) {
-        if methods.contains(&request.method().as_str()) {
+        if methods.contains(&method) {
             return next.run(request).await;
         }
-        return empty(StatusCode::METHOD_NOT_ALLOWED);
+        // chi's `methodNotAllowedHandler`: one `Allow` header per method on
+        // the matched node, then the status and an empty write
+        // (`mux.go:529-540`).
+        let mut response = empty(StatusCode::METHOD_NOT_ALLOWED);
+        for allowed in methods {
+            response
+                .headers_mut()
+                .append(header::ALLOW, HeaderValue::from_static(allowed));
+        }
+        return response;
     }
     let Some(kind) = rpc_kind(&path) else {
         return plain_http_error(StatusCode::NOT_FOUND, "404 page not found");
@@ -201,11 +225,12 @@ mod tests {
 
     #[tokio::test]
     async fn known_http_operations_with_a_wrong_method_are_empty_405s() {
-        for (method, path) in [
-            ("POST", "/health"),
-            ("HEAD", "/health"),
-            ("GET", "/init"),
-            ("GET", "/files/compose"),
+        for (method, path, allowed) in [
+            ("POST", "/health", &["GET"][..]),
+            ("HEAD", "/health", &["GET"][..]),
+            ("GET", "/init", &["POST"][..]),
+            ("GET", "/files/compose", &["POST"][..]),
+            ("HEAD", "/files", &["GET", "POST"][..]),
         ] {
             let response = send(method, path, None).await;
             assert_eq!(
@@ -213,10 +238,46 @@ mod tests {
                 StatusCode::METHOD_NOT_ALLOWED,
                 "{method} {path}"
             );
-            // chi writes only the status; net/http adds Content-Length: 0.
+            // chi writes only the status and one Allow header per method;
+            // net/http adds the framing.
+            let values: Vec<&str> = response
+                .headers()
+                .get_all(header::ALLOW)
+                .iter()
+                .map(|value| value.to_str().expect("ascii"))
+                .collect();
+            assert_eq!(values, allowed, "{method} {path}");
             assert!(response.headers().get(header::CONTENT_TYPE).is_none());
             assert!(response.headers().get("accept-post").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_methods_are_405s_without_allow_before_any_path_lookup() {
+        // chi resolves the method against its methodMap before touching the
+        // tree (`mux.go:476-480`); the no-methods MethodNotAllowedHandler
+        // emits no Allow header, even for a path that does not exist.
+        for (method, path) in [
+            ("PRI", "/health"),
+            ("PRI", "/does-not-exist"),
+            ("get", "/health"),
+            ("OPTIONSish", "/init"),
+        ] {
+            let response = send(method, path, None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path}"
+            );
+            assert!(
+                response.headers().get(header::ALLOW).is_none(),
+                "{method} {path}"
+            );
+        }
+        // QUERY is in chi v5.5.0's methodMap, so it takes the normal lookup.
+        let response = send("QUERY", "/health", None).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[header::ALLOW], "GET");
     }
 
     #[tokio::test]

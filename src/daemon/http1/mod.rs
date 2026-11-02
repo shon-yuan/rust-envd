@@ -18,6 +18,7 @@
 
 mod head;
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -26,6 +27,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::{header, Method, Request};
+use axum::response::Response;
 use axum::Router;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -135,7 +139,7 @@ async fn serve_connection(
             .header_read_timeout(None);
         let service = service_fn(move |request| {
             let app = app.clone();
-            async move { app.oneshot(request).await }
+            async move { respond(app, request).await }
         });
         let mut connection = std::pin::pin!(builder.serve_connection(io, service));
         let mut closing = false;
@@ -162,7 +166,40 @@ async fn serve_connection(
     if let Some(reject) = reject {
         let _ = writer.write_all(reject.response()).await;
         let _ = writer.shutdown().await;
+        if reject == Reject::TooLarge {
+            // Go's `closeWriteAndWait` for errTooLarge: half-close, then keep
+            // reading for a second so unread request bytes cannot reset the
+            // connection and discard the 431 (`server.go:2039`).
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::io::copy(&mut writer, &mut tokio::io::sink()),
+            )
+            .await;
+        }
     }
+}
+
+/// Serve one request through `app`, applying Go's HEAD framing.
+///
+/// `net/http` never sends a response body for HEAD, and it never invents a
+/// `Content-Length` for one: the automatic length is suppressed when the
+/// method is HEAD and the buffered body is empty (`server.go:68-74`), and HEAD
+/// responses are never chunked (`server.go:210`). axum's top-level route
+/// future computes `content-length: 0` from the empty body *before* it
+/// discards that body for HEAD, so the header has to be removed before hyper
+/// writes the response.
+async fn respond<B>(app: Router, request: Request<B>) -> Result<Response, Infallible>
+where
+    B: axum::body::HttpBody<Data = axum::body::Bytes> + Send + 'static,
+    B::Error: Into<axum::BoxError>,
+{
+    let is_head = request.method() == Method::HEAD;
+    let mut response = app.oneshot(request).await?;
+    if is_head {
+        response.headers_mut().remove(header::CONTENT_LENGTH);
+        *response.body_mut() = Body::empty();
+    }
+    Ok(response)
 }
 
 /// How the guard is reading the connection.
@@ -171,10 +208,16 @@ enum Mode {
     /// The next request head starts at `scan`.
     Head,
     /// A Content-Length body has this many bytes left.
-    Body { remaining: u64 },
+    Body {
+        remaining: u64,
+        /// Stop parsing once the body is complete (Go closes after replying).
+        halt_after: bool,
+    },
     /// A chunked body is in progress.
-    Chunk { state: ChunkState },
-    /// A CONNECT request was answered; never parse another head.
+    Chunk { state: ChunkState, halt_after: bool },
+    /// Go answers this request and never parses another head on the
+    /// connection (CONNECT, `Connection: close`, HTTP/1.0, failed `Expect`,
+    /// the HTTP/2 preface).
     Halt,
     /// The body framing is unparseable; forward the rest without inspection.
     Pass,
@@ -275,15 +318,33 @@ impl<S> GuardedStream<S> {
                     let parsed = head::parse(&self.buf[self.scan..], self.skip_crlf);
                     match parsed {
                         Ok(Some(head)) => {
-                            self.scan += head.len;
+                            let start = self.scan;
+                            let end = start + head.len;
+                            // Go accepts more than hyper's parser does; apply
+                            // the delivery rewrites before handing the bytes
+                            // over, and account for any length change.
+                            let delivered_len = if head.needs_rewrite() {
+                                let rewritten = head.rewrite(&self.buf[start..end]);
+                                let len = rewritten.len();
+                                self.buf.splice(start..end, rewritten).for_each(drop);
+                                len
+                            } else {
+                                head.len
+                            };
+                            self.scan = start + delivered_len;
                             self.deliverable = self.scan;
                             self.skip_crlf = head.method_post;
                             self.idle_gate = true;
                             self.mode = match head.framing {
+                                Framing::Empty if head.halt_after => Mode::Halt,
                                 Framing::Empty => Mode::Head,
-                                Framing::Length(remaining) => Mode::Body { remaining },
+                                Framing::Length(remaining) => Mode::Body {
+                                    remaining,
+                                    halt_after: head.halt_after,
+                                },
                                 Framing::Chunked => Mode::Chunk {
                                     state: ChunkState::Size,
+                                    halt_after: head.halt_after,
                                 },
                                 Framing::Close => Mode::Halt,
                             };
@@ -295,21 +356,36 @@ impl<S> GuardedStream<S> {
                         }
                     }
                 }
-                Mode::Body { mut remaining } => {
+                Mode::Body {
+                    mut remaining,
+                    halt_after,
+                } => {
                     let available = (self.buf.len() - self.scan) as u64;
                     let take = available.min(remaining);
                     self.scan += take as usize;
                     self.deliverable = self.scan;
                     remaining -= take;
-                    self.mode = if remaining == 0 {
-                        Mode::Head
+                    let done = remaining == 0;
+                    self.mode = if done {
+                        if halt_after {
+                            Mode::Halt
+                        } else {
+                            Mode::Head
+                        }
                     } else {
-                        Mode::Body { remaining }
+                        Mode::Body {
+                            remaining,
+                            halt_after,
+                        }
                     };
+                    if done && halt_after {
+                        // Report EOF from the Halt arm in this same pass.
+                        continue;
+                    }
                     // All buffered bytes were body; no head is in progress.
                     break;
                 }
-                Mode::Chunk { state } => {
+                Mode::Chunk { state, halt_after } => {
                     let mut pos = self.scan;
                     let mut state = state;
                     let progress = scan_chunked(&self.buf, &mut pos, &mut state);
@@ -317,10 +393,14 @@ impl<S> GuardedStream<S> {
                     self.deliverable = pos;
                     match progress {
                         ChunkProgress::NeedMore => {
-                            self.mode = Mode::Chunk { state };
+                            self.mode = Mode::Chunk { state, halt_after };
                             break;
                         }
                         ChunkProgress::Done => {
+                            if halt_after {
+                                self.mode = Mode::Halt;
+                                continue;
+                            }
                             self.mode = Mode::Head;
                         }
                         ChunkProgress::Broken => {
@@ -524,7 +604,14 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn run(input: &[u8]) -> (Vec<u8>, Option<Reject>) {
-        let (mut client, server) = tokio::io::duplex(64);
+        run_with_capacity(input, 64).await
+    }
+
+    /// Like [`run`], but with a client conduit large enough to buffer the
+    /// whole input: a rejection stops the guard from reading, so a bounded
+    /// conduit would leave the writer blocked.
+    async fn run_with_capacity(input: &[u8], capacity: usize) -> (Vec<u8>, Option<Reject>) {
+        let (mut client, server) = tokio::io::duplex(capacity);
         let shared = Arc::new(Mutex::new(None));
         let mut guard = GuardedStream::new(server, shared.clone());
         let input = input.to_vec();
@@ -577,6 +664,19 @@ mod tests {
         let (out, reject) = run(raw).await;
         assert!(out.is_empty());
         assert_eq!(reject, Some(Reject::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn a_complete_oversized_head_never_reaches_hyper() {
+        // The head is well formed but longer than Go's read limit. Hyper would
+        // answer it with its own 431; the guard must withhold every byte so
+        // the connection writer can send Go's exact errTooLarge response.
+        let mut raw = b"GET /health HTTP/1.1\r\nHost: x\r\nX-Filler: ".to_vec();
+        raw.resize(head::MAX_HEAD_BYTES + 1000, b'a');
+        raw.extend_from_slice(b"\r\n\r\n");
+        let (out, reject) = run_with_capacity(&raw, raw.len() + 1).await;
+        assert!(out.is_empty(), "hyper saw the oversized head");
+        assert_eq!(reject, Some(Reject::TooLarge));
     }
 
     #[tokio::test]
@@ -645,6 +745,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_responses_carry_no_content_length() {
+        // Go never invents a Content-Length for HEAD (`server.go:68-74`) and
+        // never chunks one (`server.go:210`). axum computes one from the
+        // empty body before discarding it, so `respond` has to remove it.
+        use axum::{http::StatusCode, routing::any};
+
+        let app = Router::new().route("/health", any(|| async { StatusCode::METHOD_NOT_ALLOWED }));
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri("/health")
+            .body(Body::empty())
+            .expect("request");
+        let response = respond(app.clone(), request).await.expect("infallible");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+
+        // The same response to GET keeps net/http's automatic zero length.
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/health")
+            .body(Body::empty())
+            .expect("request");
+        let response = respond(app, request).await.expect("infallible");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
+    }
+
+    #[tokio::test]
     async fn post_tolerates_leading_crlf_on_the_next_request() {
         let raw = b"POST /init HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\n\r\n";
         let (out, reject) = run(raw).await;
@@ -692,6 +819,58 @@ mod tests {
         stop.send(()).expect("stop");
         server.await.expect("join").expect("serve");
         out
+    }
+
+    #[tokio::test]
+    async fn rewrites_the_preface_and_withholds_the_frames_after_it() {
+        // Go answers the bare preface through its handler and closes; hyper
+        // cannot parse `HTTP/2.0`, so the guard delivers the preface line as
+        // HTTP/1.1 with `Connection: close` and drops the SETTINGS bytes.
+        let raw = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x12\x04\x00\x00\x00\x00\x00";
+        let (out, reject) = run(raw).await;
+        assert_eq!(out, b"PRI * HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert_eq!(reject, None);
+    }
+
+    #[tokio::test]
+    async fn connection_close_withholds_the_tail() {
+        // Go stops parsing after a close-bound response (closeAfterReply); a
+        // complete bad tail must not earn an extra 400.
+        let raw =
+            b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nBAD REQUEST LINE\r\n\r\n";
+        let (out, reject) = run(raw).await;
+        assert_eq!(
+            out,
+            b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(reject, None);
+    }
+
+    #[tokio::test]
+    async fn failed_expect_withholds_the_tail() {
+        let raw =
+            b"GET /health HTTP/1.1\r\nHost: x\r\nExpect: 201-created\r\n\r\nBAD REQUEST LINE\r\n\r\n";
+        let (out, reject) = run(raw).await;
+        assert_eq!(
+            out,
+            b"GET /health HTTP/1.1\r\nHost: x\r\nExpect: 201-created\r\n\r\n"
+        );
+        assert_eq!(reject, None);
+    }
+
+    #[tokio::test]
+    async fn the_body_still_reaches_hyper_before_a_close_bound_halt() {
+        let head =
+            b"POST /init HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 4\r\n\r\n";
+        let raw = [
+            head.as_slice(),
+            b"body",
+            b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n",
+        ]
+        .concat();
+        let (out, reject) = run(&raw).await;
+        assert_eq!(out, [head.as_slice(), b"body"].concat());
+        assert_eq!(reject, None);
     }
 
     #[tokio::test]

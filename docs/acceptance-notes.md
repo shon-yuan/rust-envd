@@ -462,9 +462,10 @@ requests for unimplemented system init effects returned 501. Existing serving
 processes and
 images have not been switched. The 2026-11-02 parity campaign closed the
 malformed-input, real-kernel OOM/history-rebuild, live-upgrade, and forwarder
-gaps and re-ran every gate on the final candidate; see “Parity campaign
-closure (2026-11-02)” at the end, which states exactly what is and is not
-claimed.
+gaps and re-ran every gate on the final candidate; the 2026-11-03 campaign
+closed the HTTP/1 protocol-edge, nested cgroup/`memory.oom.group` and
+non-loopback binding gaps. See the “Parity campaign closure” sections at the
+end, which state exactly what is and is not claimed.
 
 Run from the workspace:
 
@@ -617,4 +618,84 @@ Explicitly **not** claimed:
 - a clean-tree distribution: this working tree is uncommitted, so the trial
   manifest records `dirty: true`. Commits and pushes await explicit
   authorization.
+
+## Parity campaign closure (2026-11-03)
+
+Final candidate: `73e66bb4a94fd8b4de725db886aab9b375e7660bfaf763d8ec6562d401e93db0`
+(`/tmp/rust-envd-candidate-rVZ0mk/coorworker-envd`, `-version 0.10.2`,
+`-commit 51083a83…`). Its `src/` and `tests/` are byte-identical to the copies
+in this repository (`cmp`/`diff -r` verified, including the
+`vendor/connectrpc` fork and its `PATCHES.md`). This repository's suite is
+green (799 passed, 0 failed), clippy `-D warnings` and `cargo fmt --check`
+clean, and the static musl artifact built here
+(`target/x86_64-unknown-linux-musl/release/coorworker-envd`, sha256
+`562dbf67abe498912f157deafd068b7992992c8f37758fcbe65620f87e44e5c4`) matches
+the oracle document on the protojson schema gate
+(`/tmp/schema-rustenvd-v8.json`, IDENTICAL; artifact
+`/tmp/envd-schema-vm-11j0nr0j`).
+
+Gaps closed in this campaign, each bound to the same candidate:
+
+- **HTTP/1 protocol edges.** A 34-case raw-socket corpus (`PRI * HTTP/2.0`
+  prefaces, `Expect`, 100-continue, `Connection: close`, HTTP/1.0, h2c upgrade,
+  pipelining, absolute/asterisk forms, control bytes, invalid UTF-8, HTTP/1.2,
+  missing `Host`, 505, unauthenticated `OPTIONS`, and a complete head over Go's
+  1,052,672-byte budget) is byte-identical after three fixes: the head guard
+  now applies `MAX_HEAD_BYTES=(1<<20)+4096` and returns Go's exact 431; HEAD
+  responses drop the injected `content-length: 0` (Go never sends it); and
+  method resolution precedes routing like chi v5.5.0 (bare 405 without
+  `Allow` for an unknown method, one `Allow` per allowed method otherwise).
+  Documents: `/tmp/envd-http1-edges-vm-{hmerf6pf,q5ghomat}`, IDENTICAL for all
+  34 cases (`/tmp/envd-gates-73e66bb4/http1-edges-*.json`).
+- **Nested cgroup OOM with `memory.oom.group`.** `--scenario group` builds a
+  memory parent with a leaf (`envd-group/leaf`), sets `memory.oom.group=1`,
+  and provokes two real group kills. The fixture follows cgroup-v2.rst: an
+  `oom_score_adj=-1000` task is never group-killed, so the bystander stays
+  killable at 0 and redirects its stdio to `/dev/null` (a surviving sibling
+  holding the daemon's pipes would keep the Start stream open past the kill).
+  Both sides mirror the kernel's three records per event
+  (`[victim, bystander, victim]`) in `/metrics`, reject a userspace spoof, and
+  retain two events as six records non-consumingly
+  (`/tmp/envd-oom-vm-6wndvmr0`, `history {'spawned': 2, 'retained': 6}`).
+- **Non-loopback forwarding bindings.** A fifth upgrade guest starts listeners
+  on `127.0.0.1`, `127.0.0.2`, `0.0.0.0`, `10.0.2.15` and `::1`, proves each
+  alive, then reads the daemon's per-port socat count and an end-to-end relay.
+  Only `127.0.0.1` and `::1` are forwarded; `127.0.0.2` is excluded despite
+  being loopback by subnet. The `0.0.0.0` relay verdict is recorded as
+  `relay_confounded`, not asserted: `169.254.0.21` is a guest-local address,
+  so the wildcard listener answers that probe itself even with zero
+  daemon-spawned socats. A post-handover read proves the carried set keeps
+  only the control. All four upgrade documents per side and mode are identical
+  (`/tmp/upgrade-*-v8.json`).
+
+Every previously existing gate was re-run on this candidate and passed
+(`result-1.json`: `passed=true`, `failure=null`, candidate manifest binding
+the same sha): conformance `--expanded --repeat 2`
+`/tmp/envd-oracle-vm-2e1ow6ll` (2/2, `mismatches=[]`), schema
+`/tmp/envd-schema-vm-{wrt7uc7i,t_0hzqb5}`, malformed
+`/tmp/envd-malformed-vm-{bg9egozu,vy1lh4fz}`, HTTP/1 edges above, OOM global
+`/tmp/envd-oom-vm-ai4btxrw`, cgroup `/tmp/envd-oom-vm-5bu4erk5` and group
+above, CPU `/tmp/envd-cpus-vm-83lmathy`, MMDS `/tmp/envd-mmds-vm-0cow6133`,
+freeze `/tmp/envd-freeze-vm-mgyt1diu`, guest probes
+`/tmp/envd-guestprobe-vm-thcwahpa`, NFS default `/tmp/envd-nfs-vm-fr2o9cke`
+and helper-missing `/tmp/envd-nfs-vm-p4c_naue`, and upgrade
+`/tmp/envd-upgrade-vm-{eccdmcqm,9x_i9_kp,tvizmb5a,9knbtz6c}`. The NFS fixture
+now normalizes the wall-clock-derived `after N attempts` count to
+`after <ATTEMPTS:single|repeated>`: an oracle-only repeat reported 19 attempts
+for a case another oracle run reported 20, so the number itself is not a
+parity signal while retry-vs-no-retry stays compared.
+
+Explicitly **not** claimed:
+
+- inputs outside the captured corpora, including arbitrary malformed protocol
+  traffic and unenumerated system behavior;
+- TLS, a completed h2c switch, and response trailers;
+- chains longer than four consecutive swaps (they repeat the same
+  export/relocate path);
+- the production Firecracker transport path (P2/P3) and the host facade (S4);
+- a clean-tree distribution until the mirror commit is made; the provenance
+  manifest must be regenerated from the clean tree before release.
+
+The 2026-11-02 non-claims for HTTP/1 parser edges, nested cgroup
+`memory.oom.group`, and non-loopback bindings are superseded by this section.
 
