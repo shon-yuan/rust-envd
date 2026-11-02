@@ -50,6 +50,7 @@ use http::StatusCode;
 use http::header;
 use http_body::Body;
 use http_body::Frame;
+use http_body::SizeHint;
 use http_body_util::BodyExt;
 use http_body_util::Full;
 use serde::Serialize;
@@ -1610,6 +1611,17 @@ impl Body for ConnectRpcBody {
             ConnectRpcBody::Streaming(inner) => Pin::new(inner).poll_frame(cx),
         }
     }
+
+    fn size_hint(&self) -> SizeHint {
+        // A Connect unary response is one contiguous body: forwarding the
+        // exact length lets HTTP/1.1 write `Content-Length` like connect-go
+        // instead of falling back to chunked. gRPC/gRPC-Web carry trailers and
+        // streaming bodies have no known end, so they keep the default hint.
+        match self {
+            ConnectRpcBody::Full(inner) => inner.size_hint(),
+            ConnectRpcBody::GrpcUnary(_) | ConnectRpcBody::Streaming(_) => SizeHint::default(),
+        }
+    }
 }
 
 impl<D, B> tower::Service<Request<B>> for ConnectRpcService<D>
@@ -1654,6 +1666,7 @@ where
         };
 
         let fut = async move {
+            let accept_encoding = compression.accept_encoding_header().to_owned();
             let response = match handle_request(
                 dispatcher,
                 req,
@@ -1666,7 +1679,20 @@ where
             .await
             {
                 Ok(response) => response,
-                Err(err) => error_response_either(err),
+                Err(err) => {
+                    // connect-go sets `Accept-Encoding` on every Connect unary
+                    // response, error responses included; only unary requests
+                    // reach this arm.
+                    let mut response = error_response_either(err);
+                    if !accept_encoding.is_empty() {
+                        if let Ok(value) = http::HeaderValue::from_str(&accept_encoding) {
+                            response
+                                .headers_mut()
+                                .insert(header::ACCEPT_ENCODING, value);
+                        }
+                    }
+                    response
+                }
             };
             Ok(response)
         };

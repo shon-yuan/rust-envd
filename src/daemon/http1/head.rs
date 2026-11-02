@@ -15,9 +15,12 @@
 //! then `http1ServerSupportsRequest` (505), then the Host and header-value
 //! validations that produce `statusError` texts.
 //!
-//! Only acceptance and framing are modelled. Once [`parse`] returns a
-//! [`Head`], the same bytes are also valid for hyper and are handed over
-//! unchanged.
+//! Go also accepts a superset of what hyper's parser does: the HTTP/2
+//! preface line, `HTTP/1.2`–`HTTP/1.9` version tokens, absolute-form targets
+//! with an empty authority, and target bytes http's `Uri` rejects. [`parse`]
+//! therefore returns a [`Head`] carrying the rewrites that make the validated
+//! head parseable by hyper without changing the request Go's handler sees;
+//! [`Head::rewrite`] applies them to the raw bytes before delivery.
 
 /// `net/http.Server`'s default `MaxHeaderBytes` plus its bufio slop
 /// (`initialReadLimitSize`). Exceeding it yields Go's 431 response.
@@ -50,19 +53,21 @@ pub(crate) enum Reject {
 impl Reject {
     /// The exact bytes Go's `net/http` writes for this rejection.
     ///
-    /// From `(*conn).serve`: the shared `errorHeaders` block, with the
-    /// generic `publicErr` body for a plain 400 and `statusError` text for
-    /// the host/header variants. None of these carry a Date header.
+    /// From `(*conn).serve`: the shared `errorHeaders` block. `statusError`
+    /// values (bad request texts and 505) repeat their text in the status
+    /// line after a colon (`"HTTP/1.1 %d %s: %s"`, server.go:2049); the
+    /// generic 400, 431 and 501 status lines carry no reason. None of these
+    /// carry a Date header.
     pub(crate) fn response(self) -> &'static [u8] {
         match self {
             Self::BadRequest => b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request",
-            Self::MissingHost => b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: missing required Host header",
-            Self::MalformedHost => b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: malformed Host header",
-            Self::InvalidHeaderName => b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: invalid header name",
-            Self::InvalidHeaderValue => b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: invalid header value",
+            Self::MissingHost => b"HTTP/1.1 400 Bad Request: missing required Host header\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: missing required Host header",
+            Self::MalformedHost => b"HTTP/1.1 400 Bad Request: malformed Host header\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: malformed Host header",
+            Self::InvalidHeaderName => b"HTTP/1.1 400 Bad Request: invalid header name\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: invalid header name",
+            Self::InvalidHeaderValue => b"HTTP/1.1 400 Bad Request: invalid header value\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request: invalid header value",
             Self::TooLarge => b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large",
             Self::UnsupportedTransferEncoding => b"HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nUnsupported transfer encoding",
-            Self::VersionNotSupported => b"HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n505 HTTP Version Not Supported: unsupported protocol version",
+            Self::VersionNotSupported => b"HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n505 HTTP Version Not Supported: unsupported protocol version",
         }
     }
 }
@@ -80,8 +85,23 @@ pub(crate) enum Framing {
     Close,
 }
 
-/// An accepted request head.
+/// A request-target that hyper's parser would reject but Go accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetRewrite {
+    /// Deliver the target unchanged.
+    None,
+    /// Absolute-form with an empty authority (`http://`): http's `Uri`
+    /// requires an authority for absolute forms, while Go records an empty
+    /// path. Deliver Go's path (`/`) so the request reaches the handler.
+    Slash,
+    /// Percent-encode the bytes http's `Uri` rejects in paths and queries but
+    /// Go's `url.ParseRequestURI` keeps (`<`, `>`, backtick, `#`, a query
+    /// `"`, and non-UTF-8 bytes).
+    Sanitize,
+}
+
+/// An accepted request head.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Head {
     /// Length of the head in bytes, including any skipped leading CR/LF.
     pub(crate) len: usize,
@@ -89,6 +109,87 @@ pub(crate) struct Head {
     pub(crate) method_post: bool,
     /// Body framing that follows.
     pub(crate) framing: Framing,
+    /// The request-target span within those bytes.
+    uri: std::ops::Range<usize>,
+    /// The version-token span within those bytes.
+    version: std::ops::Range<usize>,
+    /// Deliver the version token as `HTTP/1.1`: Go serves any `HTTP/1.x`
+    /// and the HTTP/2 preface, but httparse only accepts `HTTP/1.0` and
+    /// `HTTP/1.1`.
+    rewrite_version: bool,
+    /// The request-target rewrite hyper needs.
+    target: TargetRewrite,
+    /// Inject `Connection: close` so hyper closes after the response, as Go
+    /// does for the HTTP/2 preface (`w.closeAfterReply`).
+    inject_close: bool,
+    /// Stop parsing after this request's body: Go closes the connection after
+    /// a `Connection: close`, an HTTP/1.0 request without keep-alive, a
+    /// failed `Expect`, or the HTTP/2 preface.
+    pub(crate) halt_after: bool,
+}
+
+impl Head {
+    /// Whether [`Head::rewrite`] would change the head bytes.
+    pub(crate) fn needs_rewrite(&self) -> bool {
+        self.rewrite_version || self.target != TargetRewrite::None || self.inject_close
+    }
+
+    /// The head bytes to deliver to hyper.
+    ///
+    /// `raw` must be this head's bytes (`len` bytes). Every rewrite keeps the
+    /// request Go's handler observes intact: the version token only affects
+    /// parsing (Go answers any `HTTP/1.x` with an `HTTP/1.1` status line), and
+    /// the target edits only touch bytes http's `Uri` cannot carry.
+    pub(crate) fn rewrite(&self, raw: &[u8]) -> Vec<u8> {
+        let mut out = raw.to_vec();
+        if self.rewrite_version {
+            out[self.version.clone()].copy_from_slice(b"HTTP/1.1");
+        }
+        let replacement = match self.target {
+            TargetRewrite::None => None,
+            TargetRewrite::Slash => Some(vec![b'/']),
+            TargetRewrite::Sanitize => Some(sanitize_target(&raw[self.uri.clone()])),
+        };
+        if let Some(replacement) = replacement {
+            out.splice(self.uri.clone(), replacement).for_each(drop);
+        }
+        if self.inject_close {
+            // The head always ends with the blank line's CRLF; the injected
+            // field line belongs before it.
+            let at = out.len() - 2;
+            out.splice(at..at, b"Connection: close\r\n".iter().copied())
+                .for_each(drop);
+        }
+        out
+    }
+}
+
+/// Percent-encode the request-target bytes http's `Uri` parser rejects.
+///
+/// `scan_path_and_query` (http 1.5.0) marks `<`, `>`, backtick and `#` as
+/// invalid in the path, and `<`, `>`, `"` and `#` as invalid in the query;
+/// bytes of 0x80 and above are accepted only when the whole target is valid
+/// UTF-8.
+pub(crate) fn sanitize_target(target: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let invalid_utf8 = std::str::from_utf8(target).is_err();
+    let query_at = target.iter().position(|&b| b == b'?');
+    let mut out = Vec::with_capacity(target.len());
+    for (index, &byte) in target.iter().enumerate() {
+        let in_query = query_at.is_some_and(|query| index > query);
+        let encode = (invalid_utf8 && byte >= 0x80)
+            || matches!(byte, b'<' | b'>' | b'#')
+            || (!in_query && byte == b'`')
+            || (in_query && byte == b'"');
+        if encode {
+            out.push(b'%');
+            out.push(HEX[(byte >> 4) as usize]);
+            out.push(HEX[(byte & 0x0f) as usize]);
+        } else {
+            out.push(byte);
+        }
+    }
+    out
 }
 
 /// One logical header after continuation lines were merged.
@@ -105,12 +206,20 @@ struct Header {
 /// Returns `Ok(None)` while more bytes are needed. A complete but rejected
 /// head returns the response kind; callers must not forward those bytes.
 pub(crate) fn parse(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reject> {
-    match parse_inner(buf, skip_leading_crlf) {
-        // Go's limited reader turns an oversized head into `errTooLarge`
-        // before the request line is ever completed.
-        Ok(None) if buf.len() > MAX_HEAD_BYTES => Err(Reject::TooLarge),
-        other => other,
+    // `(*conn).readRequest` sets the connection read limit to
+    // `initialReadLimitSize` before parsing (`server.go:1048`): the limited
+    // reader hands the parser at most that many bytes and then reports EOF.
+    // A head that completes inside the budget is parsed normally; anything
+    // longer is `errTooLarge` even when the blank line arrives later
+    // (`server.go:1055-1058`).
+    if buf.len() > MAX_HEAD_BYTES {
+        return match parse_inner(&buf[..MAX_HEAD_BYTES], skip_leading_crlf) {
+            Ok(Some(head)) => Ok(Some(head)),
+            Err(reason) => Err(reason),
+            Ok(None) => Err(Reject::TooLarge),
+        };
     }
+    parse_inner(buf, skip_leading_crlf)
 }
 
 /// Whether EOF at this point makes Go write a `400 Bad Request`.
@@ -154,14 +263,14 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
     if !valid_request_uri(uri) {
         return Err(Reject::BadRequest);
     }
-    // `http1ServerSupportsRequest` accepts the HTTP/2 connection preface line,
-    // but hyper's HTTP/1 parser cannot (it rejects `HTTP/2.0` outright, and its
-    // h2 sniffing wants the full 24-byte preface). Go's observable answer to
-    // the preface is a 400, so the guard answers that directly instead of
-    // handing hyper a head it would reject with its own 505.
-    if method == b"PRI" && uri == b"*" && (major, minor) == (2, 0) {
-        return Err(Reject::BadRequest);
-    }
+    // `http1ServerSupportsRequest` lets the HTTP/2 connection preface through
+    // to the handler; every other major version is a 505.
+    let is_preface = method == b"PRI" && uri == b"*" && (major, minor) == (2, 0);
+    // Offsets of the two tokens the delivery rewrite may touch.
+    let uri_start = start + method.len() + 1;
+    let uri_range = uri_start..uri_start + uri.len();
+    let version_start = start + line.len() - proto.len();
+    let version_range = version_start..version_start + proto.len();
 
     let is_connect = method == b"CONNECT";
     let proto_at_least_11 = major > 1 || minor >= 1;
@@ -266,16 +375,14 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
                 .ok_or(Reject::BadRequest)?;
         }
     }
-    // `http1ServerSupportsRequest`: only HTTP/1.x (and the preface, handled
-    // above) reaches a handler.
-    if major != 1 {
+    // `http1ServerSupportsRequest`: HTTP/1.x and the Preface reach a handler.
+    if major != 1 && !is_preface {
         return Err(Reject::VersionNotSupported);
     }
-    if proto_at_least_11
-        && host.is_empty()
-        && !is_connect
-        && !is_h2_upgrade(method, major, minor, &headers)
-    {
+    // `Request.isH2Upgrade`: the bare preface (no header lines at all, so the
+    // Host line a real client sends disqualifies it, as in Go).
+    let is_h2_upgrade = is_preface && headers.is_empty();
+    if proto_at_least_11 && host.is_empty() && !is_connect && !is_h2_upgrade {
         return Err(Reject::MissingHost);
     }
     if let Some(value) = host.first() {
@@ -294,6 +401,34 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
         }
     }
 
+    // `Request.wantsClose` (`shouldClose`) checks every Connection value;
+    // `expectsContinue` reads the first Expect value only (`Header.get`).
+    let close = headers_with(&headers, b"connection").any(|header| {
+        header
+            .value
+            .split(|&b| b == b',')
+            .any(|token| eq_ignore_ascii_case(trim(token), b"close"))
+    });
+    let keep_alive_10 = headers_with(&headers, b"connection").any(|header| {
+        header
+            .value
+            .split(|&b| b == b',')
+            .any(|token| eq_ignore_ascii_case(trim(token), b"keep-alive"))
+    });
+    let expect = headers_with(&headers, b"expect")
+        .next()
+        .map(|header| header.value.as_slice());
+    let expect_continue = expect.is_some_and(|value| {
+        value
+            .split(|&b| b == b',')
+            .any(|token| eq_ignore_ascii_case(trim(token), b"100-continue"))
+    });
+    // `(*conn).serve`: any non-empty Expect without the 100-continue token is
+    // answered 417 before a handler runs.
+    let failed_expect = expect.is_some_and(|value| !value.is_empty() && !expect_continue);
+    let halt_after =
+        is_h2_upgrade || failed_expect || close || ((major, minor) == (1, 0) && !keep_alive_10);
+
     let framing = if is_connect {
         Framing::Close
     } else if chunked {
@@ -307,6 +442,14 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
         len: pos,
         method_post: method == b"POST",
         framing,
+        uri: uri_range,
+        version: version_range,
+        // Go's status line is HTTP/1.1 for any version at least 1.1, and
+        // httparse accepts only the literal 1.0/1.1 tokens.
+        rewrite_version: is_preface || (major == 1 && minor > 1),
+        target: target_rewrite(uri),
+        inject_close: is_h2_upgrade,
+        halt_after,
     }))
 }
 
@@ -360,25 +503,47 @@ fn parse_http_version(proto: &[u8]) -> Option<(u8, u8)> {
     None
 }
 
-/// `net/http.Request.isH2Upgrade`: Connection contains `Upgrade` and the
-/// Upgrade header is `h2c`.
-fn is_h2_upgrade(method: &[u8], major: u8, minor: u8, headers: &[Header]) -> bool {
-    if method == b"PRI" || major != 1 || minor < 1 {
+/// The target rewrite the delivery step must apply before hyper parses it.
+fn target_rewrite(uri: &[u8]) -> TargetRewrite {
+    if uri == b"*" {
+        return TargetRewrite::None;
+    }
+    if empty_authority(uri) {
+        return TargetRewrite::Slash;
+    }
+    if needs_sanitize(uri) {
+        return TargetRewrite::Sanitize;
+    }
+    TargetRewrite::None
+}
+
+/// Whether `uri` is an absolute-form target whose authority is empty
+/// (`http://`, optionally followed by a query). Go accepts it; http's `Uri`
+/// rejects absolute forms without an authority.
+fn empty_authority(uri: &[u8]) -> bool {
+    let (scheme, rest) = split_scheme(uri);
+    if scheme.is_empty() {
         return false;
     }
-    let mut connection_upgrade = false;
-    let mut upgrade_h2c = false;
-    for header in headers {
-        if header.name == b"connection" {
-            connection_upgrade |= header
-                .value
-                .split(|&b| b == b',')
-                .any(|token| eq_ignore_ascii_case(trim(token), b"upgrade"));
-        } else if header.name == b"upgrade" {
-            upgrade_h2c |= eq_ignore_ascii_case(trim(&header.value), b"h2c");
+    let rest = match rest.iter().position(|&b| b == b'?') {
+        Some(query) => &rest[..query],
+        None => rest,
+    };
+    match rest.strip_prefix(b"//") {
+        Some(authority_and_path) => {
+            let end = authority_and_path
+                .iter()
+                .position(|&b| b == b'/')
+                .unwrap_or(authority_and_path.len());
+            end == 0
         }
+        None => false,
     }
-    connection_upgrade && upgrade_h2c
+}
+
+/// Whether [`sanitize_target`] would change any byte.
+fn needs_sanitize(uri: &[u8]) -> bool {
+    sanitize_target(uri) != uri
 }
 
 fn trim(mut bytes: &[u8]) -> &[u8] {
@@ -466,7 +631,8 @@ fn valid_host_byte(b: u8) -> bool {
 
 /// `url.ParseRequestURI` acceptance for the request-target forms Go's server
 /// hands it. Control bytes, empty targets, relative paths without a leading
-/// slash, and invalid percent escapes are rejected.
+/// slash, and invalid percent escapes are rejected. As in Go's `url.parse`,
+/// the query is cut before the authority and path are examined.
 fn valid_request_uri(raw: &[u8]) -> bool {
     if raw.iter().any(|&b| b < 0x20 || b == 0x7f) {
         return false;
@@ -477,22 +643,30 @@ fn valid_request_uri(raw: &[u8]) -> bool {
     if raw == b"*" {
         return true;
     }
-    let (scheme, rest) = split_scheme(raw);
+    let (scheme, after_scheme) = split_scheme(raw);
+    let rest = match after_scheme.iter().position(|&b| b == b'?') {
+        Some(query) => &after_scheme[..query],
+        None => after_scheme,
+    };
     if !scheme.is_empty() {
         if !rest.starts_with(b"/") {
             // Opaque (rootless) URL path: Go accepts it after a scheme.
             return true;
         }
-        if let Some(authority) = rest.strip_prefix(b"//") {
-            let host = authority.split(|&b| b == b'/').next().unwrap_or(authority);
-            return valid_authority(host);
+        if let Some(authority_and_path) = rest.strip_prefix(b"//") {
+            let end = authority_and_path
+                .iter()
+                .position(|&b| b == b'/')
+                .unwrap_or(authority_and_path.len());
+            let (authority, path) = authority_and_path.split_at(end);
+            return valid_authority(authority) && valid_percent_escapes(path);
         }
-        return valid_path_and_query(rest);
+        return valid_percent_escapes(rest);
     }
     if !rest.starts_with(b"/") {
         return false;
     }
-    valid_path_and_query(rest)
+    valid_percent_escapes(rest)
 }
 
 fn split_scheme(raw: &[u8]) -> (&[u8], &[u8]) {
@@ -559,12 +733,6 @@ fn valid_authority(authority: &[u8]) -> bool {
         }
     }
     true
-}
-
-/// Path and query: `setPath` validates percent escapes in the path only.
-fn valid_path_and_query(rest: &[u8]) -> bool {
-    let path = rest.split(|&b| b == b'?').next().unwrap_or(rest);
-    valid_percent_escapes(path)
 }
 
 fn valid_percent_escapes(bytes: &[u8]) -> bool {
@@ -740,13 +908,130 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_http2_preface() {
-        // Go hands the preface line to the mux and then rejects `SM`; hyper
-        // cannot parse it at all, so the guard answers Go's generic 400.
+    fn accepts_the_http2_preface_with_go_decisions() {
+        // The bare preface (no header lines) is Go's isH2Upgrade: the Host
+        // requirement is waived, the response closes the connection, and no
+        // further request is parsed.
+        let raw = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(head.len, 18);
+        assert!(head.halt_after);
+        assert!(head.needs_rewrite());
         assert_eq!(
-            parse_head(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
+            head.rewrite(&raw[..head.len]),
+            b"PRI * HTTP/1.1\r\nConnection: close\r\n\r\n"
+        );
+        // The same request line with headers is an ordinary request (Go's
+        // isH2Upgrade needs an empty header map); it is delivered as HTTP/1.1
+        // and the connection stays open.
+        let raw = b"PRI * HTTP/2.0\r\nHost: x\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(!head.halt_after);
+        assert_eq!(head.rewrite(raw), b"PRI * HTTP/1.1\r\nHost: x\r\n\r\n");
+    }
+
+    #[test]
+    fn rewrites_versions_httparse_cannot_parse() {
+        let raw = b"GET /health HTTP/1.2\r\nHost: x\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(head.needs_rewrite());
+        assert_eq!(
+            head.rewrite(raw),
+            b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+        );
+        // HTTP/1.0 and HTTP/1.1 are delivered unchanged.
+        let raw = b"GET /health HTTP/1.0\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(!head.needs_rewrite());
+        assert_eq!(head.rewrite(raw), raw.as_slice());
+    }
+
+    #[test]
+    fn rewrites_absolute_targets_with_an_empty_authority() {
+        let raw = b"GET http:// HTTP/1.1\r\nHost: x\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(head.rewrite(raw), b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let raw = b"GET http://?q HTTP/1.1\r\nHost: x\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(head.rewrite(raw), b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        // A non-empty authority is delivered unchanged.
+        let raw = b"GET http://x/health HTTP/1.1\r\nHost: x\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(!head.needs_rewrite());
+    }
+
+    #[test]
+    fn sanitizes_targets_http_uri_rejects() {
+        for (raw, expected) in [
+            (
+                b"GET /a<b>c HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+                b"GET /a%3Cb%3Ec HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+            (
+                b"GET /health#x HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+                b"GET /health%23x HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+            (
+                b"GET /q?a=\"b HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+                b"GET /q?a=%22b HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+            (
+                b"GET /health\xff HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+                b"GET /health%FF HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+        ] {
+            let head = parse_head(raw).unwrap().unwrap();
+            assert_eq!(head.rewrite(raw), expected, "{:?}", raw);
+        }
+        // Bytes http accepts are delivered unchanged: a path quote, a query
+        // backtick and valid UTF-8.
+        for raw in [
+            b"GET /a\"b HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+            b"GET /q?a=`b HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+            b"GET /caf\xc3\xa9 HTTP/1.1\r\nHost: x\r\n\r\n".as_slice(),
+        ] {
+            let head = parse_head(raw).unwrap().unwrap();
+            assert!(!head.needs_rewrite(), "{:?}", raw);
+        }
+    }
+
+    #[test]
+    fn absolute_form_paths_must_keep_valid_percent_escapes() {
+        assert_eq!(
+            parse_head(b"GET http://x/%zz HTTP/1.1\r\nHost: x\r\n\r\n"),
             Err(Reject::BadRequest)
         );
+        assert!(parse_head(b"GET http://?q HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn halt_after_matches_go_connection_reuse() {
+        let halted = |raw: &[u8]| parse_head(raw).unwrap().unwrap().halt_after;
+        assert!(halted(
+            b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(halted(b"GET /health HTTP/1.0\r\n\r\n"));
+        assert!(!halted(
+            b"GET /health HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"
+        ));
+        assert!(halted(
+            b"GET /health HTTP/1.1\r\nHost: x\r\nExpect: 201-created\r\n\r\n"
+        ));
+        // Go's `hasToken` splits on commas: the 100-continue token may follow
+        // others in the same value.
+        assert!(!halted(
+            b"GET /health HTTP/1.1\r\nHost: x\r\nExpect: gzip, 100-continue\r\nContent-Length: 0\r\n\r\n"
+        ));
+        // An empty Expect value is not a failed expectation.
+        assert!(!halted(
+            b"GET /health HTTP/1.1\r\nHost: x\r\nExpect:\r\n\r\n"
+        ));
+        // An h2c upgrade attempt is an ordinary request for Go 1.26.
+        assert!(!halted(
+            b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n\r\n"
+        ));
     }
 
     #[test]
@@ -805,6 +1090,17 @@ mod tests {
     }
 
     #[test]
+    fn complete_oversized_heads_are_too_large() {
+        // Go's limited reader gives up at `initialReadLimitSize` bytes even
+        // when the blank line is still to come (`server.go:1048-1058`), so a
+        // well-formed head past the limit is errTooLarge, not a 400.
+        let mut raw = b"GET / HTTP/1.1\r\nHost: x\r\nX-Fill: ".to_vec();
+        raw.resize(MAX_HEAD_BYTES + 1, b'a');
+        raw.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(parse_head(&raw), Err(Reject::TooLarge));
+    }
+
+    #[test]
     fn skips_leading_crlf_after_post() {
         let head = parse(b"\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n", true)
             .unwrap()
@@ -830,13 +1126,33 @@ mod tests {
     fn go_error_bytes_are_pinned() {
         assert!(Reject::BadRequest
             .response()
-            .ends_with(b"\r\n\r\n400 Bad Request"));
+            .starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        // `statusError` repeats its text in the status line (`server.go:2049`).
+        assert!(Reject::MissingHost
+            .response()
+            .starts_with(b"HTTP/1.1 400 Bad Request: missing required Host header\r\n"));
         assert!(Reject::MissingHost
             .response()
             .ends_with(b"\r\n\r\n400 Bad Request: missing required Host header"));
+        assert!(Reject::MalformedHost
+            .response()
+            .starts_with(b"HTTP/1.1 400 Bad Request: malformed Host header\r\n"));
+        assert!(Reject::InvalidHeaderName
+            .response()
+            .starts_with(b"HTTP/1.1 400 Bad Request: invalid header name\r\n"));
+        assert!(Reject::InvalidHeaderValue
+            .response()
+            .starts_with(b"HTTP/1.1 400 Bad Request: invalid header value\r\n"));
+        assert!(Reject::VersionNotSupported.response().starts_with(
+            b"HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version\r\n"
+        ));
         assert!(Reject::TooLarge
             .response()
             .starts_with(b"HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+        // 431 and 501 are not statusError values: no reason in the status line.
+        assert!(Reject::UnsupportedTransferEncoding
+            .response()
+            .starts_with(b"HTTP/1.1 501 Not Implemented\r\n"));
         assert!(Reject::UnsupportedTransferEncoding
             .response()
             .ends_with(b"\r\n\r\nUnsupported transfer encoding"));
