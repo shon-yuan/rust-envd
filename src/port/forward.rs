@@ -128,12 +128,17 @@ pub fn family_to_ip_version(family: u32) -> u32 {
     }
 }
 
-/// The exact socat argv (forward.go:211-218): `socat -d -d -d
-/// TCP4-LISTEN:<port>,bind=<gateway>,reuseaddr,fork TCP<family>:localhost:<port>`
-/// — reuseaddr fixes "Address already in use" on quick socat restarts.
+/// The exact socat argv (forward.go:211-218): the program the child execs,
+/// then `socat -d -d -d TCP4-LISTEN:<port>,bind=<gateway>,reuseaddr,fork
+/// TCP<family>:localhost:<port>` — reuseaddr fixes "Address already in use"
+/// on quick socat restarts. Go builds the same argv through
+/// `exec.CommandContext(ctx, "socat", ...)`; here argv[0] IS the program the
+/// spawn edge execs ([`SocatSpawn::spawn`]'s contract), LookPath-resolved
+/// against envd's inherited PATH exactly as Go's constructor does.
 pub(crate) fn socat_argv(port: u32, family: u32, source_ip: [u8; 4]) -> Vec<String> {
     let [a, b, c, d] = source_ip;
     vec![
+        "socat".into(),
         "-d".into(),
         "-d".into(),
         "-d".into(),
@@ -422,7 +427,10 @@ impl Forwarder {
     /// scan; a start that FAILED is not (forward.go:206-209).
     async fn start_port_forwarding(&self, port: &mut PortToForward) -> bool {
         let argv = socat_argv(port.port, port.family, self.source_ip);
-        let command_display = argv_display("socat", &argv);
+        // Go logs `cmd.String()`, which renders the LookPath-resolved absolute
+        // command path; this joins the spawned argv verbatim, so the display
+        // shows the bare "socat" the child execs (display-only deviation).
+        let command_display = argv.join(" ");
         let cgroup_fd = self
             .freezer
             .manager()
@@ -633,20 +641,6 @@ fn dotted(ip: [u8; 4]) -> String {
     format!("{a}.{b}.{c}.{d}")
 }
 
-/// Log display for a spawn. Deviation from the oracle, disclosed: Go logs
-/// `cmd.String()`, which renders the PATH-resolved absolute command path
-/// (exec.CommandContext LookPath-resolves "socat" into cmd.Path) plus args;
-/// this joins the literal `"socat"` program name instead — display only, the
-/// spawned argv is the same.
-fn argv_display(program: &str, argv: &[String]) -> String {
-    let mut display = String::from(program);
-    for arg in argv {
-        display.push(' ');
-        display.push_str(arg);
-    }
-    display
-}
-
 /// Go `go reaper.Reap(pid)` (forward.go:382): wait4 the re-adopted socat so
 /// it does not linger as a zombie once it exits (reaper.go Reap).
 fn start_reaper(pid: i32) {
@@ -801,12 +795,14 @@ mod tests {
         assert_eq!(family_to_ip_version(1), 0, "unknown family stays 0");
     }
 
-    /// Oracle forward.go:211-218: the exact socat argv, reuseaddr included.
+    /// Oracle forward.go:211-218: the exact socat argv, program included, and
+    /// reuseaddr with it.
     #[test]
     fn socat_argv_matches_the_oracle_command_shape() {
         assert_eq!(
             socat_argv(4000, 4, DEFAULT_GATEWAY_IP),
             vec![
+                "socat".to_owned(),
                 "-d".to_owned(),
                 "-d".to_owned(),
                 "-d".to_owned(),
@@ -817,7 +813,7 @@ mod tests {
         // The family rides the TARGET address only; the listener is always
         // TCP4 (forward.go:216-217).
         assert_eq!(
-            socat_argv(4000, 6, DEFAULT_GATEWAY_IP)[4],
+            socat_argv(4000, 6, DEFAULT_GATEWAY_IP)[5],
             "TCP6:localhost:4000"
         );
     }
@@ -1149,6 +1145,7 @@ mod tests {
         assert_eq!(
             recorded[0].argv,
             vec![
+                "socat".to_owned(),
                 "-d".to_owned(),
                 "-d".to_owned(),
                 "-d".to_owned(),
@@ -1169,6 +1166,51 @@ mod tests {
         assert!(
             group_gone(socat_pid).await,
             "the stopped socat's process group must be killed"
+        );
+
+        let _ = stop.send(());
+        let _ = task.await;
+    }
+
+    /// Go spawns `exec.CommandContext(ctx, "socat", args...)`
+    /// (forward.go:213-218): the child's argv[0] is the program, resolved by
+    /// LookPath against envd's inherited PATH — /bin/socat in the guest. The
+    /// spawn edge's contract is "argv[0] is the program" ([`SocatSpawn::spawn`]),
+    /// so the forwarded argv must carry it: an argv of flags alone would exec
+    /// `-d` and fail with ENOENT, exactly as the upgrade gate's verbose serial
+    /// once recorded ("failed to start socat", os error 2) with the forwarder
+    /// forever unrelayed.
+    #[tokio::test]
+    async fn the_spawned_socat_argv_starts_with_the_program_name() {
+        let logger = test_logger();
+        let scanner = test_scanner(&logger);
+        let spawner = RecordingSocat::sleeping();
+        let forwarder = Arc::new(
+            Forwarder::build(&logger, &scanner, noop_freezer(), Ok(()))
+                .with_spawner(spawner.clone()),
+        );
+        let subscriber = forwarder.subscriber().unwrap();
+        let (stop, stop_rx) = oneshot::channel();
+        let forwarder_for_task = Arc::clone(&forwarder);
+        let task = tokio::spawn(async move { forwarder_for_task.start_forwarding(stop_rx).await });
+
+        subscriber
+            .signal(batch(vec![listen_row(4242, 65_003)]))
+            .await;
+        subscriber
+            .signal(batch(vec![listen_row(4242, 65_003)]))
+            .await;
+
+        let recorded = spawner.recorded();
+        assert_eq!(recorded.len(), 1, "exactly one spawn for one port");
+        assert_eq!(
+            recorded[0].argv[0], "socat",
+            "argv[0] is the program the child execs"
+        );
+        assert_eq!(
+            &recorded[0].argv[1..],
+            &socat_argv(65_003, 4, DEFAULT_GATEWAY_IP)[1..],
+            "the flags after the program match the oracle's argv exactly"
         );
 
         let _ = stop.send(());

@@ -57,6 +57,20 @@ pub(crate) fn go_text(error: &std::io::Error) -> String {
     }
 }
 
+/// Go `os.Stat`'s failure text: an *os.PathError with op "stat". Rust's std
+/// rejects a path containing NUL before the syscall (InvalidInput, no errno),
+/// while Go's syscall returns EINVAL, so that one case is rendered explicitly.
+#[allow(dead_code)] // Unused only where the test harness compiles this file directly.
+pub(crate) fn stat_text(path: &str, error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(_) => format!("stat {path}: {}", go_text(error)),
+        None if error.kind() == std::io::ErrorKind::InvalidInput => {
+            format!("stat {path}: invalid argument")
+        }
+        None => format!("stat {path}: {error}"),
+    }
+}
+
 /// Go `syscall.Signal.String()` descriptions (sigtable), lowercase without the
 /// SIG prefix; unknown numbers render as `signal N`. Used wherever Go renders
 /// `os.ProcessState.String()` or an `exec.ExitError` ("signal: " + name).

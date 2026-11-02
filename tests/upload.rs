@@ -262,7 +262,57 @@ async fn streaming_gzip_raw_and_multipart_support_multiple_members_and_crc_error
     )
     .await;
     assert_eq!(status, 400, "{value}");
+    // Go's compress/gzip texts, wrapped by getDecompressedBody verbatim: a
+    // three-byte body is truncated inside the fixed header ("unexpected EOF"),
+    // while a full-sized non-gzip header fails the magic check.
+    assert_eq!(
+        value["message"],
+        "error decompressing request body: failed to create gzip reader: unexpected EOF"
+    );
+    let (status, value) = upload(
+        &app,
+        &query,
+        "application/octet-stream",
+        Body::from("not-gzip-bytes"),
+        &[("content-encoding", "gzip")],
+    )
+    .await;
+    assert_eq!(status, 400, "{value}");
+    assert_eq!(
+        value["message"],
+        "error decompressing request body: failed to create gzip reader: gzip: invalid header"
+    );
     assert_eq!(fs::read(&path).unwrap(), b"partial");
+}
+
+#[tokio::test]
+async fn truncated_multipart_headers_answer_an_empty_sniffed_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = setup(dir.path()).await;
+    // Go's mime/multipart NextPart reports io.EOF when the stream ends inside
+    // the next part's headers, so PostFiles succeeds with no entries; the
+    // marshal wrote with no explicit type is sniffed as text/plain.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/files")
+                .header("content-type", "multipart/form-data; boundary=X")
+                .body(Body::from(
+                    "--X\r\nContent-Disposition: form-data; name=\"a\"\r\n",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), 65536).await.unwrap(),
+        &b"[]"[..]
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,74 @@
+# Packaging — what a covered distribution must include
+
+A **covered distribution** of this project is any linked `envd` binary built
+from this crate, and any guest or sandbox image that embeds such a binary.
+Every covered distribution must ship:
+
+| # | Artifact | Why |
+|---|----------|-----|
+| 1 | The built binary (`target/release/coorworker-envd`) | The distributed program. |
+| 2 | `LICENSE` | The project's MIT grant. |
+| 3 | `third_party/e2b/LICENSE` and `third_party/e2b/PROVENANCE` | e2b protobuf schemas redistributed under Apache-2.0; generated code built from them carries the same attribution. |
+| 4 | `third_party/NOTICES.md` | Aggregate third-party notice: scope statement, project MIT grant, e2b Apache-2.0 pointer, Go BSD-3-Clause notice, per-crate index and copyright lines. |
+| 5 | The complete `third_party/licenses/` tree | Verbatim license texts for every crate in the locked dependency graph, one directory per crate-version. |
+| 6 | The Go Authors' BSD-3-Clause notice for `src/mmds/go_url.rs` | Required for binary redistribution; the notice is reproduced in `third_party/NOTICES.md` ("Copyright 2009 The Go Authors."), so including item 4 satisfies it. Source distributions must also keep the notice in the file header itself. |
+| 7 | `vendor/connectrpc/LICENSE` and `vendor/connectrpc/PATCHES.md` | The in-tree `connectrpc` 0.9.1 fork selected by `[patch.crates-io]`; the license text is also enumerated as `licenses/connectrpc-0.9.1/`, and `PATCHES.md` records the upstream revision and every local change. |
+| 8 | A provenance manifest from `scripts/packaging_manifest.py` | Binds the binary to `git rev-parse HEAD`, dirty state, toolchain, canonical build command, and SHA-256 digests of every covered file and the whole license tree. |
+
+Do not drop, truncate, or reflow items 2–5: the license texts are copied
+verbatim from the crates.io packages and must stay byte-for-byte.
+
+## Canonical build
+
+From a clean checkout at the pinned revision:
+
+```sh
+git rev-parse HEAD            # record this with the artifact
+cargo build --locked -j4      # or: cargo build --locked --release -j4
+```
+
+`--locked` makes cargo use exactly the versions in `Cargo.lock` — the same
+versions covered by `third_party/NOTICES.md`. The distributed guest binary is
+the static musl build:
+
+```sh
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+CC_x86_64_unknown_linux_musl=clang AR_x86_64_unknown_linux_musl=llvm-ar \
+cargo build --locked --release -j4 --target x86_64-unknown-linux-musl
+```
+
+## Binding artifacts to source
+
+- Record `git rev-parse HEAD` (and `git status --porcelain` to prove a clean
+  tree) next to each artifact.
+- Build only with `cargo build --locked`; never an unlocked build.
+- Emit the provenance manifest for the exact artifact being distributed:
+
+  ```sh
+  python3 scripts/packaging_manifest.py \
+    --binary target/x86_64-unknown-linux-musl/release/coorworker-envd \
+    --target x86_64-unknown-linux-musl --output dist/provenance.json
+  ```
+
+  The script refuses a dirty tree unless `--allow-dirty` is passed (the
+  resulting manifest still records `dirty: true`), refuses missing covered
+  files, and rejects a notice bundle that does not match `Cargo.lock`.
+- When `Cargo.lock` changes, refresh the notice bundle before distributing:
+
+  ```sh
+  python3 scripts/generate_notices.py          # regenerate NOTICES.md + licenses/
+  python3 scripts/generate_notices.py --check  # CI-style verification
+  ```
+
+  The generator fails closed: any crate without a discoverable license
+  aborts the bundle rather than shipping a partial notice.
+
+## Completeness check
+
+- [ ] binary
+- [ ] `LICENSE`
+- [ ] `third_party/e2b/LICENSE` + `third_party/e2b/PROVENANCE`
+- [ ] `third_party/NOTICES.md`
+- [ ] `third_party/licenses/` — full tree, unmodified
+- [ ] `vendor/connectrpc/LICENSE` + `vendor/connectrpc/PATCHES.md`
+- [ ] provenance manifest for this artifact

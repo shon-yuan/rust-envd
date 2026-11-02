@@ -5,6 +5,7 @@ use super::{
 use crate::proto::process as pb;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -213,6 +214,317 @@ enum Output {
     Stdout,
     Stderr,
     Pty,
+}
+
+/// The inherited descriptor endpoints an adopted entry pumps (readopt.go's
+/// reader set): relocated stdout/stderr read-ends and, for pty children, the
+/// rebuilt terminal (its stdout/stderr slots are absent and never wrapped).
+pub(super) struct AdoptedIo {
+    pub(super) stdout: Option<super::pipe::FdReader>,
+    pub(super) stderr: Option<super::pipe::FdReader>,
+    pub(super) tty: Option<Arc<super::pty::Terminal>>,
+}
+
+/// The incoming handover's adopted-process supervision (readopt.go): readers
+/// over the inherited descriptors, a pid-specific reaper instead of an owned
+/// `Child`, and a kill timer that arms only once the workload thaws. The
+/// child itself kept running as this process's child across the execve, so
+/// its output keeps flowing and its exit status is collected with a
+/// pid-specific wait.
+pub(super) async fn run_adopted(
+    registry: Arc<Mutex<Registry>>,
+    entry: Arc<Entry>,
+    mut controls: mpsc::Receiver<Control>,
+    io: AdoptedIo,
+    timeout: Option<Duration>,
+    thawed: tokio::sync::watch::Receiver<()>,
+    _logs: Option<Arc<dyn ProcessLogSink>>,
+) {
+    let (output, mut events) = mpsc::channel(64);
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let pty_reader = io.tty.map(|terminal| {
+        tokio::spawn(read(
+            super::pty::Reader(terminal),
+            output.clone(),
+            Output::Pty,
+            stopping.clone(),
+            entry.pty_bytes.clone(),
+        ))
+    });
+    let stdout_reader = io.stdout.map(|pipe| {
+        tokio::spawn(read(
+            pipe,
+            output.clone(),
+            Output::Stdout,
+            stopping.clone(),
+            entry.stdout_bytes.clone(),
+        ))
+    });
+    let stderr_reader = io.stderr.map(|pipe| {
+        tokio::spawn(read(
+            pipe,
+            output.clone(),
+            Output::Stderr,
+            stopping.clone(),
+            entry.stderr_bytes.clone(),
+        ))
+    });
+    drop(output);
+    let observing = entry.clone();
+    let mut pump = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            publish(&observing, event, false).await;
+        }
+    });
+    // The carried kill deadline arms only after the thaw (readopt.go
+    // BeginReaping waits on `Thawed`): frozen time must not burn the
+    // remaining timeout down before the process can run again. The absolute
+    // deadline is recorded once armed, so a chained handover carries the
+    // remaining time exactly as Go's `Deadline()` does.
+    let deadline = async {
+        match timeout.filter(|duration| !duration.is_zero()) {
+            Some(timeout) => {
+                let mut thawed = thawed;
+                let _ = thawed.wait_for(|_| true).await;
+                *entry.deadline_at.lock().await = Some(Instant::now() + timeout);
+                tokio::time::sleep(timeout).await
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(deadline);
+    let mut signaled = false;
+    let mut expired = false;
+    let status = loop {
+        tokio::select! {
+            biased;
+            result = wait_adopted(entry.info.pid) => break result,
+            _ = &mut deadline => {
+                // Kill the adopted child only; the pid-specific kill mirrors
+                // the live path's selected-child kill.
+                let _ = kill(Pid::from_raw(entry.info.pid as i32), Signal::SIGKILL);
+                expired = true;
+                break wait_adopted(entry.info.pid).await;
+            }
+            Some(control) = controls.recv() => {
+                // The pid is ours to signal until wait_adopted reaps it; a
+                // stale control after that is refused like the live path.
+                signaled = true;
+                let result = kill(Pid::from_raw(entry.info.pid as i32), control.signal)
+                    .map_err(|error| RuntimeError::Internal(error.to_string()));
+                let _ = control.reply.send(result);
+            }
+        }
+    };
+    // No new signal is accepted once the child is reaped and the pid could be
+    // recycled (readopt.go closes the EndEvent source at the same point).
+    controls.close();
+    while let Some(control) = controls.recv().await {
+        let _ = control.reply.send(Err(RuntimeError::NotFound));
+    }
+    entry.stdin.lock().await.take();
+    if signaled || expired {
+        let _ = stop.send(true);
+    }
+    let readers = async {
+        if let Some(reader) = pty_reader {
+            let _ = reader.await;
+        }
+        if let Some(reader) = stdout_reader {
+            let _ = reader.await;
+        }
+        if let Some(reader) = stderr_reader {
+            let _ = reader.await;
+        }
+    };
+    tokio::pin!(readers);
+    let mut readers_done = false;
+    if !expired {
+        tokio::select! {
+            _ = &mut readers => { readers_done = true; },
+            _ = &mut deadline => { expired = true; }
+        }
+    }
+    if !expired {
+        tokio::select! {
+            _ = &mut pump => {},
+            _ = &mut deadline => { expired = true; }
+        }
+    }
+    if expired {
+        let _ = stop.send(true);
+        pump.abort();
+        let _ = pump.await;
+        if !readers_done {
+            readers.await;
+        }
+    }
+    if let Some(terminal) = entry.pty.lock().await.take() {
+        terminal.close();
+    }
+    let end = match status {
+        Ok(status) => adopted_terminal(status),
+        Err(error) => pb::process_event::EndEvent {
+            exit_code: -1,
+            error: Some(error.to_string()),
+            status: "wait4 error".into(),
+            ..Default::default()
+        },
+    };
+    // readopt.go reapByPidfd's event: the readopt end event, not the live
+    // handler's process_end line.
+    eprintln!(
+        "envd: re-adopted process ended (pid {}, {})",
+        entry.info.pid, end.status
+    );
+    {
+        let mut registry = registry.lock().await;
+        if registry
+            .live
+            .get(&entry.info.pid)
+            .is_some_and(|live| Arc::ptr_eq(live, &entry))
+        {
+            registry.retained.insert(
+                entry.info.pid,
+                Retained {
+                    info: entry.info.clone(),
+                    end: end.clone(),
+                    expires: Instant::now() + RETENTION,
+                },
+            );
+            registry.live.remove(&entry.info.pid);
+        }
+    }
+    let pid = entry.info.pid;
+    let expiry = Instant::now() + RETENTION;
+    tokio::spawn(async move {
+        tokio::time::sleep_until(expiry).await;
+        let mut registry = registry.lock().await;
+        if registry
+            .retained
+            .get(&pid)
+            .is_some_and(|exit| exit.expires <= Instant::now())
+        {
+            registry.retained.remove(&pid);
+        }
+    });
+    let terminal = publish(&entry, end_event(end), expired);
+    tokio::pin!(terminal);
+    if expired {
+        terminal.await;
+    } else {
+        tokio::select! {
+            _ = &mut terminal => {},
+            _ = &mut deadline => {}
+        }
+    }
+}
+
+/// Block until the adopted pid exits, then collect its status with a
+/// pid-specific wait (readopt.go `reapByPidfd`: pidfd poll + `wait4(pid)` —
+/// never a `wait4(-1)`, which could steal another component's child). tokio
+/// 1.52 reaps only pid-specifically (registered reapers and the orphan drain
+/// both `waitpid(pid)`), so the status survives until we collect it.
+async fn wait_adopted(pid: u32) -> std::io::Result<std::process::ExitStatus> {
+    // SAFETY: pidfd_open takes the pid and flags over registers; a negative
+    // return means the kernel refused (unsupported, fd exhaustion, or an
+    // already-reaped pid) and the fallback polls the pid directly.
+    let pidfd = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pidfd_open,
+            pid as nix::libc::c_uint,
+            nix::libc::O_NONBLOCK as nix::libc::c_uint,
+        )
+    };
+    if pidfd >= 0 {
+        // SAFETY: pidfd_open handed us a fresh descriptor this block solely
+        // owns; AsyncFd closes it on drop.
+        let owned = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+        let async_fd = tokio::io::unix::AsyncFd::new(owned)?;
+        // The pidfd reports readable exactly once — when the process exits.
+        let _ = async_fd.readable().await?;
+        drop(async_fd);
+    } else {
+        // Fallback: poll the pid directly (readopt.go's "pidfd_open failed;
+        // falling back to blocking wait4" path, in non-blocking shape).
+        loop {
+            let polled = wait_adopted_raw(pid, nix::libc::WNOHANG)?;
+            if let Some(status) = polled {
+                return Ok(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    Ok(wait_adopted_raw(pid, 0)?.unwrap())
+}
+
+/// One pid-specific waitpid with a restart on EINTR. `Some` carries the raw
+/// wait status for a reaped child; `None` is WNOHANG's still-alive.
+fn wait_adopted_raw(
+    pid: u32,
+    flags: nix::libc::c_int,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    // SAFETY: waitpid takes the pid, a status out-pointer and flag bits; the
+    // child is ours, so the kernel fills the status once it exits.
+    let mut status: nix::libc::c_int = 0;
+    let rc = unsafe { nix::libc::waitpid(pid as nix::libc::pid_t, &mut status, flags) };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return wait_adopted_raw(pid, flags);
+        }
+        return Err(error);
+    }
+    if rc == 0 {
+        return Ok(None);
+    }
+    Ok(Some(std::process::ExitStatus::from_raw(status)))
+}
+
+/// A carried process whose adoption failed has no entry, no readers and no
+/// reaper: kill it and collect the status so it neither keeps running unseen
+/// nor becomes a zombie. Go's `Readopt` cannot fail on a valid carried
+/// descriptor, so this path is Rust-only; terminating is the conservative
+/// choice because the dropped read ends would fail the child on its next
+/// write anyway. `pid <= 1` is refused because `kill(0, …)` targets our own
+/// process group.
+pub(crate) async fn reap_unadopted(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
+    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+    let _ = wait_adopted(pid).await;
+}
+
+/// readopt.go `reapByPidfd`'s terminal rendering. Deliberately different
+/// from the live path's `ProcessState.String()` text: a normal exit renders
+/// `"exited"` (not "exit status N") and a signal death renders the bare
+/// signal name with exit code 128+signal — the oracle's two paths differ,
+/// and an upgraded envd speaks the readopt variant.
+fn adopted_terminal(status: std::process::ExitStatus) -> pb::process_event::EndEvent {
+    let code = status.code();
+    if let Some(code) = code {
+        pb::process_event::EndEvent {
+            exit_code: code,
+            exited: true,
+            status: "exited".into(),
+            ..Default::default()
+        }
+    } else if let Some(signal) = status.signal() {
+        pb::process_event::EndEvent {
+            exit_code: 128 + signal,
+            exited: false,
+            status: crate::errno_text::signal_description(signal),
+            ..Default::default()
+        }
+    } else {
+        pb::process_event::EndEvent {
+            exit_code: -1,
+            exited: false,
+            status: "exited".into(),
+            ..Default::default()
+        }
+    }
 }
 
 async fn read(

@@ -90,9 +90,13 @@ async fn download(daemon: &Daemon, request: Request<Body>) -> Result<Response, R
         if error.kind() == io::ErrorKind::NotFound {
             json_error(404, &format!("path '{resolved}' does not exist"))
         } else {
+            // Go wraps os.Stat's *fs.PathError ("stat <path>: <errno text>").
             json_error(
                 500,
-                &format!("error checking if path exists '{resolved}': {error}"),
+                &format!(
+                    "error checking if path exists '{resolved}': {}",
+                    crate::errno_text::stat_text(&resolved, &error)
+                ),
             )
         }
     })?;

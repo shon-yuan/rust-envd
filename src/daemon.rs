@@ -51,8 +51,11 @@ pub fn share_freezer(
 }
 
 mod compose;
+mod cors;
 mod download;
 mod filesystem_rpc;
+mod frontdoor;
+pub mod http1;
 mod metrics;
 pub mod nfs;
 mod process_rpc;
@@ -515,22 +518,36 @@ impl Daemon {
 }
 
 pub fn app(state: Arc<Daemon>) -> Router {
-    http_routes(state.clone()).layer(middleware::from_fn_with_state(state, authorize))
+    layered(http_routes(state.clone()), state)
 }
 
 pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
     let rpc = filesystem_rpc::router(state.clone());
-    http_routes(state.clone())
-        .fallback_service(crate::transport::rpc_service(rpc))
-        .layer(middleware::from_fn_with_state(state, authorize))
+    layered(
+        http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
+        state,
+    )
 }
 
 pub fn app_with_execution(state: Arc<Daemon>, runtime: crate::process::ProcessRuntime) -> Router {
     let rpc =
         process_rpc::router(state.clone(), runtime).merge(filesystem_rpc::router(state.clone()));
-    http_routes(state.clone())
-        .fallback_service(crate::transport::rpc_service(rpc))
+    layered(
+        http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
+        state,
+    )
+}
+
+/// main.go:325-331 order: CORS is outermost, then authorization, then the chi
+/// mux (here [`frontdoor::gate`] followed by the two routers). The gate sits
+/// inside authorization because Go's auth middleware wraps the mux, so an
+/// unauthenticated unknown path is 401, not 404.
+fn layered(router: Router, state: Arc<Daemon>) -> Router {
+    crate::transport::ensure_protojson_schema();
+    router
+        .layer(middleware::from_fn(frontdoor::gate))
         .layer(middleware::from_fn_with_state(state, authorize))
+        .layer(middleware::from_fn(cors::cors))
 }
 
 fn http_routes(state: Arc<Daemon>) -> Router {
@@ -787,11 +804,32 @@ async fn health() -> Response {
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),
     );
+    // store.go:193 sets Content-Type explicitly, so the wire carries an EMPTY
+    // content-type header (verified by the malformed-input gate) rather than
+    // no header at all.
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, header::HeaderValue::from_static(""));
     response
 }
 async fn envs(State(daemon): State<Arc<Daemon>>) -> Response {
     let state = daemon.state.lock().await;
-    let mut response = Json(state.environment.all()).into_response();
+    // Go sets application/json and encodes with json.NewEncoder, whose trailing
+    // newline is on the wire.
+    let mut response = match serde_json::to_vec(&state.environment.all()) {
+        Ok(mut body) => {
+            body.push(b'\n');
+            Body::from(body).into_response()
+        }
+        Err(error) => {
+            eprintln!("failed to encode environment: {error}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),
@@ -801,13 +839,135 @@ async fn envs(State(daemon): State<Arc<Daemon>>) -> Response {
 
 /// Go api.gen.go:323-354, form-bound query parameters. Absent or unknown
 /// values keep the contracts of callers predating each parameter.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 struct FreezeParams {
-    #[serde(rename = "maxWaitMs")]
     max_wait_ms: Option<i64>,
     mode: Option<String>,
-    #[serde(rename = "maxCgroups")]
     max_cgroups: Option<i64>,
+}
+
+/// api.gen.go:723-765 binding order: mode, maxCgroups, maxWaitMs, stopping at
+/// the first invalid value. Go answers a binding failure with http.Error and
+/// oapi's `Invalid format for parameter ...` text; axum's Query rejection text
+/// would be different, so the binding is reproduced here.
+fn freeze_params(query: Option<&str>) -> Result<FreezeParams, String> {
+    let query = go_query_values(query.unwrap_or(""));
+    let mut params = FreezeParams::default();
+    if let Some(value) = query.get("mode") {
+        params.mode = Some(value.clone());
+    }
+    if let Some(value) = query.get("maxCgroups") {
+        params.max_cgroups = Some(bind_integer("maxCgroups", value)?);
+    }
+    if let Some(value) = query.get("maxWaitMs") {
+        params.max_wait_ms = Some(bind_integer("maxWaitMs", value)?);
+    }
+    Ok(params)
+}
+
+fn bind_integer(name: &str, value: &str) -> Result<i64, String> {
+    go_parse_int(value).map_err(|error| {
+        format!("Invalid format for parameter {name}: error binding string parameter: {error}")
+    })
+}
+
+/// Go `url.ParseQuery` as `r.URL.Query()` exposes it: malformed pairs (bad
+/// percent escape, unescaped `;`) are dropped, `+` is a space, and oapi's
+/// scalar binding takes the first value for a repeated key.
+fn go_query_values(query: &str) -> std::collections::HashMap<String, String> {
+    let mut values = std::collections::HashMap::new();
+    for piece in query.split('&') {
+        if piece.is_empty() || piece.contains(';') {
+            continue;
+        }
+        let (raw_key, raw_value) = piece.split_once('=').unwrap_or((piece, ""));
+        let (Some(key), Some(value)) = (go_query_unescape(raw_key), go_query_unescape(raw_value))
+        else {
+            continue;
+        };
+        values.entry(key).or_insert(value);
+    }
+    values
+}
+
+fn go_query_unescape(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                let high = (*bytes.get(index + 1)? as char).to_digit(16)?;
+                let low = (*bytes.get(index + 2)? as char).to_digit(16)?;
+                output.push((high << 4 | low) as u8);
+                index += 3;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+/// strconv.ParseInt(value, 10, 64)'s failure text.
+fn go_parse_int(value: &str) -> Result<i64, String> {
+    let (negative, digits) = match value.as_bytes().first() {
+        Some(b'+') => (false, &value[1..]),
+        Some(b'-') => (true, &value[1..]),
+        _ => (false, value),
+    };
+    let out_of_range = || {
+        format!(
+            "strconv.ParseInt: parsing {}: value out of range",
+            go_quote(value)
+        )
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "strconv.ParseInt: parsing {}: invalid syntax",
+            go_quote(value)
+        ));
+    }
+    let magnitude = digits.parse::<u128>().map_err(|_| out_of_range())?;
+    let limit = if negative {
+        1u128 << 63
+    } else {
+        i64::MAX as u128
+    };
+    if magnitude > limit {
+        return Err(out_of_range());
+    }
+    Ok(if negative {
+        (-(magnitude as i128)) as i64
+    } else {
+        magnitude as i64
+    })
+}
+
+/// strconv.Quote's shape for the ASCII query values a caller can send.
+fn go_quote(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character if (character as u32) < 0x20 || character as u32 == 0x7f => {
+                quoted.push_str(&format!("\\x{:02x}", character as u32));
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Go init.go:494-643 PostFreeze. maxWaitMs is what tells the two callers
@@ -816,8 +976,12 @@ struct FreezeParams {
 /// best-effort: an incomplete freeze is reported, never failed.
 async fn freeze(
     State(daemon): State<Arc<Daemon>>,
-    axum::extract::Query(params): axum::extract::Query<FreezeParams>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
+    let params = match freeze_params(query.as_deref()) {
+        Ok(params) => params,
+        Err(error) => return plain_http_error(StatusCode::BAD_REQUEST, &error),
+    };
     // Go's asymmetry is deliberate: the THAW is inevitable once started
     // (freeze.go:1208-1212, context.WithoutCancel), the FREEZE respects its
     // caller — the lock acquire is ctx-bounded (freeze.go:575), so a caller
@@ -2188,5 +2352,107 @@ mod upgrade_write_tests {
                 "round {round}: the write future resolved before the staged binary held every byte"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn go_parse_int_matches_strconv_text_and_bounds() {
+        assert_eq!(go_parse_int("42"), Ok(42));
+        assert_eq!(go_parse_int("+42"), Ok(42));
+        assert_eq!(go_parse_int("-5"), Ok(-5));
+        assert_eq!(go_parse_int("9223372036854775807"), Ok(i64::MAX));
+        assert_eq!(go_parse_int("-9223372036854775808"), Ok(i64::MIN));
+        assert_eq!(
+            go_parse_int("abc"),
+            Err("strconv.ParseInt: parsing \"abc\": invalid syntax".into())
+        );
+        assert_eq!(
+            go_parse_int(""),
+            Err("strconv.ParseInt: parsing \"\": invalid syntax".into())
+        );
+        assert_eq!(
+            go_parse_int(" 1"),
+            Err("strconv.ParseInt: parsing \" 1\": invalid syntax".into())
+        );
+        assert_eq!(
+            go_parse_int("9223372036854775808"),
+            Err("strconv.ParseInt: parsing \"9223372036854775808\": value out of range".into())
+        );
+        assert_eq!(
+            go_parse_int("1".repeat(100).as_str()),
+            Err(format!(
+                "strconv.ParseInt: parsing \"{}\": value out of range",
+                "1".repeat(100)
+            ))
+        );
+    }
+
+    #[test]
+    fn go_query_values_drops_malformed_pairs_and_keeps_the_first_value() {
+        let values = go_query_values("maxWaitMs=abc&maxWaitMs=2&%zz=1&mode=a+b&bare");
+        assert_eq!(values.get("maxWaitMs").map(String::as_str), Some("abc"));
+        assert_eq!(values.get("mode").map(String::as_str), Some("a b"));
+        assert_eq!(values.get("bare").map(String::as_str), Some(""));
+        assert!(!values.contains_key("%zz"));
+        assert!(go_query_values("a=1;b=2").is_empty());
+    }
+
+    #[tokio::test]
+    async fn freeze_params_render_oapi_binding_errors_and_bind_in_generated_order() {
+        let error = freeze_params(Some("maxWaitMs=abc")).unwrap_err();
+        assert_eq!(
+            error,
+            "Invalid format for parameter maxWaitMs: error binding string parameter: \
+             strconv.ParseInt: parsing \"abc\": invalid syntax"
+        );
+        // The handler renders that text through http.Error (text/plain, newline).
+        let response = plain_http_error(StatusCode::BAD_REQUEST, &error);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap(),
+            &b"Invalid format for parameter maxWaitMs: error binding string parameter: \
+              strconv.ParseInt: parsing \"abc\": invalid syntax\n"[..]
+        );
+        // mode and maxCgroups are bound before maxWaitMs (api.gen.go:723-765).
+        let error = freeze_params(Some("maxWaitMs=abc&maxCgroups=zz")).unwrap_err();
+        assert_eq!(
+            error,
+            "Invalid format for parameter maxCgroups: error binding string parameter: \
+             strconv.ParseInt: parsing \"zz\": invalid syntax"
+        );
+        let params = freeze_params(Some("maxWaitMs=-5&mode=hierarchy&maxCgroups=3")).unwrap();
+        assert_eq!(params.max_wait_ms, Some(-5));
+        assert_eq!(params.mode.as_deref(), Some("hierarchy"));
+        assert_eq!(params.max_cgroups, Some(3));
+        // Go's URL.Query drops the malformed pair, leaving the default.
+        assert_eq!(freeze_params(Some("%zz=1")).unwrap().max_wait_ms, None);
+    }
+
+    #[test]
+    fn a_nul_path_renders_go_stat_einval_text() {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file name contained an unexpected NUL byte",
+        );
+        assert_eq!(
+            crate::errno_text::stat_text("/root/\0", &error),
+            "stat /root/\0: invalid argument"
+        );
+        let error = io::Error::from_raw_os_error(nix::errno::Errno::ENOENT as i32);
+        assert_eq!(
+            crate::errno_text::stat_text("/root/x", &error),
+            "stat /root/x: no such file or directory"
+        );
     }
 }

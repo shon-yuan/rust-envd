@@ -31,8 +31,9 @@ impl std::error::Error for PathTextError {
 }
 
 /// The Go os-failure text for `op path: errno` (os.PathError's Display shape
-/// for open/fork-exec sites), as an io::Error that keeps the errno.
-pub(super) fn path_text_error(op: &str, path: &str, error: io::Error) -> io::Error {
+/// for open/fork-exec sites), as an io::Error that keeps the errno. Re-exported
+/// crate-wide for the handover blob writer's refusal text.
+pub(crate) fn path_text_error(op: &str, path: &str, error: io::Error) -> io::Error {
     io::Error::other(PathTextError {
         text: format!("{op} {path}: {}", crate::errno_text::go_text(&error)),
         source: error,

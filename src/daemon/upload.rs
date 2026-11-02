@@ -130,8 +130,15 @@ async fn receive(daemon: &Daemon, request: Request<Body>) -> Result<Response, Re
     } else {
         return Err(json_error(400,&format!("unsupported content type: {content_type}, expected multipart/form-data or application/octet-stream")));
     };
-    // Go marshals []EntryInfo directly, with no explicitly set JSON Content-Type.
-    Ok(Body::from(serde_json::Value::Array(entries).to_string()).into_response())
+    // Go writes the marshaled array with no explicit Content-Type, so net/http
+    // sniffs it: JSON bytes are all printable text, yielding
+    // "text/plain; charset=utf-8" (verified against http.DetectContentType).
+    let mut response = Body::from(serde_json::Value::Array(entries).to_string()).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    Ok(response)
 }
 
 fn metadata_headers(headers: &HeaderMap) -> Result<HashMap<String, String>, Response> {
@@ -195,7 +202,7 @@ async fn decode(body: Body, headers: &HeaderMap) -> Result<Input, Response> {
             let error = decoder.read(&mut [0u8; 1]).err().unwrap_or_else(|| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "invalid gzip header")
             });
-            let _ = ready.send(Err(error.to_string()));
+            let _ = ready.send(Err(go_gzip_text(&error)));
             return;
         }
         if ready.send(Ok(())).is_err() {
@@ -234,6 +241,16 @@ async fn decode(body: Body, headers: &HeaderMap) -> Result<Input, Response> {
             )
         })?;
     Ok(input)
+}
+
+/// flate2's gzip header errors rendered as Go compress/gzip's texts: the
+/// oracle's getDecompressedBody wraps gzip.NewReader's error verbatim.
+fn go_gzip_text(error: &io::Error) -> String {
+    match error.to_string().as_str() {
+        "invalid gzip header" => "gzip: invalid header".to_owned(),
+        "unexpected end of file" => "unexpected EOF".to_owned(),
+        other => other.to_owned(),
+    }
 }
 
 async fn open(path: &str, account: &Account) -> Result<tokio::fs::File, Response> {
@@ -678,11 +695,19 @@ async fn multipart(
     let mut reader = multer::Multipart::new(guarded, boundary);
     let mut entries = Vec::new();
     let mut paths: Vec<String> = Vec::new();
-    while let Some(mut field) = reader
-        .next_field()
-        .await
-        .map_err(|e| json_error(500, &format!("error reading form: {e}")))?
-    {
+    loop {
+        // Go mime/multipart reports io.EOF when the stream ends inside the next
+        // part's headers (nextPart returns io.EOF for that shape), and
+        // PostFiles then answers with the parts collected so far. multer calls
+        // the same condition IncompleteStream; the corpus' truncated multipart
+        // body is exactly this case.
+        let mut field = match reader.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) | Err(multer::Error::IncompleteStream) => break,
+            Err(error) => {
+                return Err(json_error(500, &format!("error reading form: {error}")));
+            }
+        };
         let parsed = disposition(&field);
         let is_file = parsed.as_ref().is_some_and(|value| {
             value.subtype() == "form-data"
