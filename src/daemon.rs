@@ -5,10 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    body::{to_bytes, Body, HttpBody},
+    body::{Body, HttpBody},
     extract::State,
     http::{header, Method, Request, StatusCode},
-    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::any,
     Json, Router,
@@ -19,8 +18,9 @@ use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 use crate::{
-    auth::Access,
-    exec_context::{Defaults, Environment},
+    configuration::Configuration,
+    exec_context::Defaults,
+    http::{json_error, plain_http_error},
     memory_protection::{read_memory_protection, MemoryProtection},
 };
 
@@ -51,15 +51,18 @@ pub fn share_freezer(
 }
 
 mod compose;
-mod cors;
-mod download;
 mod filesystem_rpc;
-mod frontdoor;
 pub mod http1;
 mod metrics;
 pub mod nfs;
 mod process_rpc;
 mod upload;
+
+impl crate::http::ConfigurationState for Daemon {
+    fn configuration(&self) -> &Arc<Mutex<Configuration>> {
+        &self.state
+    }
+}
 
 pub struct Daemon {
     state: Arc<Mutex<Configuration>>,
@@ -125,11 +128,6 @@ pub struct Daemon {
 mod filesystem_payload;
 mod process_payload;
 mod rpc_log;
-struct Configuration {
-    access: Access,
-    defaults: Defaults,
-    environment: Environment,
-}
 
 /// Mirrors Go `SetupHyperloop`: a per-daemon lock serializes rewrites (last
 /// writer wins), success stores the internal events address, failure only logs.
@@ -470,14 +468,8 @@ impl Daemon {
     }
 
     pub fn new() -> Self {
-        let mut environment = Environment::default();
-        environment.store_internal("E2B_SANDBOX", "true");
         Self {
-            state: Arc::new(Mutex::new(Configuration {
-                access: Access::fresh(),
-                defaults: Defaults::default(),
-                environment,
-            })),
+            state: Arc::new(Mutex::new(Configuration::new())),
             init_lock: Arc::new(Mutex::new(())),
             watchers: crate::filesystem::watchers::WatcherRegistry::new(),
             freezer: Arc::new(crate::cgroups::freeze::WorkloadFreezer::new(Arc::new(
@@ -518,12 +510,12 @@ impl Daemon {
 }
 
 pub fn app(state: Arc<Daemon>) -> Router {
-    layered(http_routes(state.clone()), state)
+    crate::http::layered(http_routes(state.clone()), state)
 }
 
 pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
     let rpc = filesystem_rpc::router(state.clone());
-    layered(
+    crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
     )
@@ -532,121 +524,24 @@ pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
 pub fn app_with_execution(state: Arc<Daemon>, runtime: crate::process::ProcessRuntime) -> Router {
     let rpc =
         process_rpc::router(state.clone(), runtime).merge(filesystem_rpc::router(state.clone()));
-    layered(
+    crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
     )
 }
 
-/// main.go:325-331 order: CORS is outermost, then authorization, then the chi
-/// mux (here [`frontdoor::gate`] followed by the two routers). The gate sits
-/// inside authorization because Go's auth middleware wraps the mux, so an
-/// unauthenticated unknown path is 401, not 404.
-///
-/// The two outermost layers reproduce `net/http`'s connection-level checks,
-/// which run before any handler: a failed `Expect` is answered 417
-/// (`server.go:2059-2068`) and `OPTIONS *` is answered by the general options
-/// handler (`server.go:3327`).
-fn layered(router: Router, state: Arc<Daemon>) -> Router {
-    crate::transport::ensure_protojson_schema();
-    router
-        .layer(middleware::from_fn(frontdoor::gate))
-        .layer(middleware::from_fn_with_state(state, authorize))
-        .layer(middleware::from_fn(cors::cors))
-        .layer(middleware::from_fn(options_asterisk))
-        .layer(middleware::from_fn(expectation))
-}
-
-/// `net/http`'s Expect handling (`server.go:2059-2068`): a non-empty `Expect`
-/// whose first value has no `100-continue` token is answered 417 before any
-/// handler runs, with `Connection: close` set (`sendExpectationFailed`).
-async fn expectation(request: Request<Body>, next: Next) -> Response {
-    let expect = request.headers().get(header::EXPECT);
-    let continue_expected = expect.is_some_and(|value| {
-        value
-            .as_bytes()
-            .split(|&byte| byte == b',')
-            .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"100-continue"))
-    });
-    if expect.is_some_and(|value| !value.is_empty()) && !continue_expected {
-        let mut response = StatusCode::EXPECTATION_FAILED.into_response();
-        response.headers_mut().insert(
-            header::CONNECTION,
-            header::HeaderValue::from_static("close"),
-        );
-        response.headers_mut().insert(
-            header::CONTENT_LENGTH,
-            header::HeaderValue::from_static("0"),
-        );
-        return response;
-    }
-    next.run(request).await
-}
-
-/// `serverHandler.ServeHTTP` answers `OPTIONS *` with the general options
-/// handler before the mux (`server.go:3327`): 200 with `Content-Length: 0`,
-/// draining at most 4 KiB of body — anything larger aborts the read and the
-/// connection closes (`globalOptionsHandler`).
-async fn options_asterisk(request: Request<Body>, next: Next) -> Response {
-    if !is_general_options(&request) {
-        return next.run(request).await;
-    }
-    let mut response = StatusCode::OK.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        header::HeaderValue::from_static("0"),
-    );
-    if to_bytes(request.into_body(), 4 << 10).await.is_err() {
-        response.headers_mut().insert(
-            header::CONNECTION,
-            header::HeaderValue::from_static("close"),
-        );
-    }
-    response
-}
-
-/// `serverHandler.ServeHTTP` compares the raw request target with `"*"`
-/// (`server.go:3327`), so `OPTIONS *?x` reaches the mux rather than the
-/// general options handler.
-fn is_general_options(request: &Request<Body>) -> bool {
-    request.method() == Method::OPTIONS
-        && request
-            .uri()
-            .path_and_query()
-            .is_some_and(|target| target.as_str() == "*")
-}
-
-#[cfg(test)]
-mod options_asterisk_tests {
-    use super::*;
-
-    fn request(method: &str, target: &str) -> Request<Body> {
-        Request::builder()
-            .method(method)
-            .uri(target)
-            .body(Body::empty())
-            .expect("request")
-    }
-
-    #[test]
-    fn only_the_exact_star_target_is_general_options() {
-        // `*?x` cannot reach here: `valid_request_uri` rejects it as Go's
-        // `url.ParseRequestURI` does, before hyper parses the head.
-        assert!(is_general_options(&request("OPTIONS", "*")));
-        assert!(!is_general_options(&request("OPTIONS", "/health")));
-        assert!(!is_general_options(&request("GET", "*")));
-    }
-}
-
+/// The Linux route table. The shared layers and the two platform-neutral
+/// handlers live in [`crate::http`]; this function only lists the operations
+/// backed by Linux services.
 fn http_routes(state: Arc<Daemon>) -> Router {
     // Every route uses `any` so axum's method router cannot append an `Allow`
     // header to fallback responses (including the 401 authorization returns
     // before the mux); Go's chi mux answers those methods itself, and
     // [`frontdoor::gate`] reproduces its 405/404 before a handler is reached.
     Router::new()
-        .route("/health", any(health))
+        .route("/health", any(crate::http::health))
         .route("/metrics", any(metrics::get_metrics))
-        .route("/envs", any(envs))
+        .route("/envs", any(crate::http::envs::<Daemon>))
         .route("/init", any(init))
         .route("/upgrade", any(upgrade))
         .route("/freeze", any(freeze))
@@ -663,24 +558,10 @@ fn http_routes(state: Arc<Daemon>) -> Router {
 /// other method, so the dispatcher only routes the two.
 async fn files(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
     match *request.method() {
-        Method::GET => download::get_files(State(daemon), request).await,
+        Method::GET => crate::files_http::get_files(State(daemon), request).await,
         Method::POST => upload::upload(State(daemon), request).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
-}
-
-/// Go http.Error: plain text, newline-terminated, nosniff.
-fn plain_http_error(status: StatusCode, message: &str) -> Response {
-    let mut response = (status, format!("{message}\n")).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response.headers_mut().insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        header::HeaderValue::from_static("nosniff"),
-    );
-    response
 }
 
 /// Go main.go:427-475. The choreography's non-exec parts live here so they are
@@ -794,149 +675,6 @@ async fn write_upgrade_binary(body: Body, path: &std::path::Path) -> Result<(), 
     // an exec of this image racing a fork can fail ETXTBSY. Go's io.Copy
     // holds the same window; parity behavior, not a defect.
     Ok(())
-}
-
-async fn authorize(
-    State(daemon): State<Arc<Daemon>>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    let state = daemon.state.lock().await;
-    let result = state.access.authorize(
-        request.method().as_str(),
-        request.uri().path(),
-        request
-            .headers()
-            .get("x-access-token")
-            .and_then(|header| header.to_str().ok()),
-    );
-    drop(state);
-    if let Err(error) = result {
-        return json_error(StatusCode::UNAUTHORIZED, &error.to_string());
-    }
-    if let Some(username) = crate::exec_context::basic_username(request.headers()) {
-        let checked = tokio::task::spawn_blocking(move || {
-            let invalid = || {
-                connectrpc::ConnectError::unauthenticated(format!("invalid username: '{username}'"))
-            };
-            nix::unistd::User::from_name(&username)
-                .map_err(|_| invalid())?
-                .ok_or_else(invalid)?;
-            Ok::<_, connectrpc::ConnectError>(())
-        })
-        .await
-        .unwrap_or_else(|_| Err(connectrpc::ConnectError::internal("account lookup failed")));
-        if let Err(error) = checked {
-            return basic_error_response(error, &request);
-        }
-    }
-    let gzip_response = crate::transport::input_response_encoding(&request);
-    let response = next.run(crate::transport::observe_request(request)).await;
-    crate::transport::encode_input_response(response, gzip_response).await
-}
-
-// authn.ErrorWriter classifies POST protocols before falling back to unary JSON.
-fn basic_error_response(error: connectrpc::ConnectError, request: &Request<Body>) -> Response {
-    let content_type = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    let content_type = content_type.as_str();
-    let is_post = request.method() == axum::http::Method::POST;
-    if is_post
-        && (content_type == "application/grpc-web"
-            || content_type.starts_with("application/grpc-web+"))
-    {
-        let mut response = Body::empty().into_response();
-        if let Ok(value) = header::HeaderValue::from_str(content_type) {
-            response.headers_mut().insert(header::CONTENT_TYPE, value);
-        }
-        let code = if error.code == connectrpc::ErrorCode::Unauthenticated {
-            "16"
-        } else {
-            "13"
-        };
-        response
-            .headers_mut()
-            .insert("grpc-status", header::HeaderValue::from_static(code));
-        let message = error.message.as_deref().unwrap_or("");
-        let escaped: String = message
-            .bytes()
-            .map(|byte| {
-                if !(0x20..0x7f).contains(&byte) || byte == b'%' {
-                    format!("%{byte:02X}")
-                } else {
-                    char::from(byte).to_string()
-                }
-            })
-            .collect();
-        if let Ok(value) = header::HeaderValue::from_str(&escaped) {
-            response.headers_mut().insert("grpc-message", value);
-        }
-        return response;
-    }
-    let valid_version = request
-        .headers()
-        .get("connect-protocol-version")
-        .is_none_or(|value| value.is_empty() || value == "1");
-    let grpc = content_type == "application/grpc" || content_type.starts_with("application/grpc+");
-    let streaming = content_type.starts_with("application/connect+") && valid_version;
-    if is_post && (grpc || streaming) {
-        let mut headers = request.headers().clone();
-        if let Ok(value) = header::HeaderValue::from_str(content_type) {
-            headers.insert(header::CONTENT_TYPE, value);
-        }
-        error.into_http_response(&headers).map(Body::new)
-    } else {
-        error
-            .into_http_response(&header::HeaderMap::new())
-            .map(Body::new)
-    }
-}
-
-async fn health() -> Response {
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-store"),
-    );
-    // store.go:193 sets Content-Type explicitly, so the wire carries an EMPTY
-    // content-type header (verified by the malformed-input gate) rather than
-    // no header at all.
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, header::HeaderValue::from_static(""));
-    response
-}
-async fn envs(State(daemon): State<Arc<Daemon>>) -> Response {
-    let state = daemon.state.lock().await;
-    // Go sets application/json and encodes with json.NewEncoder, whose trailing
-    // newline is on the wire.
-    let mut response = match serde_json::to_vec(&state.environment.all()) {
-        Ok(mut body) => {
-            body.push(b'\n');
-            Body::from(body).into_response()
-        }
-        Err(error) => {
-            eprintln!("failed to encode environment: {error}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json"),
-    );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-store"),
-    );
-    response
 }
 
 /// Go api.gen.go:323-354, form-bound query parameters. Absent or unknown
@@ -2012,23 +1750,6 @@ async fn apply_init(
         response,
     )
     .await
-}
-
-fn json_error(status: StatusCode, message: &str) -> Response {
-    let mut response = (
-        status,
-        format!("{}\n", json!({"code":status.as_u16(),"message":message})),
-    )
-        .into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json; charset=utf-8"),
-    );
-    response.headers_mut().insert(
-        "x-content-type-options",
-        header::HeaderValue::from_static("nosniff"),
-    );
-    response
 }
 
 /// Go init.go:1096-1165 auditFrozenSet: classify the frozen set at resume and

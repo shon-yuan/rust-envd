@@ -1,13 +1,11 @@
 //! Streaming POST /files behavior pinned to runtime 51083a83, upload.go.
 // HTTP adapter errors carry complete protocol responses from shared auth helpers.
 #![allow(clippy::result_large_err)]
-use super::{
-    download::{authorize, json_error, lookup_account, Parameters},
-    Daemon,
-};
+use super::Daemon;
 use crate::{
     auth::ReadWrite,
     exec_context::{Account, Defaults},
+    files_http::{authorize, json_error, lookup_account, Parameters},
     filesystem::{metadata, paths},
 };
 use axum::{

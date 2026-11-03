@@ -2,10 +2,10 @@
 // HTTP file adapters return axum responses as first-class error payloads;
 // boxing every shared-helper boundary only re-wraps the same allocation.
 #![allow(clippy::result_large_err)]
-use super::Daemon;
 use crate::{
     auth::{AuthError, FileAccess, ReadWrite},
     exec_context::{Account, Defaults},
+    http::ConfigurationState,
 };
 use axum::{
     body::Body,
@@ -28,15 +28,15 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 
-pub(super) struct Parameters {
-    pub(super) path: String,
-    pub(super) path_present: bool,
-    pub(super) username: Option<String>,
-    pub(super) signature: Option<String>,
-    pub(super) expiration: Option<i64>,
+pub struct Parameters {
+    pub path: String,
+    pub path_present: bool,
+    pub username: Option<String>,
+    pub signature: Option<String>,
+    pub expiration: Option<i64>,
 }
 impl Parameters {
-    pub(super) fn parse(query: &str) -> Result<Self, Response> {
+    pub fn parse(query: &str) -> Result<Self, Response> {
         // Generated Go scalar binding rejects repeated known parameters.
         let mut values: BTreeMap<String, Option<String>> = BTreeMap::new();
         for (key, value) in form_urlencoded::parse(query.as_bytes()) {
@@ -68,18 +68,21 @@ impl Parameters {
     }
 }
 
-pub(super) async fn get_files(
-    State(daemon): State<Arc<Daemon>>,
+pub async fn get_files<S: ConfigurationState>(
+    State(state): State<Arc<S>>,
     request: Request<Body>,
 ) -> Response {
-    match download(&daemon, request).await {
+    match download(state.as_ref(), request).await {
         Ok(response) | Err(response) => response,
     }
 }
 
-async fn download(daemon: &Daemon, request: Request<Body>) -> Result<Response, Response> {
+async fn download<S: ConfigurationState>(
+    state: &S,
+    request: Request<Body>,
+) -> Result<Response, Response> {
     let params = Parameters::parse(request.uri().query().unwrap_or(""))?;
-    let defaults = authorize(daemon, &params, request.headers(), ReadWrite::Read).await?;
+    let defaults = authorize(state, &params, request.headers(), ReadWrite::Read).await?;
     let supplied = params.username.clone();
     let requested = params.path.clone();
     let resolved =
@@ -95,7 +98,7 @@ async fn download(daemon: &Daemon, request: Request<Body>) -> Result<Response, R
                 500,
                 &format!(
                     "error checking if path exists '{resolved}': {}",
-                    crate::errno_text::stat_text(&resolved, &error)
+                    stat_text(&resolved, &error)
                 ),
             )
         }
@@ -223,13 +226,13 @@ async fn download(daemon: &Daemon, request: Request<Body>) -> Result<Response, R
     Ok(response(status, headers, stream_file(file, segments)))
 }
 
-pub(super) async fn authorize(
-    daemon: &Daemon,
+pub async fn authorize<S: ConfigurationState>(
+    state: &S,
     params: &Parameters,
     headers: &HeaderMap,
     operation: ReadWrite,
 ) -> Result<Defaults, Response> {
-    let state = daemon.state.lock().await;
+    let configuration = state.configuration().lock().await;
     let token = header_text(headers, "x-access-token");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -244,18 +247,21 @@ pub(super) async fn authorize(
         expiration: params.expiration,
         now,
     };
-    state.access.authorize_file(&access).map_err(|error| {
-        let message = if error == AuthError::Unauthorized && !token.is_empty() {
-            "access token present in header but does not match".to_owned()
-        } else {
-            error.to_string()
-        };
-        json_error(401, &message)
-    })?;
-    Ok(state.defaults.clone())
+    configuration
+        .access
+        .authorize_file(&access)
+        .map_err(|error| {
+            let message = if error == AuthError::Unauthorized && !token.is_empty() {
+                "access token present in header but does not match".to_owned()
+            } else {
+                error.to_string()
+            };
+            json_error(401, &message)
+        })?;
+    Ok(configuration.defaults.clone())
 }
 
-pub(super) fn resolve(
+pub fn resolve(
     defaults: &Defaults,
     supplied: Option<&str>,
     path: &str,
@@ -273,22 +279,21 @@ pub(super) fn resolve(
 }
 
 /// OS lookup is blocking; call from spawn_blocking at either file adapter.
-pub(super) fn lookup_account(username: &str) -> Result<Account, Response> {
-    let user = nix::unistd::User::from_name(username)
-        .map_err(|error| json_error(401, &format!("error looking up user '{username}': {error}")))?
-        .ok_or_else(|| {
-            json_error(
-                401,
-                &format!("error looking up user '{username}': user: unknown user {username}"),
-            )
-        })?;
-    Ok(Account {
-        name: user.name,
-        home: user.dir.to_string_lossy().into_owned(),
-        uid: user.uid.as_raw(),
-        gid: user.gid.as_raw(),
-        groups: Vec::new(),
-    })
+pub fn lookup_account(username: &str) -> Result<Account, Response> {
+    crate::platform::lookup_account(username)
+        .map_err(|error| json_error(401, &format!("error looking up user '{username}': {error}")))
+}
+
+/// Go's `os.Stat` failure text. The oracle runs on Linux; Windows keeps the
+/// same prefix and lets `std::io::Error` render its own message, since no
+/// Windows oracle exists to match.
+#[cfg(target_os = "linux")]
+fn stat_text(path: &str, error: &io::Error) -> String {
+    crate::errno_text::stat_text(path, error)
+}
+#[cfg(windows)]
+fn stat_text(path: &str, error: &io::Error) -> String {
+    format!("stat {path}: {error}")
 }
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
     headers
@@ -311,7 +316,7 @@ fn response(status: u16, headers: HeaderMap, body: Body) -> Response {
     response
 }
 /// Mirrors Go http.Error as used by the generated query binder fallback.
-pub(super) fn plain_error(status: u16, message: &str) -> Response {
+pub fn plain_error(status: u16, message: &str) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -324,7 +329,7 @@ pub(super) fn plain_error(status: u16, message: &str) -> Response {
     response(status, headers, Body::from(format!("{message}\n")))
 }
 
-pub(super) fn json_error(status: u16, message: &str) -> Response {
+pub fn json_error(status: u16, message: &str) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,

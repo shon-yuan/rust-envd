@@ -4,6 +4,7 @@
 //! implementation lands. The endpoint/method surface is fixed by the traits in
 //! `platform/mod.rs`; see `docs/windows-port.md` for the plan.
 
+pub mod account;
 pub mod cgroup;
 pub mod clock;
 pub mod fs;

@@ -4,6 +4,7 @@
 //! paths are preserved through the re-exports in `lib.rs`, so no code outside
 //! the move changed.
 
+pub mod account;
 pub mod cgroups;
 pub mod cpus;
 pub mod filesystem;

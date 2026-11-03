@@ -20,6 +20,14 @@ pub mod linux;
 #[cfg(windows)]
 pub mod windows;
 
+/// Resolve a username to the account record the HTTP and filesystem adapters
+/// pass around. Linux reads the password database; Windows resolves the SID
+/// through the local SAM and synthesizes `uid`/`gid`.
+#[cfg(target_os = "linux")]
+pub use linux::account::lookup as lookup_account;
+#[cfg(windows)]
+pub use windows::account::lookup as lookup_account;
+
 /// Identifies one registered filesystem watcher.
 pub type WatchId = u64;
 

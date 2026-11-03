@@ -838,3 +838,35 @@ hyperloop tests now poll with 1 ms sleeps instead of a fixed number of
 loaded runner), and the Linux job runs `cargo fetch --locked` before the
 notice check because `cargo metadata --offline` needs the non-Linux sources
 that the bundle covers.
+
+## Windows port P1 — shared HTTP surface and contract tests (2026-11-03)
+
+The platform-neutral HTTP stack left the Linux daemon: `src/http/` owns the
+`net/http` connection-level checks (`Expect`, `OPTIONS *`), rs/cors, the
+chi/connect-go frontdoor, authorization, `/health` and `/envs`;
+`src/files_http.rs` owns `GET /files`. `section 5.1`'s rule that shared code
+never calls a platform API now holds: account lookup goes through
+`platform::lookup_account` (password database on Linux, `LookupAccountNameW`
+on Windows), and the one Go errno-text renderer is cfg-split (Windows keeps
+the `stat <path>:` prefix and std's own message). `src/daemon_windows.rs`
+serves `/health`, `/envs`, `/init` and `GET /files` over that shared code;
+the rest of the REST surface answers 501 and the Connect procedures answer
+connect-go's 404 `unimplemented`, each naming the documented gap. The
+Windows deviations are listed in `docs/windows-port.md`.
+
+Verification, Linux: 814 tests passed / 0 failed across all targets, clippy
+`-D warnings` and fmt clean, and the full parity gate set was rerun on the
+new candidate before this note was written: sha
+`5eb94465…`, five IDENTICAL documents (schema, malformed, HTTP/1 edges,
+upgrade reexec and install) and every single-side gate `passed=true`
+(`/tmp/envd-gates-5eb94465/`). Verification, Windows: the `windows-check`
+cross-compile job, and clippy on the Windows target (`--lib`, `-D warnings`)
+plus `cargo test --no-run --lib` (which type-checks the Windows test bodies;
+only the MSVC linker is absent locally) are clean. The contract tests
+themselves run on
+`windows-latest` in the `windows-test` job (`cargo test --lib`), where the
+real Win32 account database and filesystem answer. They assert the wire
+behaviour an SDK sees: 204 `/health` with an empty content-type, the 401 JSON
+envelope, `/init` token install plus `X-Envd-Version`/`X-Envd-Memory`, a real
+file read and the missing-path error shape, chi 404/405 with `Allow`, CORS
+preflight, and raw-socket `OPTIONS *`/failing-`Expect` responses.

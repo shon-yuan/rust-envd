@@ -3,7 +3,11 @@
 Status: P0 complete 2026-11-03 — the platform seam exists, the Linux backends
 are moved under `src/platform/linux/`, the Windows skeleton compiles for
 `x86_64-pc-windows-msvc`, and the full Linux parity gate set is IDENTICAL on
-the same candidate. No Windows endpoint is implemented yet.
+the same candidate.
+P1 in progress — the filesystem backend and the shared HTTP surface are
+implemented and contract-tested on `windows-latest` (`/health`, `/envs`,
+`/init`, `GET /files`); execution, watchers and the Connect procedures are
+still to come. See "P1 progress".
 This document scopes goal D: **a Windows guest sandbox that serves the complete
 existing envd API**, while the Linux daemon keeps its byte-level parity with the
 pinned Go oracle.
@@ -84,6 +88,11 @@ implementation; the rest is reused.
 | `POST /files/compose` | Sequential composition with the same validation order and error texts | Same. |
 | `POST /upgrade` | Spawn the new binary, transfer the listening socket with `WSADuplicateSocket`, pass the handover blob, retire the old process | Endpoint contract unchanged. Windows has no `exec`, so the PID changes; the handover blob carries process metadata instead of open file descriptors. |
 | `OPTIONS *`, CORS preflight | Shared code | Unchanged. |
+
+Implementation status (2026-11-03): `GET /health`, `GET /envs`, `POST /init`
+and `GET /files` are served by the Windows daemon and covered by contract
+tests. `POST /files`, `/files/compose` and the remaining REST operations are
+not served yet.
 
 ### 4.2 Connect procedures
 
@@ -283,9 +292,42 @@ Status: all P0 items are done, including the Linux gate rerun.
   the oracle, and conformance, freeze, guestprobe, MMDS, CPUs, OOM and NFS
   all pass (`/tmp/envd-gates-ca97781/`). The Windows side still makes no
   differential claim.
+- **HTTP surface and contract tests (2026-11-03)**: the platform-neutral
+  HTTP stack moved out of the Linux daemon into `src/http/` (connection-level
+  `Expect`/`OPTIONS *` checks, rs/cors, the chi/connect-go frontdoor,
+  authorization, `/health`, `/envs`) and `src/files_http.rs` (`GET /files`).
+  Both daemons mount that same code, so the wire behaviour is one
+  implementation rather than two. `src/daemon_windows.rs` serves `/health`,
+  `/envs`, `/init` and `GET /files` through it, with these documented
+  deviations:
+  - no MMDS token hash: `/init` authorizes against the installed token only;
+  - `caBundle`, `timestamp`, `hyperloopIP`, `cpuCount`, `thaw`, `lifecycleID`
+    and `volumeMounts` are accepted and have no effect;
+  - `X-Envd-Memory` reports `{"request":0,"low":0,"floor":0,"partial":true}`;
+  - the builtin default user is the service account (`USERNAME`), because
+    Windows has no `root`; `defaultUser: "root"` therefore fails account
+    resolution with the same 401 an unknown Linux user produces.
+  `POST /files`, `/files/compose` and the other REST operations answer 501
+  with a message naming this document; the 17 Connect procedures answer
+  connect-go's 404 `unimplemented` JSON error with the same message.
+  Contract tests live in `src/daemon_windows.rs` and drive a real loopback
+  listener: 204 `/health` with the empty content-type header, the 401 JSON
+  envelope, `/init` token install and `X-Envd-*` headers, file read and
+  missing-path errors, chi 404/405, CORS preflight, and raw-socket
+  `OPTIONS *`/failing-`Expect` checks.
+- **Linux evidence for the HTTP slice**: candidate sha
+  `5eb944656b644c4f42f392c0dbfe9e517e355430a70979b27e945f9493ac188d`. The
+  schema, malformed, HTTP/1 edge and both upgrade documents are IDENTICAL to
+  the oracle; conformance, freeze, guestprobe, MMDS, CPUs, OOM
+  global/cgroup/group and both NFS scenarios are `passed=true`. Status log and
+  document copies: `/tmp/envd-gates-5eb94465/`. Linux suite: 814 tests, 0
+  failed; clippy `-D warnings` and fmt clean; the notice bundle still matches
+  the lockfile.
 - **Still `Unsupported`**: watchers (`ReadDirectoryChangesW` is the next
-  slice), process, resource, port-scan, and metadata backends. The daemon
-  itself remains Linux-gated until its call sites move behind the traits.
+  slice), process, resource, port-scan, and metadata backends; `POST /files`,
+  compose, and the Connect procedure surface. The Windows binary entry point
+  still exits with "not implemented"; the daemon state and router exist and
+  are contract-tested, but nothing serves them in a guest yet.
 
 Rough effort: 30–45 person-weeks (6–9 months for one engineer; 3–5 months with
 2–3 engineers). P0 alone is 2–3 weeks and calibrates the rest.

@@ -1,11 +1,9 @@
 //! POST /files/compose, pinned to runtime 51083a83 compose.go.
 // Shared HTTP helpers return complete responses, including protocol error headers.
 #![allow(clippy::result_large_err)]
-use super::{
-    download::{json_error, lookup_account, resolve},
-    Daemon,
-};
+use super::Daemon;
 use crate::exec_context::{Account, Defaults};
+use crate::files_http::{json_error, lookup_account, resolve};
 use axum::{
     body::Body,
     extract::State,

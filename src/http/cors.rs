@@ -100,7 +100,7 @@ pub(crate) async fn cors(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::plain_http_error;
+    use crate::http::plain_http_error;
     use axum::{body::Body, middleware, routing::get, Router};
     use tower::ServiceExt;
 

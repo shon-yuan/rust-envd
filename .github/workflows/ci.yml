@@ -37,7 +37,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Check the Windows platform skeleton
+      - name: Check the Windows-target build
         run: cargo check --locked -j4 --target x86_64-pc-windows-msvc --lib --bins
       - name: Build the shared crate for the Windows target
         run: cargo build --locked -j4 --target x86_64-pc-windows-msvc --lib
@@ -49,5 +49,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: choco install protoc -y --no-progress
-      - name: Run the Windows backend unit tests
+      - name: Run the Windows backend and endpoint contract tests
         run: cargo test --locked -j4 --lib

@@ -9,16 +9,21 @@ pub mod cacerts;
 pub mod clock;
 #[cfg(target_os = "linux")]
 pub mod collapse;
+pub mod configuration;
 #[cfg(target_os = "linux")]
+pub mod daemon;
+#[cfg(windows)]
+#[path = "daemon_windows.rs"]
 pub mod daemon;
 #[cfg(target_os = "linux")]
 pub mod errno_text;
-#[cfg(target_os = "linux")]
 pub mod exec_context;
+pub mod files_http;
 #[cfg(target_os = "linux")]
 pub mod fsfreeze;
 pub mod goquote;
 pub mod guest;
+pub mod http;
 pub mod hyperloop;
 #[cfg(target_os = "linux")]
 pub mod logs;
@@ -28,7 +33,6 @@ pub mod metrics;
 #[cfg(target_os = "linux")]
 pub mod oom;
 pub mod platform;
-#[cfg(target_os = "linux")]
 pub mod transport;
 #[cfg(target_os = "linux")]
 pub mod upgrade;

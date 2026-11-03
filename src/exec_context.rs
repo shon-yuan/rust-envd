@@ -155,22 +155,7 @@ pub fn request_account(
             if supplied.is_some() { "" } else { "default " }
         ))
     };
-    let user = nix::unistd::User::from_name(username)
-        .map_err(|_| invalid())?
-        .ok_or_else(invalid)?;
-    let name = std::ffi::CString::new(user.name.as_str()).map_err(|_| invalid())?;
-    let groups = nix::unistd::getgrouplist(&name, user.gid)
-        .map_err(|_| invalid())?
-        .iter()
-        .map(|group| group.as_raw())
-        .collect();
-    Ok(Account {
-        name: user.name,
-        home: user.dir.to_string_lossy().into_owned(),
-        uid: user.uid.as_raw(),
-        gid: user.gid.as_raw(),
-        groups,
-    })
+    crate::platform::lookup_account(username).map_err(|_| invalid())
 }
 
 #[derive(Clone, Debug, Default)]
