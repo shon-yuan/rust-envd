@@ -824,7 +824,11 @@ HTTP/1 edge and both upgrade documents, with conformance, freeze, guestprobe,
 MMDS, CPUs, OOM and NFS all passing (`/tmp/envd-gates-ca97781/`). The
 workflow addition exposed a
 pre-existing timing assumption in `tests/route_runner.rs`: it waited five
-seconds for the probe child while another test could hold the shared spawn
-gate. The test now takes the gate before starting that deadline and allows
-ten seconds in both directions; it is test-only and does not change the
-daemon.
+seconds for a probe child while another test could hold the shared spawn gate,
+and it located the child by scanning every `/proc` entry for an argv[0] match.
+The test now takes the gate before starting its deadline, has the probe report
+its PID through a file, judges liveness by `/proc/<pid>/cmdline` (empty for a
+zombie), execs `/usr/bin/sleep` by absolute path because sibling tests mutate
+`PATH`, and surfaces an early runner error with its output. It is test-only and
+does not change the daemon; the guest binary is byte-identical to the gated
+candidate.
