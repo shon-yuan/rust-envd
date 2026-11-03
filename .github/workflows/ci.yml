@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo build --locked -j4
+      - run: cargo test --locked -j4
+      - run: cargo clippy --locked -j4 --all-targets -- -D warnings
+      - run: cargo fmt --check
+      - name: License notice bundle matches Cargo.lock
+        run: python3 scripts/generate_notices.py --check
+
+  windows-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Check the Windows platform skeleton
+        run: cargo check --locked -j4 --target x86_64-pc-windows-msvc --lib --bins
+      - name: Build the shared crate for the Windows target
+        run: cargo build --locked -j4 --target x86_64-pc-windows-msvc --lib

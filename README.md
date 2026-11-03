@@ -12,7 +12,7 @@ upstream protobuf schemas redistributed byte-for-byte under their
 [Apache-2.0 license](third_party/e2b/LICENSE) with full
 [provenance](third_party/e2b/PROVENANCE); generated code built from those
 schemas carries the same attribution. The Go-derived redirect URL helper in
-`src/mmds/go_url.rs` retains The Go Authors' BSD-3-Clause notice.
+`src/platform/linux/mmds/go_url.rs` retains The Go Authors' BSD-3-Clause notice.
 `vendor/connectrpc/` is an Apache-2.0 in-tree fork of `connectrpc` 0.9.1
 carrying connect-go error-text parity; its changes are recorded in
 `vendor/connectrpc/PATCHES.md`. `vendor/hyper/` is an MIT in-tree fork of
@@ -25,11 +25,13 @@ and the release manifest procedure are specified in
 
 ## Platforms
 
-Linux x86_64 is the only supported target today, the same as the Go daemon.
-A Windows sandbox (the daemon running inside a Windows guest and serving the
-complete API) is evaluated, with an endpoint-by-endpoint compatibility matrix
-and a phased plan, in [docs/windows-port.md](docs/windows-port.md); nothing
-of that port is implemented yet.
+Linux x86_64 is the only supported runtime target today, the same as the Go
+daemon. The Windows port (goal D) is at P0: the platform seam and a
+Windows-target skeleton exist, so the shared crate checks and builds for
+`x86_64-pc-windows-msvc`, but no Windows endpoint or backend is implemented
+and the binary itself still needs a Windows toolchain to link. The endpoint
+matrix, semantics, and phased plan are in
+[docs/windows-port.md](docs/windows-port.md).
 
 ## Differences from the Go daemon
 

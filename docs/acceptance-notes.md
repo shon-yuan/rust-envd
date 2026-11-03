@@ -479,7 +479,7 @@ The `client` feature forwards `connectrpc/client` for the generated clients.
 Buffa envd messages remain separate from the existing Prost ToolHost messages.
 Any distributed binary/image using these schemas must include
 `third_party/e2b/LICENSE` and `PROVENANCE`; generated output does not replace
-those notices. The Go-derived redirect URL helper in `src/mmds/go_url.rs` retains
+those notices. The Go-derived redirect URL helper in `src/platform/linux/mmds/go_url.rs` retains
 The Go Authors' BSD-3-Clause license; binary redistribution must reproduce that
 notice too. The HTTP/TLS path also links dependencies with ISC and Unicode-3.0
 obligations, including ring, WebPKI and ICU. The distributable notice bundle is
@@ -780,3 +780,28 @@ two known failures that depend on a stale local guest image (2026-10-14)
 lacking the current `counter`/`extension` tool declarations, unrelated to
 envd, hyper or connectrpc.
 
+## Windows port P0 scaffolding (2026-11-03)
+
+P0 of the Windows sandbox port is a compile-time seam, not a feature claim.
+The Linux backends (`process`, `cgroups`, `filesystem`, `port`, `cpus`,
+`mmds`) moved verbatim to `src/platform/linux/` and remain the only
+implementations the daemon calls; `src/lib.rs` re-exports them under
+`#[cfg(target_os = "linux")]`, and the binary entry point moved to
+`src/main_linux.rs` behind a target dispatcher. Seven backend traits
+(`ProcessBackend`, `ResourceBackend`, `FsBackend`, `WatcherBackend`,
+`PortScanBackend`, `ClockBackend`, `MetadataBackend`) live in
+`src/platform/mod.rs`; the `src/platform/windows/` skeleton implements each
+with `io::ErrorKind::Unsupported`, except the read-only clock.
+
+Verification on this candidate: Linux `cargo test -j4 --offline` green,
+clippy `-D warnings` and `cargo fmt --check` clean, notice bundle unchanged
+and `--check` green; `cargo check --target x86_64-pc-windows-msvc --lib
+--bins` and `cargo build --target x86_64-pc-windows-msvc --lib` succeed.
+Linking the Windows binary is deferred to a Windows toolchain host. The
+Linux parity gate rerun on the same candidate (sha `c036e195…`) is
+IDENTICAL for the schema, malformed, HTTP/1 edge and both upgrade documents,
+and the conformance, freeze, guestprobe, MMDS, CPUs, OOM and NFS gates all
+pass; the artifact directories and status logs are recorded in the
+workspace campaign plan (`/tmp/envd-gates-c036e195/`). That evidence covers
+the listed corpus and scenarios only; the Windows side makes no
+differential claim.

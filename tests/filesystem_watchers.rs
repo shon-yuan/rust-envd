@@ -1,5 +1,5 @@
 //! Real inotify events in ordinary-user temporary directories; no daemon/handover fixture.
-#[path = "../src/filesystem/watchers.rs"]
+#[path = "../src/platform/linux/filesystem/watchers.rs"]
 mod watchers;
 
 use coorworker_envd::{exec_context, filesystem, proto};

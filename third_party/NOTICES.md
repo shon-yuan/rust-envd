@@ -20,7 +20,7 @@ Copyright (c) 2026 shon-yuan
 
 ## Go-derived source (BSD-3-Clause)
 
-`src/mmds/go_url.rs` is a Go-derived redirect URL helper carrying The Go Authors' BSD-3-Clause notice ("Copyright 2009 The Go Authors.") in its file header. Binary redistribution of a covered distribution must reproduce that notice; source distributions include the file itself.
+`src/platform/linux/mmds/go_url.rs` is a Go-derived redirect URL helper carrying The Go Authors' BSD-3-Clause notice ("Copyright 2009 The Go Authors.") in its file header. Binary redistribution of a covered distribution must reproduce that notice; source distributions include the file itself.
 
 ## Vendored Rust crate forks
 

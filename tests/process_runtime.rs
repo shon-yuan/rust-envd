@@ -1,6 +1,6 @@
 pub use coorworker_envd::{cgroups, exec_context, proto};
 // Import the runtime directly so integration tests also cover its private modules.
-#[path = "../src/process/mod.rs"]
+#[path = "../src/platform/linux/process/mod.rs"]
 mod runtime;
 // The runtime's start refusals render Go errno text (`crate::errno_text`);
 // this standalone compilation unit needs the same module under its own root.

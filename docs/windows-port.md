@@ -1,9 +1,12 @@
 # Windows sandbox port — evaluation and plan
 
-Status: evaluation, 2026-11-03. Nothing in this document is implemented yet.
-It scopes goal D: **a Windows guest sandbox that serves the complete existing
-envd API**, while the Linux daemon keeps its byte-level parity with the pinned
-Go oracle.
+Status: P0 complete 2026-11-03 — the platform seam exists, the Linux backends
+are moved under `src/platform/linux/`, the Windows skeleton compiles for
+`x86_64-pc-windows-msvc`, and the full Linux parity gate set is IDENTICAL on
+the same candidate. No Windows endpoint is implemented yet.
+This document scopes goal D: **a Windows guest sandbox that serves the complete
+existing envd API**, while the Linux daemon keeps its byte-level parity with the
+pinned Go oracle.
 
 ## 1. Objective
 
@@ -205,19 +208,47 @@ suspension). The endpoint's request/response contract is unchanged.
 
 ## 11. P0 preparation checklist
 
-- [ ] Create `src/platform/mod.rs`; move the Linux backends under
-  `src/platform/linux/` with `git mv` only — no code edits in the move commit.
-- [ ] Define the seven traits with the daemon's existing error types; no
-  `dyn` dispatch on Linux, no behavioural change.
-- [ ] Add `[target.'cfg(windows)'.dependencies] windows-sys` (Win32 bindings,
-  pinned); Linux dependency set unchanged.
-- [ ] Add a Windows skeleton implementing every trait with `unsupported`
-  errors so the crate compiles for `x86_64-pc-windows-msvc`.
-- [ ] CI: the Linux parity gates are unchanged; a new Windows job runs
-  `cargo check --target x86_64-pc-windows-msvc` plus the platform-neutral
-  tests.
-- [ ] Re-run the full Linux parity gate set on the refactor candidate and
-  record the evidence; any loss of identity blocks P1.
+Status: all P0 items are done, including the Linux gate rerun.
+
+- [x] Create `src/platform/mod.rs`; move the Linux backends under
+  `src/platform/linux/` with `git mv` only — no code edits in the moved files
+  (one comment's path was updated). `process/`, `cgroups/`, `filesystem/`,
+  `port/`, `cpus/`, `mmds/` moved; `lib.rs` re-exports them under
+  `#[cfg(target_os = "linux")]`, so every existing `crate::<backend>::…` path
+  is unchanged. The daemon binary entry point moved to `src/main_linux.rs`
+  behind a target dispatcher.
+- [x] Define the seven traits with the daemon's existing error types; no
+  `dyn` dispatch on Linux, no behavioural change. `ProcessBackend`,
+  `ResourceBackend`, `FsBackend`, `WatcherBackend`, `PortScanBackend`,
+  `ClockBackend`, `MetadataBackend` live in `src/platform/mod.rs`; Linux keeps
+  calling its backends directly until the P1 adapters exist.
+- [x] Add `[target.'cfg(windows)'.dependencies] windows-sys` (Win32 bindings,
+  pinned); Linux dependency set unchanged. Pinned to `=0.61.2`, a version
+  already present in `Cargo.lock`; `nix`, `xattr`, `inotify`,
+  `tokio-rustls` and `rustls-native-certs` moved to
+  `[target.'cfg(target_os = "linux")'.dependencies]`.
+- [x] Add a Windows skeleton implementing every trait with `unsupported`
+  errors so the crate compiles for `x86_64-pc-windows-msvc`. Verified:
+  `cargo check --target x86_64-pc-windows-msvc --lib --bins` and
+  `cargo build --target x86_64-pc-windows-msvc --lib` both succeed on a Linux
+  host. Linking the binary needs an MSVC linker, so that step belongs to a
+  Windows toolchain host.
+- [x] CI: the Linux parity gates are unchanged; a new Windows job runs
+  `cargo check --target x86_64-pc-windows-msvc` plus the shared-crate build.
+  `.github/workflows/ci.yml` adds a Linux job (build, test, clippy, fmt, notice
+  bundle) and the Windows check job. The external oracle gates stay in the
+  workspace parity suite, not in this repository.
+- [x] Re-run the full Linux parity gate set on the refactor candidate and
+  record the evidence; any loss of identity blocks P1. Candidate sha
+  `c036e19540ccb90a757e373de56ee4fc22bf7a91552cbfbc1173aee335f2c323`
+  (`-version 0.10.2`, `-commit 51083a83…`): schema (73 cases), malformed
+  (110+18+174+8+24 groups), HTTP/1 edges (71/71) and both upgrade modes are
+  IDENTICAL against the oracle; conformance (`--expanded --repeat 2`),
+  freeze, guestprobe, MMDS, CPUs, OOM global/cgroup/group and both NFS
+  scenarios are `passed=true`. Gate documents and status logs are in
+  `/tmp/envd-gates-c036e195/`; the workspace campaign plan records the
+  artifact directories and the two invocation fixes (NFS server ownership,
+  `socat` guest-bin name and SONAME guest libs).
 
 ## 12. Milestones
 

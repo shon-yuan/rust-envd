@@ -3,28 +3,38 @@
 //! This crate is under construction and is not the running sandbox daemon.
 
 pub mod auth;
+#[cfg(target_os = "linux")]
 pub mod cacerts;
-pub mod cgroups;
+#[cfg(target_os = "linux")]
 pub mod clock;
+#[cfg(target_os = "linux")]
 pub mod collapse;
-pub mod cpus;
+#[cfg(target_os = "linux")]
 pub mod daemon;
+#[cfg(target_os = "linux")]
 pub mod errno_text;
+#[cfg(target_os = "linux")]
 pub mod exec_context;
-pub mod filesystem;
+#[cfg(target_os = "linux")]
 pub mod fsfreeze;
 pub mod goquote;
 pub mod guest;
 pub mod hyperloop;
+#[cfg(target_os = "linux")]
 pub mod logs;
 pub mod memory_protection;
+#[cfg(target_os = "linux")]
 pub mod metrics;
-pub mod mmds;
+#[cfg(target_os = "linux")]
 pub mod oom;
-pub mod port;
-pub mod process;
+pub mod platform;
+#[cfg(target_os = "linux")]
 pub mod transport;
+#[cfg(target_os = "linux")]
 pub mod upgrade;
+
+#[cfg(target_os = "linux")]
+pub use platform::linux::{cgroups, cpus, filesystem, mmds, port, process};
 
 pub mod proto {
     connectrpc::include_generated!();

@@ -100,7 +100,7 @@ const CGROUP_PROCS: &[u8] = b"cgroup.procs\0";
 /// Shared by the socat forwarder and the user/pty spawn path so every child
 /// is placed the same way, before execve. Public because the process runtime
 /// is compiled directly into its integration tests (tests/process_runtime.rs
-/// includes src/process/mod.rs), which can only reach public items.
+/// includes src/platform/linux/process/mod.rs), which can only reach public items.
 ///
 /// Contract for callers: call between fork and exec, with a directory fd the
 /// parent owns; it performs only openat/write/close on that descriptor

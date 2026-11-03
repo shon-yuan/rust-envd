@@ -7,11 +7,9 @@ license = "MIT"
 [dependencies]
 axum = { version = "0.8", features = ["http2"] }
 tower = { version = "0.5", features = ["util"] }
-nix = { version = "0.29", features = ["user", "fs", "signal", "process", "term", "time"] }
-xattr = "1"
-inotify = { version = "=0.11.5", default-features = false }
-# nfs_mount_linux.go: umount2 and the statx(STATX_MNT_ID) mount-ID probe. The
-# version is pinned to the one already in Cargo.lock (transitive of nix).
+# Linux backend needs libc directly too: nfs_mount_linux.go's umount2 and the
+# statx(STATX_MNT_ID) mount-ID probe. The version is pinned to the one already
+# in Cargo.lock (transitive of nix).
 libc = "0.2.190"
 # Go net defaults for accepted sockets and the listener backlog (main.rs,
 # daemon::http1::serve).
@@ -45,9 +43,24 @@ http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+url = "=2.5.8"
+
+# Linux backends: nix/libc syscalls, inotify watchers, xattr metadata, MMDS TLS.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["user", "fs", "signal", "process", "term", "time"] }
+xattr = "1"
+inotify = { version = "=0.11.5", default-features = false }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 rustls-native-certs = "=0.8.5"
-url = "=2.5.8"
+
+# Windows backend skeleton (docs/windows-port.md). Pinned to the version
+# already in Cargo.lock; the feature set grows with the P1 implementation.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
 
 [build-dependencies]
 connectrpc-build = "=0.9.0"
