@@ -23,6 +23,14 @@ The distributable notice bundle
 and the release manifest procedure are specified in
 [`third_party/PACKAGING.md`](third_party/PACKAGING.md).
 
+## Platforms
+
+Linux x86_64 is the only supported target today, the same as the Go daemon.
+A Windows sandbox (the daemon running inside a Windows guest and serving the
+complete API) is evaluated, with an endpoint-by-endpoint compatibility matrix
+and a phased plan, in [docs/windows-port.md](docs/windows-port.md); nothing
+of that port is implemented yet.
+
 ## Differences from the Go daemon
 
 Within the differential corpora listed in
