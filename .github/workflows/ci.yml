@@ -37,3 +37,13 @@ jobs:
         run: cargo check --locked -j4 --target x86_64-pc-windows-msvc --lib --bins
       - name: Build the shared crate for the Windows target
         run: cargo build --locked -j4 --target x86_64-pc-windows-msvc --lib
+
+  windows-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: choco install protoc -y --no-progress
+      - name: Run the Windows backend unit tests
+        run: cargo test --locked -j4 --lib

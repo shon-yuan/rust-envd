@@ -805,3 +805,26 @@ pass; the artifact directories and status logs are recorded in the
 workspace campaign plan (`/tmp/envd-gates-c036e195/`). That evidence covers
 the listed corpus and scenarios only; the Windows side makes no
 differential claim.
+
+## Windows port P1 — filesystem backend (2026-11-03)
+
+`WindowsFsBackend` now implements `stat`, `read_dir`, `create_dir`, `remove`
+and `rename`; the value synthesis follows `docs/windows-port.md` §5.2
+(synthesized `mode`/`permissions`, SID-derived `owner`/`group` with
+non-empty fallbacks, resolved reparse-point target, empty `metadata` map).
+The backend is not yet reachable from the daemon, which stays Linux-gated.
+
+Verification: Windows-target `cargo check --lib --bins` and clippy
+`-D warnings` clean on a Linux cross toolchain; the module's unit tests run
+on the new `windows-test` CI job (`cargo test --lib` on `windows-latest`),
+not on this host. Linux is unchanged behaviourally: the full suite is 814
+passed / 0 failed, clippy and fmt clean, and the full parity gate set on the
+same candidate (sha `ca97781c…`) is IDENTICAL for the schema, malformed,
+HTTP/1 edge and both upgrade documents, with conformance, freeze, guestprobe,
+MMDS, CPUs, OOM and NFS all passing (`/tmp/envd-gates-ca97781/`). The
+workflow addition exposed a
+pre-existing timing assumption in `tests/route_runner.rs`: it waited five
+seconds for the probe child while another test could hold the shared spawn
+gate. The test now takes the gate before starting that deadline and allows
+ten seconds in both directions; it is test-only and does not change the
+daemon.

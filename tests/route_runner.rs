@@ -366,11 +366,18 @@ async fn dropping_the_run_future_kills_the_child() {
     }
 
     let runner = ProcessRunner::with_program(probe.display().to_string());
-    let task = tokio::spawn(async move { run_gated(&runner, vec!["30".into()]).await });
+    // Take the gate here rather than inside the task: another test may hold it
+    // for seconds, and the appearance deadline must start only once this spawn
+    // can actually run (CI exposed the difference on a loaded runner).
+    let gate = SPAWN_GATE.lock().await;
+    let task = tokio::spawn(async move {
+        let _gate = gate;
+        runner.run(vec!["30".into()]).await
+    });
     let started = Instant::now();
     while probe_processes(&probe) == 0 {
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(10),
             "probe child never appeared"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -379,7 +386,7 @@ async fn dropping_the_run_future_kills_the_child() {
     let deadline = Instant::now();
     while probe_processes(&probe) > 0 {
         assert!(
-            deadline.elapsed() < Duration::from_secs(5),
+            deadline.elapsed() < Duration::from_secs(10),
             "dropping the run future left the child alive"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;

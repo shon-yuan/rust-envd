@@ -144,7 +144,9 @@ Rules:
 | `symlink_target` | Reparse-point target; `is_symlink` from the reparse tag. |
 
 Clients that compare `owner` to a Linux username will see a SID-derived name;
-that is a documented value difference, not a missing API.
+that is a documented value difference, not a missing API. P1 currently
+returns the empty map for `metadata`; NTFS extended-attribute reading is a
+later slice.
 
 ## 6. Guest platform
 
@@ -260,6 +262,29 @@ Status: all P0 items are done, including the Linux gate rerun.
 | P3 | Upgrade endpoint, token/init effects, port forwarding | Live-upgrade contract test green. |
 | P4 | Windows guest image + Cloud Hypervisor backend + tool bridge | End-to-end: boot Windows guest, run a tool through the sandbox stack. |
 | P5 | SDK matrix, security review, performance/boot baselines | Release checklist green. |
+
+### P1 progress
+
+- **Filesystem backend (2026-11-03)**: `WindowsFsBackend` implements `stat`,
+  `read_dir`, `create_dir`, `remove`, and `rename` on `std::fs`. `stat`
+  synthesizes `mode`/`permissions` from the read-only attribute and the entry
+  kind, resolves `owner`/`group` from the object's security descriptor
+  (`GetNamedSecurityInfoW` + `LookupAccountSidW`, with SID-string and `None`
+  fallbacks so the value is never empty), reports the resolved reparse-point
+  target with the `\\?\` prefix stripped, and returns an empty `metadata`
+  map. Declared difference: Windows has no POSIX special bits, so
+  `permissions` renders only the `r`/`w`/`x` triples. Unit tests live in
+  `src/platform/windows/fs.rs` and run on the `windows-test` CI job
+  (`cargo test --lib` on `windows-latest`).
+- **Linux evidence for this slice**: candidate sha
+  `ca97781c8b08c74b8cf30ca05a09b3f94c23ca7eabf551bfc7a6286c91f7bb4d` — the
+  schema, malformed, HTTP/1 edge and both upgrade documents are IDENTICAL to
+  the oracle, and conformance, freeze, guestprobe, MMDS, CPUs, OOM and NFS
+  all pass (`/tmp/envd-gates-ca97781/`). The Windows side still makes no
+  differential claim.
+- **Still `Unsupported`**: watchers (`ReadDirectoryChangesW` is the next
+  slice), process, resource, port-scan, and metadata backends. The daemon
+  itself remains Linux-gated until its call sites move behind the traits.
 
 Rough effort: 30–45 person-weeks (6–9 months for one engineer; 3–5 months with
 2–3 engineers). P0 alone is 2–3 weeks and calibrates the rest.
