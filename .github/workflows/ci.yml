@@ -21,6 +21,10 @@ jobs:
       - run: cargo test --locked -j4
       - run: cargo clippy --locked -j4 --all-targets -- -D warnings
       - run: cargo fmt --check
+      - name: Fetch the full lockfile for the notice bundle
+        # The bundle covers every platform in Cargo.lock, and
+        # `cargo metadata --offline` needs those sources in the registry cache.
+        run: cargo fetch --locked
       - name: License notice bundle matches Cargo.lock
         run: python3 scripts/generate_notices.py --check
 

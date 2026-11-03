@@ -61,7 +61,10 @@ cargo build --locked --release -j4 --target x86_64-unknown-linux-musl
   ```
 
   The generator fails closed: any crate without a discoverable license
-  aborts the bundle rather than shipping a partial notice.
+  aborts the bundle rather than shipping a partial notice. The bundle
+  covers every platform in `Cargo.lock`, so `cargo fetch --locked` must have
+  populated the registry cache (an offline `cargo metadata` needs those
+  sources); CI fetches the full lockfile before running the check.
 
 ## Completeness check
 
