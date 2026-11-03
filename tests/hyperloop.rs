@@ -8,8 +8,11 @@ use axum::{
 };
 use coorworker_envd::hyperloop::{get_ip_family, rewrite_hosts_file, IPFamily};
 use std::time::Duration;
-use tokio::task::yield_now;
 use tower::ServiceExt;
+
+/// Poll interval for the async waits: yielding alone can spin a whole budget
+/// before a blocking writer runs on a loaded host (CI exposed it).
+const POLL: Duration = Duration::from_millis(1);
 
 async fn envs(router: axum::Router, token: Option<&str>) -> serde_json::Value {
     let mut request = Request::get("/envs");
@@ -46,7 +49,7 @@ async fn wait_env(router: &axum::Router, expected: &str) -> bool {
         {
             return true;
         }
-        yield_now().await;
+        tokio::time::sleep(POLL).await;
     }
     false
 }
@@ -56,7 +59,7 @@ async fn wait_for(mut probe: impl FnMut() -> bool) -> bool {
         if probe() {
             return true;
         }
-        yield_now().await;
+        tokio::time::sleep(POLL).await;
     }
     false
 }
@@ -332,7 +335,7 @@ async fn serialized_inits_end_with_the_last_address_everywhere() {
     let mut stable = 0;
     let mut last = String::new();
     for _ in 0..6000 {
-        yield_now().await;
+        tokio::time::sleep(POLL).await;
         let values = envs(router.clone(), None).await;
         let current = values
             .get("E2B_EVENTS_ADDRESS")
@@ -415,7 +418,7 @@ async fn repeated_identical_hyperloop_init_keeps_env_and_bytes() {
         StatusCode::NO_CONTENT
     );
     for _ in 0..2000 {
-        yield_now().await;
+        tokio::time::sleep(POLL).await;
     }
     assert_eq!(
         envs(router.clone(), None).await["E2B_EVENTS_ADDRESS"],
@@ -455,7 +458,7 @@ async fn empty_zone_init_stores_no_env() {
     let mut stable = 0;
     let mut last = String::new();
     for _ in 0..6000 {
-        yield_now().await;
+        tokio::time::sleep(POLL).await;
         let values = envs(router.clone(), None).await;
         let current = values
             .get("E2B_EVENTS_ADDRESS")
@@ -491,7 +494,7 @@ async fn daemon_without_builder_ignores_hyperloop_ip() {
         StatusCode::NO_CONTENT
     );
     for _ in 0..2000 {
-        yield_now().await;
+        tokio::time::sleep(POLL).await;
     }
     assert!(envs(router.clone(), None)
         .await
