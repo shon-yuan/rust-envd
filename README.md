@@ -83,3 +83,76 @@ list — lives in [docs/acceptance-notes.md](docs/acceptance-notes.md). NFS
 `volumeMounts` mounts through the real `mount.nfs` path and passes the
 isolated QEMU differential gate against the pinned Go oracle; the sandbox
 serving images have not switched.
+
+## Usage
+
+### Development instance
+
+```sh
+cargo run -j4 --locked -p coorworker-envd -- --development --listen 127.0.0.1:0
+```
+
+Runs as the current ordinary user on a loopback address (root is rejected) —
+enough to exercise the HTTP/Connect surface locally.
+
+### Guest instance inside a microVM
+
+In production shape the daemon is the guest's PID 1. Startup enforces four
+things: the `--guest` flag, effective root, PID 1, and `coorworker.envd=1`
+on the kernel command line. Build the static guest binary first:
+
+```sh
+CC_x86_64_unknown_linux_musl=/usr/bin/clang \
+CFLAGS_x86_64_unknown_linux_musl='-ffreestanding -nostdlibinc -DRING_CORE_NOSTDLIBINC=1' \
+cargo build -j4 --locked -p coorworker-envd \
+  --target x86_64-unknown-linux-musl --release --bin coorworker-envd
+```
+
+A minimal initramfs guest has this shape (busybox plus the musl loader as
+the only userspace, a root account, one NIC driver):
+
+```
+/envd                              # the static binary built above
+/bin/busybox + /bin/{sh,mount,...} # busybox applet symlinks
+/lib/ld-musl-x86_64.so.1
+/lib/e1000.ko                      # unpacked from the host's e1000.ko.zst
+/etc/passwd, /etc/group            # root account entries
+/init:
+  #!/bin/sh
+  export PATH=/bin
+  mount -t proc proc /proc
+  mount -t sysfs sysfs /sys
+  mount -t devtmpfs devtmpfs /dev
+  mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+  insmod /lib/e1000.ko || poweroff -f
+  ip link set lo up
+  ip link set eth0 up
+  ip addr add 10.0.2.15/24 dev eth0
+  exec /envd --guest --isnotfc --listen 0.0.0.0:49983
+```
+
+Boot it with any x86_64 bzImage (an ELF `vmlinux` without a PVH note, such
+as the Firecracker quickstart kernel, is not loadable by `qemu -kernel`):
+
+```sh
+qemu-system-x86_64 -no-user-config -nodefaults -display none -serial stdio \
+  -no-reboot -accel kvm -m 384 -smp 2 \
+  -kernel /boot/vmlinuz-linux -initrd initramfs.cpio.gz \
+  -append "console=ttyS0 rdinit=/init panic=-1 coorworker.envd=1" \
+  -netdev user,id=n,restrict=on,hostfwd=tcp:127.0.0.1:49983-:49983 \
+  -device e1000,netdev=n
+```
+
+- `--isnotfc` skips the MMDS poll and the HTTP log exporter, so the
+  instance starts fresh and accepts its first `/init` access token.
+- The network shape above gives no default route: the guest cannot reach
+  metadata, cloud or public services; only the one host forward exists.
+- Readiness is the forwarded `GET /health` answering `204`.
+- Prerequisites: `qemu-system-x86_64`, `zstd` (to unpack the module) and
+  unprivileged access to `/dev/kvm` (`-accel tcg` works without KVM,
+  slower).
+
+The dual-VM differential harness that boots a Go oracle and this binary
+side by side lives in the internal workspace's parity suite, not in this
+repository; production Firecracker launch (persistent ext4 rootfs, MMDS
+wiring) is a separate deployment track.
