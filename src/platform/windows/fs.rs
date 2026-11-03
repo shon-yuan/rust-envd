@@ -375,7 +375,7 @@ mod tests {
 
         let info = WindowsFsBackend.stat(&path).expect("stat");
         assert_eq!(info.name, "hello.txt");
-        assert_eq!(info.r#type, FileType::File as i32);
+        assert_eq!(info.r#type, FileType::File);
         assert_eq!(info.size, 5);
         assert_eq!(info.mode, 0o644);
         assert_eq!(info.permissions, "-rw-r--r--");
@@ -418,7 +418,7 @@ mod tests {
         WindowsFsBackend.create_dir(&nested).expect("create_dir");
 
         let info = WindowsFsBackend.stat(&nested).expect("stat");
-        assert_eq!(info.r#type, FileType::Directory as i32);
+        assert_eq!(info.r#type, FileType::Directory);
         assert_eq!(info.mode, 0o755);
         assert_eq!(info.permissions, "drwxr-xr-x");
 

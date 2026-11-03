@@ -341,50 +341,56 @@ async fn dropping_the_run_future_kills_the_child() {
     // runner's future is dropped when the caller goes away; kill-on-drop must
     // leave no orphan behind.
     let dir = tempdir();
-    let probe = dir.join("route-runner-kill-probe");
-    fs::copy("/usr/bin/sleep", &probe).unwrap();
-    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+    let pid_file = dir.join("route-runner-kill-probe.pid");
+    // The probe reports its PID through a file instead of relying on /proc
+    // argv scanning: a killed-but-unreaped child keeps its /proc entry, so
+    // liveness is judged by the (then empty) cmdline, not by existence.
+    let probe = write_script(
+        &dir,
+        "route-runner-kill-probe",
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$1\"\nexec /usr/bin/sleep 30\n",
+        0o755,
+    );
 
-    fn probe_processes(probe: &Path) -> usize {
-        let mut found = 0;
-        let entries = match fs::read_dir("/proc") {
-            Ok(entries) => entries,
-            Err(_) => return 0,
-        };
-        for entry in entries.flatten() {
-            let command = match fs::read(entry.path().join("cmdline")) {
-                Ok(command) => command,
-                Err(_) => continue,
-            };
-            // argv[0] is the first NUL-separated token.
-            let argv0 = command.split(|byte| *byte == 0).next().unwrap_or(&[]);
-            if argv0 == probe.as_os_str().as_encoded_bytes() {
-                found += 1;
-            }
+    fn child_alive(pid: &str) -> bool {
+        match fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(command) => !command.is_empty(),
+            Err(_) => false,
         }
-        found
     }
 
     let runner = ProcessRunner::with_program(probe.display().to_string());
+    let pid_arg = pid_file.display().to_string();
     // Take the gate here rather than inside the task: another test may hold it
-    // for seconds, and the appearance deadline must start only once this spawn
-    // can actually run (CI exposed the difference on a loaded runner).
+    // for seconds, and the deadline must start only once this spawn can run.
     let gate = SPAWN_GATE.lock().await;
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         let _gate = gate;
-        runner.run(vec!["30".into()]).await
+        runner.run(vec![pid_arg]).await
     });
     let started = Instant::now();
-    while probe_processes(&probe) == 0 {
+    let pid = loop {
+        if let Ok(text) = fs::read_to_string(&pid_file) {
+            let text = text.trim();
+            if !text.is_empty() {
+                break text.to_string();
+            }
+        }
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "probe child never appeared"
+            "probe child never reported its pid within 10s"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+        tokio::select! {
+            result = &mut task => {
+                panic!("probe runner finished before the child appeared: {result:?}");
+            }
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    };
+    assert!(child_alive(&pid), "probe child exited before the assertion");
     task.abort();
     let deadline = Instant::now();
-    while probe_processes(&probe) > 0 {
+    while child_alive(&pid) {
         assert!(
             deadline.elapsed() < Duration::from_secs(10),
             "dropping the run future left the child alive"
