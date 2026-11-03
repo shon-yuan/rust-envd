@@ -345,7 +345,9 @@ Status: all P0 items are done, including the Linux gate rerun.
   listener: raw upload into a missing directory then read it back through
   `GET /files`, a two-part multipart upload, the directory-target /
   invalid-metadata / unsupported-content-type 400 shapes, and the 401 without
-  a token.
+  a token. The `windows-test` job ran them natively on `windows-latest` in run
+  `41657417627`: 33 tests passed (the 29 existing plus the four upload
+  tests).
 - **Linux evidence for the `POST /files` slice**: candidate sha
   `bccb04e9e6b38d2dbb3d3e7eddbb7b05fd05738e4cfcb673d37e070ae8eec3e7`. The
   schema, malformed, HTTP/1 edge and both upgrade documents are IDENTICAL to

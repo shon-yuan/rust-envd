@@ -901,5 +901,16 @@ install) and every single-side gate `passed=true`
 clean. The new contract tests — raw upload into a missing directory read back
 through `GET /files`, a two-part multipart upload, the directory-target /
 invalid-metadata / unsupported-content-type 400 shapes, and the 401 without a
-token — run in the `windows-test` job on `windows-latest`; no run id yet
-because the slice has not been pushed.
+token — ran in the `windows-test` job on `windows-latest` in run
+`41657417627`: 33 tests passed / 0 failed (the 29 existing plus the four upload
+tests), and all three jobs are green.
+
+That run followed `41656501320`, whose Windows jobs were green but whose Linux
+job failed on a wall-clock guard: `tests/upload.rs`'s
+`review_unfinished_part_headers_reject_before_sender_closes` pushes the full
+10 MiB header budget through multer, which rescans the growing unterminated
+line on every read, so the debug-build test alone costs several seconds
+(3.7–5.0 s measured locally) and crossed its 10 s deadline on the runner while
+still rejecting correctly. The deadline now exists only to fail a hang
+(60 s), with the reason in the test; the guest binary is byte-identical
+(`bccb04e9…`), so the gated candidate stands.
