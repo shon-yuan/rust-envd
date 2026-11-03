@@ -588,7 +588,7 @@ async fn expectation(request: Request<Body>, next: Next) -> Response {
 /// draining at most 4 KiB of body — anything larger aborts the read and the
 /// connection closes (`globalOptionsHandler`).
 async fn options_asterisk(request: Request<Body>, next: Next) -> Response {
-    if request.method() != Method::OPTIONS || request.uri().path() != "*" {
+    if !is_general_options(&request) {
         return next.run(request).await;
     }
     let mut response = StatusCode::OK.into_response();
@@ -603,6 +603,39 @@ async fn options_asterisk(request: Request<Body>, next: Next) -> Response {
         );
     }
     response
+}
+
+/// `serverHandler.ServeHTTP` compares the raw request target with `"*"`
+/// (`server.go:3327`), so `OPTIONS *?x` reaches the mux rather than the
+/// general options handler.
+fn is_general_options(request: &Request<Body>) -> bool {
+    request.method() == Method::OPTIONS
+        && request
+            .uri()
+            .path_and_query()
+            .is_some_and(|target| target.as_str() == "*")
+}
+
+#[cfg(test)]
+mod options_asterisk_tests {
+    use super::*;
+
+    fn request(method: &str, target: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(target)
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    #[test]
+    fn only_the_exact_star_target_is_general_options() {
+        // `*?x` cannot reach here: `valid_request_uri` rejects it as Go's
+        // `url.ParseRequestURI` does, before hyper parses the head.
+        assert!(is_general_options(&request("OPTIONS", "*")));
+        assert!(!is_general_options(&request("OPTIONS", "/health")));
+        assert!(!is_general_options(&request("GET", "*")));
+    }
 }
 
 fn http_routes(state: Arc<Daemon>) -> Router {

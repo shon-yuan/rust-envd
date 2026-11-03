@@ -23,12 +23,13 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{header, Method, Request};
+use axum::http::{header, Method, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use hyper::server::conn::http1;
@@ -65,8 +66,7 @@ pub async fn serve(
             _ = &mut shutdown => break,
             accepted = accept(&listener) => {
                 let (stream, _) = accepted?;
-                // Go's net package enables TCP_NODELAY on accepted sockets.
-                let _ = stream.set_nodelay(true);
+                configure_accepted(&stream);
                 let shared = Arc::new(Mutex::new(None));
                 connections.spawn(serve_connection(
                     stream,
@@ -81,6 +81,20 @@ pub async fn serve(
     let _ = stop.send(true);
     while connections.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Go's `net` defaults for an accepted TCP connection: `SetNoDelay(true)`
+/// (`net.TCPConn` enables it by default), keep-alive on, and
+/// `SetKeepAlivePeriod(15s)`, which on Linux sets both `TCP_KEEPIDLE` and
+/// `TCP_KEEPINTVL` to 15s; the probe count stays at Linux's default of 9.
+fn configure_accepted(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let socket = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(15))
+        .with_interval(Duration::from_secs(15))
+        .with_retries(9);
+    let _ = socket.set_tcp_keepalive(&keepalive);
 }
 
 /// `axum::serve`'s listener behaviour: retry transient accept errors with a
@@ -127,9 +141,11 @@ async fn serve_connection(
         let io = TokioIo::new(GuardedStream::new(stream, shared.clone()));
         let mut builder = http1::Builder::new();
         builder
-            // Go allows 500 header values and 1 MiB of head; hyper defaults
-            // to 100 values and would answer 431 on its own.
-            .max_headers(head::MAX_HEADER_VALUES)
+            // Go's only bound is `MaxHeaderBytes`; it has no header-value
+            // count limit (Go 1.26.10). Hyper's default of 100 would answer
+            // 431 on its own, so raise its count bound to the same byte
+            // budget the guard enforces.
+            .max_headers(head::MAX_HEAD_BYTES)
             .max_header_size(head::MAX_HEAD_BYTES)
             .max_buf_size(head::MAX_HEAD_BYTES + READ_CHUNK)
             // Go keeps answering a request whose client half-closed the
@@ -179,7 +195,8 @@ async fn serve_connection(
     }
 }
 
-/// Serve one request through `app`, applying Go's HEAD framing.
+/// Serve one request through `app`, applying Go's HEAD framing and its
+/// post-handler request-body drain.
 ///
 /// `net/http` never sends a response body for HEAD, and it never invents a
 /// `Content-Length` for one: the automatic length is suppressed when the
@@ -188,18 +205,232 @@ async fn serve_connection(
 /// future computes `content-length: 0` from the empty body *before* it
 /// discards that body for HEAD, so the header has to be removed before hyper
 /// writes the response.
+///
+/// Go also drains up to `maxPostHandlerReadBytes+1` bytes of any request body
+/// the handler did not read before it decides whether the response can be
+/// followed by another request (`server.go:1393-1435`). A body that cannot be
+/// consumed — corrupt chunked framing, a declared length over the limit — sets
+/// `closeAfterReply`, and the HTTP/1.1 response carries `Connection: close`
+/// (`server.go:1529-1540`). Hyper's own "drain or close" drops the connection
+/// silently and never touches the response header, so the drain happens here,
+/// before the response future resolves.
 async fn respond<B>(app: Router, request: Request<B>) -> Result<Response, Infallible>
 where
-    B: axum::body::HttpBody<Data = axum::body::Bytes> + Send + 'static,
+    B: http_body::Body<Data = axum::body::Bytes> + Send + 'static,
     B::Error: Into<axum::BoxError>,
 {
     let is_head = request.method() == Method::HEAD;
+    let is_connect = request.method() == Method::CONNECT;
+    let request_version = request.version();
+    let request_wants_close = request_wants_close(&request);
+    let expects_continue = request_expects_continue(&request);
+    let (parts, body) = request.into_parts();
+    let eof = Arc::new(AtomicBool::new(body.is_end_stream()));
+    let slot: Arc<Mutex<Option<Pin<Box<B>>>>> = Arc::new(Mutex::new(None));
+    let (slot_tx, drained) = (slot.clone(), eof.clone());
+    let request = Request::from_parts(parts, Drainable::new(body, slot, drained));
     let mut response = app.oneshot(request).await?;
     if is_head {
         response.headers_mut().remove(header::CONTENT_LENGTH);
         *response.body_mut() = Body::empty();
     }
+    // A CONNECT is never followed by another request on the same connection
+    // (`server.go:1372-1375`); for HTTP/1.1 Go also announces the close on
+    // every non-2xx response (`server.go:1529-1540`), which is what our
+    // unauthorized reply always is.
+    if is_connect && !response.status().is_success() {
+        insert_close(&mut response, request_version);
+    }
+
+    let response_wants_close = response
+        .headers()
+        .get(header::CONNECTION)
+        .is_some_and(|value| header_has_token(value.as_bytes(), b"close"));
+    let body_fully_read = eof.load(Ordering::Relaxed);
+    let leftover = slot_tx.lock().expect("body slot lock").take();
+    let protocol_close = is_connect
+        || request_wants_close
+        || response_wants_close
+        || response.status() == StatusCode::SWITCHING_PROTOCOLS;
+    if let Some(body) = leftover {
+        // Go skips the drain when the connection is already closing, and it
+        // sets `closeAfterReply` without draining when an `Expect:
+        // 100-continue` body was never consumed (`server.go:1369-1375`).
+        if expects_continue && !body_fully_read {
+            insert_close(&mut response, request_version);
+        } else if !protocol_close {
+            match drain_body(body).await {
+                DrainOutcome::Drained => {}
+                DrainOutcome::TooLarge | DrainOutcome::Broken => {
+                    insert_close(&mut response, request_version)
+                }
+            }
+        }
+    }
     Ok(response)
+}
+
+/// Go's post-handler read budget (`server.go:1102`).
+const MAX_POST_HANDLER_READ_BYTES: usize = 256 * 1024;
+
+/// Add `Connection: close` to a response unless it already asks to close.
+///
+/// Go's `delConnectionHeader` replaces any existing `Connection` value with
+/// the close announcement on HTTP/1.1 (`server.go:1529-1540`). For HTTP/1.0
+/// it deletes the header instead and announces nothing, because the version
+/// already means "close" (`setHeader.connection = ""`).
+fn insert_close(response: &mut Response, request_version: axum::http::Version) {
+    if request_version < axum::http::Version::HTTP_11 {
+        response.headers_mut().remove(header::CONNECTION);
+        return;
+    }
+    response.headers_mut().insert(
+        header::CONNECTION,
+        axum::http::HeaderValue::from_static("close"),
+    );
+}
+
+fn header_has_token(value: &[u8], token: &[u8]) -> bool {
+    value
+        .split(|&byte| byte == b',')
+        .any(|item| trim_ascii(item).eq_ignore_ascii_case(token))
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = value {
+        if first.is_ascii_whitespace() {
+            value = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = value {
+        if last.is_ascii_whitespace() {
+            value = rest;
+        } else {
+            break;
+        }
+    }
+    value
+}
+
+/// `shouldClose` for a request Go has already accepted (`request.go:1513`).
+fn request_wants_close<B>(request: &Request<B>) -> bool {
+    let connection = request.headers().get_all(header::CONNECTION);
+    let closes = connection
+        .iter()
+        .any(|value| header_has_token(value.as_bytes(), b"close"));
+    if request.version() == axum::http::Version::HTTP_10 {
+        let first_keeps_alive = connection
+            .iter()
+            .next()
+            .is_some_and(|value| header_has_token(value.as_bytes(), b"keep-alive"));
+        return closes || !first_keeps_alive;
+    }
+    closes
+}
+
+fn request_expects_continue<B>(request: &Request<B>) -> bool {
+    request
+        .headers()
+        .get(header::EXPECT)
+        .is_some_and(|value| header_has_token(value.as_bytes(), b"100-continue"))
+}
+
+enum DrainOutcome {
+    Drained,
+    TooLarge,
+    Broken,
+}
+
+/// Consume the rest of a request body exactly like Go's post-handler drain.
+async fn drain_body<B>(mut body: Pin<Box<B>>) -> DrainOutcome
+where
+    B: http_body::Body<Data = axum::body::Bytes>,
+{
+    let mut seen = 0usize;
+    loop {
+        let frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await;
+        match frame {
+            None => return DrainOutcome::Drained,
+            Some(Ok(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    seen = seen.saturating_add(data.len());
+                    // Go copies at most maxPostHandlerReadBytes+1 bytes; a
+                    // body still alive after that is too large to reuse the
+                    // connection for (`server.go:1417-1432`).
+                    if seen > MAX_POST_HANDLER_READ_BYTES {
+                        return DrainOutcome::TooLarge;
+                    }
+                }
+            }
+            // A corrupt body must never be parsed as another request
+            // (`server.go:1425-1428`).
+            Some(Err(_)) => return DrainOutcome::Broken,
+        }
+    }
+}
+
+/// Hands the request body back to [`respond`] when the handler drops it, so
+/// the drain can run after the handler and before the response is written.
+struct Drainable<B> {
+    inner: Option<Pin<Box<B>>>,
+    slot: Arc<Mutex<Option<Pin<Box<B>>>>>,
+    eof: Arc<AtomicBool>,
+}
+
+impl<B> Drainable<B> {
+    fn new(body: B, slot: Arc<Mutex<Option<Pin<Box<B>>>>>, eof: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: Some(Box::pin(body)),
+            slot,
+            eof,
+        }
+    }
+}
+
+impl<B> http_body::Body for Drainable<B>
+where
+    B: http_body::Body<Data = axum::body::Bytes>,
+{
+    type Data = axum::body::Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let polled = inner.as_mut().poll_frame(cx);
+        if matches!(polled, Poll::Ready(None)) {
+            this.eof.store(true, Ordering::Relaxed);
+            this.inner = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(|inner| inner.is_end_stream())
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner
+            .as_ref()
+            .map_or_else(http_body::SizeHint::default, |inner| inner.size_hint())
+    }
+}
+
+impl<B> Drop for Drainable<B> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            *self.slot.lock().expect("body slot lock") = Some(inner);
+        }
+    }
 }
 
 /// How the guard is reading the connection.
@@ -238,6 +469,10 @@ enum ChunkProgress {
     Broken,
 }
 
+/// Go envd's `idleTimeout` (`main.go:39`): the maximum wait for the first
+/// bytes of the next request once a previous response has finished.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(640);
+
 /// An `AsyncRead`/`AsyncWrite` wrapper that only lets hyper see request bytes
 /// Go's `net/http` would accept.
 struct GuardedStream<S> {
@@ -258,6 +493,9 @@ struct GuardedStream<S> {
     /// before attempting the next head (`server.go:2193`). A connection that
     /// ends with fewer is closed without a reply.
     idle_gate: bool,
+    /// Deadline for the next request's first bytes, mirroring Go's
+    /// `SetReadDeadline(IdleTimeout)` + `Peek(4)` after a response.
+    idle_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// The first rejection found on this connection.
     reject: Option<Reject>,
     /// The guard gave hyper (or will give it) end-of-file.
@@ -276,6 +514,7 @@ impl<S> GuardedStream<S> {
             mode: Mode::Head,
             skip_crlf: false,
             idle_gate: false,
+            idle_deadline: None,
             reject: None,
             closed: false,
         }
@@ -446,6 +685,27 @@ impl<S: AsyncRead + Unpin> AsyncRead for GuardedStream<S> {
             }
             if this.closed {
                 return Poll::Ready(Ok(()));
+            }
+            // Go arms `IdleTimeout` after each response and waits for four
+            // bytes of the next request (`server.go:2113-2131`). Fewer than
+            // four buffered bytes in head state is that wait.
+            let idle =
+                this.idle_gate && matches!(this.mode, Mode::Head) && this.buf.len() - this.scan < 4;
+            if idle {
+                let deadline = this
+                    .idle_deadline
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(IDLE_TIMEOUT)));
+                if deadline.as_mut().poll(cx).is_ready() {
+                    // Go's read deadline expires and `serve` returns without
+                    // a reply; hyper sees the same by dropping the stream.
+                    this.closed = true;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "idle timeout",
+                    )));
+                }
+            } else {
+                this.idle_deadline = None;
             }
             let mut chunk = [0u8; READ_CHUNK];
             let mut read = ReadBuf::new(&mut chunk);
@@ -626,6 +886,40 @@ mod tests {
         (out, reject)
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn idle_connections_close_after_go_idle_timeout() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut client, server) = tokio::io::duplex(64);
+        let shared = Arc::new(Mutex::new(None));
+        let mut guard = GuardedStream::new(server, shared);
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .expect("write");
+        let mut out = [0u8; 64];
+        let read = guard.read(&mut out).await.expect("read");
+        assert_eq!(
+            &out[..read],
+            b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n".as_slice()
+        );
+
+        // The guard now waits for the next request's first bytes, exactly
+        // where Go arms `IdleTimeout` (main.go:39, server.go:2113).
+        let mut next = [0u8; 64];
+        let read = guard.read(&mut next);
+        tokio::pin!(read);
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
+        tokio::time::advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = match futures_util::poll!(read.as_mut()) {
+            Poll::Ready(result) => result.expect_err("idle connection was not closed"),
+            Poll::Pending => panic!("idle connection was not closed at 640s"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
     #[tokio::test]
     async fn forwards_complete_requests() {
         let raw = b"GET /health HTTP/1.1\r\nHost: x\r\n\r\nGET /envs HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -646,7 +940,13 @@ mod tests {
     async fn forwards_a_chunked_body_then_the_next_head() {
         let raw = b"POST /init HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\n\r\n";
         let (out, reject) = run(raw).await;
-        assert_eq!(out, raw);
+        // Go deletes Transfer-Encoding from the handler view but still frames
+        // the body as chunked; the canonical framing header is kept so hyper
+        // does the same.
+        assert_eq!(
+            out,
+            b"POST /init HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+        );
         assert_eq!(reject, None);
     }
 
@@ -783,7 +1083,10 @@ mod tests {
     async fn chunk_framing_stops_at_trailers() {
         let raw = b"POST /init HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: y\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\n\r\n";
         let (out, reject) = run(raw).await;
-        assert_eq!(out, raw);
+        assert_eq!(
+            out,
+            b"POST /init HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n0\r\nX-Trailer: y\r\n\r\nGET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+        );
         assert_eq!(reject, None);
     }
 
@@ -791,16 +1094,85 @@ mod tests {
     async fn malformed_chunk_framing_falls_back_to_pass_through() {
         let raw = b"POST /init HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nGET /health HTTP/1.1\r\nHost: x\r\n\r\n";
         let (out, reject) = run(raw).await;
-        assert_eq!(out, raw);
+        assert_eq!(
+            out,
+            b"POST /init HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\nzz\r\nGET /health HTTP/1.1\r\nHost: x\r\n\r\n"
+        );
         assert_eq!(reject, None);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_unread_chunked_body_announces_the_close() {
+        // Go drains up to 256 KiB of an unread request body before writing
+        // the response; a corrupt chunked body makes that drain fail, sets
+        // closeAfterReply, and the HTTP/1.1 response carries
+        // `Connection: close` (`server.go:1393-1435,1529-1540`).
+        let out = exchange_roundtrip(
+            b"GET /health HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got {text:?}");
+        assert!(text.contains("connection: close"), "got {text:?}");
+    }
+
+    #[tokio::test]
+    async fn a_consumed_chunked_body_keeps_the_connection() {
+        // A well-formed body is drained without setting closeAfterReply, so
+        // the response must not announce a close.
+        let out = exchange_roundtrip(
+            b"GET /health HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got {text:?}");
+        assert!(!text.contains("connection: close"), "got {text:?}");
+    }
+
+    #[tokio::test]
+    async fn connect_responses_announce_the_close() {
+        // `net/http` never reuses a CONNECT connection and, for a non-2xx
+        // HTTP/1.1 response, writes `Connection: close` (`server.go:1372`,
+        // `server.go:1529-1540`).
+        use axum::routing::any;
+        let app = Router::new().route("/health", any(|| async { StatusCode::UNAUTHORIZED }));
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("/health")
+            .body(Body::empty())
+            .expect("request");
+        let response = respond(app, request).await.expect("infallible");
+        assert_eq!(response.headers()[header::CONNECTION], "close");
+    }
+
+    #[tokio::test]
+    async fn http10_connect_responses_do_not_announce_the_close() {
+        // Go deletes the handler's `Connection` header on HTTP/1.0 and sets
+        // no replacement (`server.go:1529-1540`): the version itself already
+        // means "close".
+        use axum::routing::any;
+        let app = Router::new().route("/health", any(|| async { StatusCode::UNAUTHORIZED }));
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .uri("/health")
+            .version(axum::http::Version::HTTP_10)
+            .body(Body::empty())
+            .expect("request");
+        let response = respond(app, request).await.expect("infallible");
+        assert!(response.headers().get(header::CONNECTION).is_none());
     }
 
     /// Spin a real listener + hyper, then exchange raw bytes with it.
     async fn exchange_roundtrip(payload: &[u8]) -> Vec<u8> {
         use axum::routing::get;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let app = Router::new().route("/health", get(|| async { "ok" }));
+        exchange_roundtrip_app(app, payload).await
+    }
+
+    async fn exchange_roundtrip_app(app: Router, payload: &[u8]) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("addr");
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -819,6 +1191,44 @@ mod tests {
         stop.send(()).expect("stop");
         server.await.expect("join").expect("serve");
         out
+    }
+
+    #[tokio::test]
+    async fn response_trailers_are_written_without_te_or_trailer_header() {
+        // Go's net/http writes `http.TrailerPrefix` fields after the terminal
+        // chunk regardless of the request's TE header and without announcing
+        // them in a Trailer response header. Hyper 1.12.0 would drop them;
+        // vendor/hyper/PATCHES.md restores Go's behavior.
+        use bytes::Bytes;
+        use futures_util::stream;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let app = Router::new().route(
+            "/trailers",
+            axum::routing::get(|| async {
+                let stream = stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"body"))),
+                    Ok(Frame::trailers({
+                        let mut trailers = axum::http::HeaderMap::new();
+                        trailers.insert("grpc-status", axum::http::HeaderValue::from_static("0"));
+                        trailers
+                    })),
+                ]);
+                axum::body::Body::new(StreamBody::new(stream))
+            }),
+        );
+        let out = exchange_roundtrip_app(
+            app,
+            b"GET /trailers HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("transfer-encoding: chunked"), "got {text:?}");
+        assert!(
+            text.ends_with("0\r\ngrpc-status: 0\r\n\r\n"),
+            "got {text:?}"
+        );
     }
 
     #[tokio::test]

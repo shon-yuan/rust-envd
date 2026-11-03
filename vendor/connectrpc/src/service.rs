@@ -2215,33 +2215,41 @@ where
     // Helper to build a gRPC trailers-only error response using GrpcUnaryBody.
     let grpc_unary_error = |err: &ConnectError| -> Response<GrpcUnaryBody> {
         let grpc_trailers = build_grpc_trailers(Some(err), err.trailers());
-        let trailers = match protocol {
-            Protocol::Grpc => GrpcUnaryTrailers::Http2(grpc_trailers),
-            Protocol::GrpcWeb => {
-                GrpcUnaryTrailers::WebBody(encode_grpc_web_trailers(&grpc_trailers))
-            }
-            Protocol::Connect => unreachable!("gRPC unary fast path is gRPC/gRPC-Web only"),
-        };
+        // connect-go's gRPC-Web handler sends trailing metadata as HTTP
+        // headers when it never wrote a body and set no custom response
+        // headers (`protocol_grpc.go:533-543`).
+        let web_trailers_only = protocol == Protocol::GrpcWeb && err.response_headers().is_empty();
         let mut response = Response::builder().status(StatusCode::OK).header(
             header::CONTENT_TYPE,
             protocol.response_content_type(codec_format, true),
         );
-        // For trailers-only gRPC responses, include grpc-status in headers
-        if protocol == Protocol::Grpc {
-            response = response.header(&GRPC_STATUS, err.code.grpc_code());
-            if let Some(val) = err
-                .message
-                .as_deref()
-                .and_then(|m| http::HeaderValue::from_str(&grpc_percent_encode(m)).ok())
-            {
-                response = response.header(&GRPC_MESSAGE, val);
+        // Go's connect-go always advertises accepted encodings, error
+        // responses included (protocol_grpc.go:171).
+        let accept = compression.accept_encoding_header();
+        if !accept.is_empty() {
+            response = response.header(protocol.accept_encoding_header(), accept);
+        }
+        if web_trailers_only {
+            for (key, value) in grpc_trailers.iter() {
+                response = response.header(key, value);
             }
         }
         let response = echo_error_headers(response, err);
+        let trailers = if web_trailers_only {
+            None
+        } else {
+            Some(match protocol {
+                Protocol::Grpc => GrpcUnaryTrailers::Http2(grpc_trailers),
+                Protocol::GrpcWeb => {
+                    GrpcUnaryTrailers::WebBody(encode_grpc_web_trailers(&grpc_trailers))
+                }
+                Protocol::Connect => unreachable!("gRPC unary fast path is gRPC/gRPC-Web only"),
+            })
+        };
         let body = GrpcUnaryBody {
             data: None,
             payload: std::collections::VecDeque::new(),
-            trailers: Some(trailers),
+            trailers,
         };
         response.body(body).unwrap_or_else(|_| {
             Response::new(GrpcUnaryBody {
@@ -3460,11 +3468,14 @@ fn build_grpc_trailers(
                 trailers.insert(&GRPC_MESSAGE, val);
             }
             // Encode error details as grpc-status-details-bin (base64-encoded
-            // google.rpc.Status protobuf containing the error details)
-            {
+            // google.rpc.Status protobuf containing the error details).
+            // connect-go only emits this field when the status actually
+            // carries details (protocol_grpc.go:859-866) and uses padded
+            // standard base64 (`EncodeBinaryHeader`).
+            if !err.details.is_empty() {
                 use base64::Engine;
                 let status_bytes = crate::grpc_status::encode(err);
-                let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&status_bytes);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&status_bytes);
                 if let Ok(val) = http::HeaderValue::from_str(&b64) {
                     trailers.insert(&GRPC_STATUS_DETAILS_BIN, val);
                 }

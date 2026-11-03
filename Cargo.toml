@@ -13,6 +13,9 @@ inotify = { version = "=0.11.5", default-features = false }
 # nfs_mount_linux.go: umount2 and the statx(STATX_MNT_ID) mount-ID probe. The
 # version is pinned to the one already in Cargo.lock (transitive of nix).
 libc = "0.2.190"
+# Go net defaults for accepted sockets and the listener backlog (main.rs,
+# daemon::http1::serve).
+socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "process", "io-util", "sync", "fs"] }
 futures-util = "0.3"
@@ -38,6 +41,7 @@ connectrpc = { version = "=0.9.1", default-features = false, features = ["json",
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 bytes = "1"
+http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
@@ -59,5 +63,8 @@ client = ["connectrpc/client"]
 
 # In-tree fork of connectrpc 0.9.1 (Apache-2.0; see vendor/connectrpc/PATCHES.md)
 # carrying the connect-go error-text parity required by the pinned oracle.
+# In-tree fork of hyper 1.12.0 (MIT; see vendor/hyper/PATCHES.md) carrying Go's
+# HTTP/1.1 trailer write path and chunked-body limits.
 [patch.crates-io]
 connectrpc = { path = "vendor/connectrpc" }
+hyper = { path = "vendor/hyper" }

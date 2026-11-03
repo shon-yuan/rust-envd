@@ -26,9 +26,6 @@
 /// (`initialReadLimitSize`). Exceeding it yields Go's 431 response.
 pub(crate) const MAX_HEAD_BYTES: usize = (1 << 20) + 4096;
 
-/// `net/http.DefaultMaxHeaderValueCount`.
-pub(crate) const MAX_HEADER_VALUES: usize = 500;
-
 /// Which Go error response the guard owes the client, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reject {
@@ -119,9 +116,27 @@ pub(crate) struct Head {
     rewrite_version: bool,
     /// The request-target rewrite hyper needs.
     target: TargetRewrite,
+    /// Offset where the request line starts within the head (after any
+    /// leading CR/LF Go discards).
+    start: usize,
+    /// Offset just past the request line.
+    line_end: usize,
+    /// Parsed headers with lowercased names and merged continuations, in
+    /// arrival order.
+    headers: Vec<Header>,
+    /// Whether the delivered head must be rebuilt from `headers` to match
+    /// the request Go's handler observes (obs-fold merge, Transfer-Encoding
+    /// and chunked Content-Length deletion, Content-Length dedup, first-only
+    /// Expect, HTTP/1.0 close semantics).
+    normalize: bool,
     /// Inject `Connection: close` so hyper closes after the response, as Go
     /// does for the HTTP/2 preface (`w.closeAfterReply`).
     inject_close: bool,
+    /// With more than one Connection field, whether the delivered block must
+    /// force `close` (`Some(true)`) or keep only the first value
+    /// (`Some(false)`). Go's `wantsClose`/`wantsHttp10KeepAlive` read only
+    /// `Header.get`, i.e. the first value, while hyper scans every value.
+    connection_rewrite: Option<bool>,
     /// Stop parsing after this request's body: Go closes the connection after
     /// a `Connection: close`, an HTTP/1.0 request without keep-alive, a
     /// failed `Expect`, or the HTTP/2 preface.
@@ -131,7 +146,10 @@ pub(crate) struct Head {
 impl Head {
     /// Whether [`Head::rewrite`] would change the head bytes.
     pub(crate) fn needs_rewrite(&self) -> bool {
-        self.rewrite_version || self.target != TargetRewrite::None || self.inject_close
+        self.rewrite_version
+            || self.target != TargetRewrite::None
+            || self.normalize
+            || self.inject_close
     }
 
     /// The head bytes to deliver to hyper.
@@ -139,28 +157,130 @@ impl Head {
     /// `raw` must be this head's bytes (`len` bytes). Every rewrite keeps the
     /// request Go's handler observes intact: the version token only affects
     /// parsing (Go answers any `HTTP/1.x` with an `HTTP/1.1` status line), and
-    /// the target edits only touch bytes http's `Uri` cannot carry.
+    /// the target edits only touch bytes http's `Uri` cannot carry. When
+    /// `normalize` is set the field block is rebuilt from [`Head::headers`],
+    /// reproducing `readMIMEHeader`/`readTransfer`'s handler-visible view.
     pub(crate) fn rewrite(&self, raw: &[u8]) -> Vec<u8> {
-        let mut out = raw.to_vec();
-        if self.rewrite_version {
-            out[self.version.clone()].copy_from_slice(b"HTTP/1.1");
+        if !self.normalize {
+            // Only the request line and the blank line need edits; keep the
+            // client's field bytes untouched.
+            let mut out = raw.to_vec();
+            if self.rewrite_version {
+                out[self.version.clone()].copy_from_slice(b"HTTP/1.1");
+            }
+            let replacement = match self.target {
+                TargetRewrite::None => None,
+                TargetRewrite::Slash => Some(vec![b'/']),
+                TargetRewrite::Sanitize => Some(sanitize_target(&raw[self.uri.clone()])),
+            };
+            if let Some(replacement) = replacement {
+                out.splice(self.uri.clone(), replacement).for_each(drop);
+            }
+            if self.inject_close {
+                // The head always ends with the blank line's CRLF; the
+                // injected field line belongs before it.
+                let at = out.len() - 2;
+                out.splice(at..at, b"Connection: close\r\n".iter().copied())
+                    .for_each(drop);
+            }
+            return out;
         }
-        let replacement = match self.target {
-            TargetRewrite::None => None,
-            TargetRewrite::Slash => Some(vec![b'/']),
-            TargetRewrite::Sanitize => Some(sanitize_target(&raw[self.uri.clone()])),
-        };
-        if let Some(replacement) = replacement {
-            out.splice(self.uri.clone(), replacement).for_each(drop);
+        let mut line = raw[self.start..self.line_end].to_vec();
+        if self.rewrite_version {
+            let start = self.version.start - self.start;
+            line[start..start + self.version.len()].copy_from_slice(b"HTTP/1.1");
+        }
+        let target_start = self.uri.start - self.start;
+        let target_end = self.uri.end - self.start;
+        match self.target {
+            TargetRewrite::None => {}
+            TargetRewrite::Slash => {
+                line.splice(target_start..target_end, *b"/").for_each(drop);
+            }
+            TargetRewrite::Sanitize => {
+                let replacement = sanitize_target(&raw[self.uri.clone()]);
+                line.splice(target_start..target_end, replacement)
+                    .for_each(drop);
+            }
+        }
+
+        let mut out = Vec::with_capacity(raw.len() + 32);
+        out.extend_from_slice(&line);
+        out.extend_from_slice(b"\r\n");
+        let mut expect_seen = false;
+        let mut content_length_seen = false;
+        let mut connection_written = false;
+        for header in &self.headers {
+            match header.name.as_slice() {
+                // Go's handler-visible Header map never carries
+                // Transfer-Encoding (`parseTransferEncoding` deletes it,
+                // transfer.go:636), but the chunked framing itself must still
+                // reach hyper or it would read the chunk bytes as a new
+                // request. Re-emit the one canonical form Go accepts.
+                b"transfer-encoding" => {
+                    if self.chunked() {
+                        out.extend_from_slice(b"transfer-encoding: chunked\r\n");
+                    }
+                    continue;
+                }
+                b"content-length" => {
+                    // `fixLength` deletes Content-Length when chunked and
+                    // deduplicates identical values to the first one.
+                    if self.chunked() {
+                        continue;
+                    }
+                    if content_length_seen {
+                        continue;
+                    }
+                    content_length_seen = true;
+                }
+                // `fixTrailer` deletes Trailer when chunked.
+                b"trailer" if self.chunked() => continue,
+                b"connection" => {
+                    if let Some(close) = self.connection_rewrite {
+                        if !connection_written {
+                            if close {
+                                out.extend_from_slice(b"connection: close\r\n");
+                            } else {
+                                out.extend_from_slice(b"connection: ");
+                                out.extend_from_slice(&header.value);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                            connection_written = true;
+                        }
+                        continue;
+                    }
+                }
+                b"expect" => {
+                    if expect_seen {
+                        continue;
+                    }
+                    expect_seen = true;
+                    let wants_continue = header
+                        .value
+                        .split(|&byte| byte == b',')
+                        .any(|token| trim(token).eq_ignore_ascii_case(b"100-continue"));
+                    if wants_continue {
+                        out.extend_from_slice(b"expect: 100-continue\r\n");
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            out.extend_from_slice(&header.name);
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(&header.value);
+            out.extend_from_slice(b"\r\n");
         }
         if self.inject_close {
-            // The head always ends with the blank line's CRLF; the injected
-            // field line belongs before it.
-            let at = out.len() - 2;
-            out.splice(at..at, b"Connection: close\r\n".iter().copied())
-                .for_each(drop);
+            out.extend_from_slice(b"connection: close\r\n");
         }
+        out.extend_from_slice(b"\r\n");
         out
+    }
+
+    fn chunked(&self) -> bool {
+        self.framing == Framing::Chunked
     }
 }
 
@@ -193,6 +313,7 @@ pub(crate) fn sanitize_target(target: &[u8]) -> Vec<u8> {
 }
 
 /// One logical header after continuation lines were merged.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Header {
     name: Vec<u8>,
     value: Vec<u8>,
@@ -271,11 +392,12 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
     let uri_range = uri_start..uri_start + uri.len();
     let version_start = start + line.len() - proto.len();
     let version_range = version_start..version_start + proto.len();
+    let line_end = version_range.end;
 
     let is_connect = method == b"CONNECT";
     let proto_at_least_11 = major > 1 || minor >= 1;
     let mut headers: Vec<Header> = Vec::new();
-    let mut count = 0usize;
+    let mut saw_fold = false;
     let mut pos = after_line;
     loop {
         let Some((after, line)) = next_line(buf, pos) else {
@@ -291,13 +413,10 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
             let Some(last) = headers.last_mut() else {
                 return Err(Reject::BadRequest);
             };
+            saw_fold = true;
             last.value.push(b' ');
             last.value.extend_from_slice(trim(line));
             continue;
-        }
-        count += 1;
-        if count > MAX_HEADER_VALUES {
-            return Err(Reject::TooLarge);
         }
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             return Err(Reject::BadRequest);
@@ -375,6 +494,22 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
                 .ok_or(Reject::BadRequest)?;
         }
     }
+    // `fixTrailer` (transfer.go:767-800) runs after framing is settled:
+    // only a chunked request has trailer keys validated, and three keys are
+    // rejected outright.
+    if chunked {
+        for header in headers_with(&headers, b"trailer") {
+            for key in header.value.split(|&b| b == b',') {
+                let key = trim(key);
+                if key.eq_ignore_ascii_case(b"transfer-encoding")
+                    || key.eq_ignore_ascii_case(b"trailer")
+                    || key.eq_ignore_ascii_case(b"content-length")
+                {
+                    return Err(Reject::BadRequest);
+                }
+            }
+        }
+    }
     // `http1ServerSupportsRequest`: HTTP/1.x and the Preface reach a handler.
     if major != 1 && !is_preface {
         return Err(Reject::VersionNotSupported);
@@ -401,20 +536,34 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
         }
     }
 
-    // `Request.wantsClose` (`shouldClose`) checks every Connection value;
-    // `expectsContinue` reads the first Expect value only (`Header.get`).
-    let close = headers_with(&headers, b"connection").any(|header| {
+    // `Request.Close` (`shouldClose`) scans every Connection value for
+    // "close"; `wantsHttp10KeepAlive` reads only the FIRST value. A close
+    // therefore wins from any field, while HTTP/1.0 keep-alive needs the
+    // first field to carry it. Hyper scans every value for both, so a
+    // late-only keep-alive must be rewritten to close.
+    let connection_close = headers_with(&headers, b"connection").any(|header| {
         header
             .value
             .split(|&b| b == b',')
             .any(|token| eq_ignore_ascii_case(trim(token), b"close"))
     });
-    let keep_alive_10 = headers_with(&headers, b"connection").any(|header| {
+    let keep_alive_any = headers_with(&headers, b"connection").any(|header| {
         header
             .value
             .split(|&b| b == b',')
             .any(|token| eq_ignore_ascii_case(trim(token), b"keep-alive"))
     });
+    let keep_alive_first = headers_with(&headers, b"connection")
+        .next()
+        .is_some_and(|header| {
+            header
+                .value
+                .split(|&b| b == b',')
+                .any(|token| eq_ignore_ascii_case(trim(token), b"keep-alive"))
+        });
+    let connection_rewrite =
+        ((major, minor) == (1, 0) && !connection_close && !keep_alive_first && keep_alive_any)
+            .then_some(true);
     let expect = headers_with(&headers, b"expect")
         .next()
         .map(|header| header.value.as_slice());
@@ -426,8 +575,21 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
     // `(*conn).serve`: any non-empty Expect without the 100-continue token is
     // answered 417 before a handler runs.
     let failed_expect = expect.is_some_and(|value| !value.is_empty() && !expect_continue);
-    let halt_after =
-        is_h2_upgrade || failed_expect || close || ((major, minor) == (1, 0) && !keep_alive_10);
+    let halt_after = is_h2_upgrade
+        || failed_expect
+        || connection_close
+        || ((major, minor) == (1, 0) && !keep_alive_first);
+    let normalize = saw_fold
+        // Go deletes Transfer-Encoding from the handler view even when it is
+        // syntactically valid chunked (transfer.go:636).
+        || !transfer_encoding.is_empty()
+        || (chunked && !content_length.is_empty())
+        || (chunked && headers_with(&headers, b"trailer").next().is_some())
+        || content_length.len() > 1
+        || headers_with(&headers, b"expect").count() > 1
+        || (expect_continue
+            && expect.is_some_and(|value| !value.eq_ignore_ascii_case(b"100-continue")))
+        || connection_rewrite.is_some();
 
     let framing = if is_connect {
         Framing::Close
@@ -448,7 +610,12 @@ fn parse_inner(buf: &[u8], skip_leading_crlf: bool) -> Result<Option<Head>, Reje
         // httparse accepts only the literal 1.0/1.1 tokens.
         rewrite_version: is_preface || (major == 1 && minor > 1),
         target: target_rewrite(uri),
+        start,
+        line_end,
+        headers,
+        normalize,
         inject_close: is_h2_upgrade,
+        connection_rewrite,
         halt_after,
     }))
 }
@@ -1106,6 +1273,187 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(head.len, 29);
+    }
+
+    #[test]
+    fn rejects_asterisk_targets_with_a_query() {
+        // Go's `url.ParseRequestURI` special-cases only the exact `*`
+        // target; `*?x` is "invalid URI for request" -> 400.
+        assert_eq!(
+            parse_head(b"OPTIONS *?x HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Err(Reject::BadRequest)
+        );
+    }
+
+    #[test]
+    fn accepts_more_header_lines_than_hyper_defaults() {
+        // Go 1.26.10's `net/http` has no header-value count limit; the only
+        // bound is `MaxHeaderBytes`. Hyper's default of 100 must not leak
+        // through as a 431.
+        let mut raw = b"GET /health HTTP/1.1\r\nHost: x\r\n".to_vec();
+        for index in 0..501 {
+            raw.extend_from_slice(format!("X-{index}: y\r\n").as_bytes());
+        }
+        raw.extend_from_slice(b"\r\n");
+        assert!(parse_head(&raw).unwrap().is_some());
+    }
+
+    #[test]
+    fn keeps_chunked_framing_for_hyper_while_dropping_other_framing_headers() {
+        // `parseTransferEncoding` deletes the header before any version or
+        // value check (transfer.go:636), so Go's handler never sees it. The
+        // framing itself still has to reach hyper, or the chunk bytes would
+        // be parsed as another request, so the rewrite re-emits the canonical
+        // form; Content-Length is still deleted by `fixLength` when chunked.
+        let raw = b"POST /init HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(head.framing, Framing::Chunked);
+        assert_eq!(
+            head.rewrite(raw),
+            b"POST /init HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n"
+        );
+
+        // HTTP/1.0 ignores Transfer-Encoding but still deletes it.
+        let raw = b"POST /init HTTP/1.0\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(head.framing, Framing::Length(3));
+        assert_eq!(
+            head.rewrite(raw),
+            b"POST /init HTTP/1.0\r\ncontent-length: 3\r\n\r\n"
+        );
+
+        let raw = b"GET /health HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(head.framing, Framing::Empty);
+        assert_eq!(head.rewrite(raw), b"GET /health HTTP/1.0\r\n\r\n");
+    }
+
+    #[test]
+    fn deduplicates_identical_content_length_values() {
+        // `fixLength` keeps the first value only (transfer.go:676-683).
+        let raw =
+            b"POST /init HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(head.framing, Framing::Length(3));
+        assert_eq!(
+            head.rewrite(raw),
+            b"POST /init HTTP/1.1\r\nhost: x\r\ncontent-length: 3\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn unfolds_continuation_lines_for_hyper() {
+        // Go merges an obs-fold with a single space; hyper rejects the raw
+        // fold, so the delivered head must carry the merged value.
+        let raw = b"GET /health HTTP/1.1\r\nHost: x\r\nX-A: one\r\n\ttwo\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(
+            head.rewrite(raw),
+            b"GET /health HTTP/1.1\r\nhost: x\r\nx-a: one two\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn delivers_only_the_first_expect_value() {
+        // `Header.get` reads the first value (`request.go:1509-1510`), while
+        // hyper's parser lets the last duplicate win.
+        let raw = b"POST /init HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nExpect: nope\r\nContent-Length: 2\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(
+            head.rewrite(raw),
+            b"POST /init HTTP/1.1\r\nhost: x\r\nexpect: 100-continue\r\ncontent-length: 2\r\n\r\n"
+        );
+
+        // A token list still asks for 100-continue; hyper compares the whole
+        // value, so it must be canonicalized.
+        let raw = b"POST /init HTTP/1.1\r\nHost: x\r\nExpect: 100-continue, foo\r\nContent-Length: 2\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(
+            head.rewrite(raw),
+            b"POST /init HTTP/1.1\r\nhost: x\r\nexpect: 100-continue\r\ncontent-length: 2\r\n\r\n"
+        );
+
+        // A failed first value stays failed even when a later duplicate is
+        // acceptable.
+        let raw = b"POST /init HTTP/1.1\r\nHost: x\r\nExpect: nope\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(head.halt_after);
+        assert_eq!(
+            head.rewrite(raw),
+            b"POST /init HTTP/1.1\r\nhost: x\r\nexpect: nope\r\ncontent-length: 2\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn connection_headers_follow_go_close_and_first_value_semantics() {
+        // A "close" token on ANY Connection value closes (`Request.Close`
+        // scans every value). HTTP/1.0 keep-alive, however, requires the
+        // FIRST value to carry it (`wantsHttp10KeepAlive`).
+        let raw = b"GET /health HTTP/1.0\r\nConnection: foo\r\nConnection: keep-alive\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(head.halt_after);
+        // Hyper would keep this alive from the second value; force the close
+        // Go decides on.
+        assert_eq!(
+            head.rewrite(raw),
+            b"GET /health HTTP/1.0\r\nconnection: close\r\n\r\n"
+        );
+
+        // First keep-alive: both sides keep the connection.
+        let raw = b"GET /health HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(!head.halt_after);
+        assert_eq!(head.rewrite(raw), raw.as_slice());
+
+        // A close from any later value closes in both implementations.
+        let raw = b"GET /health HTTP/1.0\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(head.halt_after);
+        assert_eq!(head.rewrite(raw), raw.as_slice());
+
+        let raw = b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(head.halt_after);
+        assert_eq!(head.rewrite(raw), raw.as_slice());
+
+        let raw = b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\nConnection: keep-alive\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(head.halt_after);
+        assert_eq!(head.rewrite(raw), raw.as_slice());
+
+        let raw = b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert!(head.halt_after);
+        assert_eq!(head.rewrite(raw), raw.as_slice());
+    }
+
+    #[test]
+    fn rejects_forbidden_chunked_trailer_keys() {
+        for key in ["Transfer-Encoding", "Trailer", "Content-Length"] {
+            let raw = format!(
+                "POST /init HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTrailer: {key}\r\n\r\n"
+            );
+            assert_eq!(parse_head(raw.as_bytes()), Err(Reject::BadRequest), "{key}");
+        }
+        // Keys are split on commas and trimmed.
+        assert_eq!(
+            parse_head(
+                b"POST /init HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTrailer: X-A, Content-Length\r\n\r\n"
+            ),
+            Err(Reject::BadRequest)
+        );
+        // Go deletes the Trailer header from the handler view when chunked.
+        let raw =
+            b"POST /init HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTrailer: X-A\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(
+            head.rewrite(raw),
+            b"POST /init HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n"
+        );
+        // Without chunking the header is preserved (transfer.go:772-781).
+        let raw = b"GET /health HTTP/1.1\r\nHost: x\r\nTrailer: Content-Length\r\n\r\n";
+        let head = parse_head(raw).unwrap().unwrap();
+        assert_eq!(head.rewrite(raw), raw.as_slice());
     }
 
     #[test]

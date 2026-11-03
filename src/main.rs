@@ -11,6 +11,27 @@ use coorworker_envd::{
 };
 use std::{net::SocketAddr, sync::Arc};
 
+/// Bind like Go's `net.Listen("tcp", "0.0.0.0:<port>")`: `SO_REUSEADDR`,
+/// non-blocking, and a listen backlog of `somaxconn` (Go's
+/// `maxListenerBacklog`, clamped at 65535). std's default backlog is 128.
+fn bind_go_listener(address: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    let backlog = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(4096)
+        .clamp(1, 65535);
+    socket.listen(backlog)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("cpu-online") {
         let cmdline = std::fs::read_to_string("/proc/cmdline")?;
@@ -450,7 +471,7 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         Environment::default(),
         std::env::var("PATH").ok(),
     )?;
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let listener = bind_go_listener(address)?;
     println!("envd listening {}", listener.local_addr()?);
     let run_dir = std::path::PathBuf::from("/run/e2b");
     if guest {
@@ -702,9 +723,10 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let result = coorworker_envd::daemon::http1::serve(
         listener,
         app_with_execution(daemon.clone(), runtime),
-        async {
-            let _ = tokio::signal::ctrl_c().await;
-        },
+        // Go envd installs no signal handler: SIGINT/SIGTERM keep the default
+        // disposition and terminate the process immediately. A pending
+        // shutdown future preserves that (no graceful drain Go does not do).
+        std::future::pending(),
     )
     .await;
     daemon.shutdown_metadata().await?;
