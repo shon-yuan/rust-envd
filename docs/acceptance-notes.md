@@ -871,3 +871,35 @@ behaviour an SDK sees: 204 `/health` with an empty content-type, the 401 JSON
 envelope, `/init` token install plus `X-Envd-Version`/`X-Envd-Memory`, a real
 file read and the missing-path error shape, chi 404/405 with `Allow`, CORS
 preflight, and raw-socket `OPTIONS *`/failing-`Expect` responses.
+
+## Windows port P1 — `POST /files` on the shared upload path (2026-11-03)
+
+The upload flow moved out of the Linux daemon into `src/files_upload.rs` and is
+generic over `ConfigurationState`, so both daemons run the same decoder,
+multipart scanner, same-path alias check and response shape. The platform-owned
+parts are behind `src/platform/file_writes.rs`: the `user.e2b.*` validation
+policy (moved verbatim, now shared) and one adapter per platform. Linux delegates
+to the existing `filesystem::{paths, metadata}` — chown/fchown, `0666` creation
+mode, `ENOSPC`/`EDQUOT` mapping, xattr persistence — so its behaviour is
+unchanged. Windows creates parents one component at a time, creates/truncates
+with the service account's ACL instead of chowning, identifies files for the
+multipart same-path refusal with `GetFileInformationByHandle` (volume serial +
+file index), maps the Windows disk-full/quota errors to the same 507 responses,
+and answers `Unsupported` for `user.e2b.*` writes; the shared flow logs that and
+continues, the same degradation a Linux filesystem without xattr support gets.
+`src/daemon_windows.rs` now routes `POST /files` to the shared handler.
+
+Verification, Linux: 814 tests passed / 0 failed, clippy `-D warnings` (Linux
+all targets, Windows `--lib`) and fmt clean. The full parity gate set was rerun
+on the new candidate sha
+`bccb04e9e6b38d2dbb3d3e7eddbb7b05fd05738e4cfcb673d37e070ae8eec3e7`: five
+IDENTICAL documents (schema, malformed, HTTP/1 edges, upgrade reexec and
+install) and every single-side gate `passed=true`
+(`/tmp/envd-gates-bccb04e9/`). Verification, Windows: the Windows-target
+`check --lib --bins`, clippy `-D warnings` and `cargo test --no-run --lib`
+(which type-checks the test bodies; only the MSVC linker is absent locally) are
+clean. The new contract tests — raw upload into a missing directory read back
+through `GET /files`, a two-part multipart upload, the directory-target /
+invalid-metadata / unsupported-content-type 400 shapes, and the 401 without a
+token — run in the `windows-test` job on `windows-latest`; no run id yet
+because the slice has not been pushed.

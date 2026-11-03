@@ -5,38 +5,12 @@ use std::io;
 use std::path::Path;
 use xattr::FileExt;
 
-const PREFIX: &str = "user.e2b.";
-const MAX_KEY: usize = 255 - PREFIX.len();
-const MAX_TOTAL: usize = 4096;
+use crate::platform::file_writes::METADATA_PREFIX as PREFIX;
 
+/// The policy lives in the platform seam so the Windows upload path enforces
+/// the identical keys and limits.
 pub fn validate_metadata(values: &HashMap<String, String>) -> io::Result<()> {
-    let mut total = 0usize;
-    for (key, value) in values {
-        if key.is_empty() || key.len() > MAX_KEY {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid metadata key length",
-            ));
-        }
-        if !key
-            .bytes()
-            .chain(value.bytes())
-            .all(|b| (0x20..=0x7e).contains(&b))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "metadata must be printable ASCII",
-            ));
-        }
-        total = total.saturating_add(PREFIX.len() + key.len() + value.len());
-    }
-    if total > MAX_TOTAL {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "metadata exceeds 4096 bytes",
-        ));
-    }
-    Ok(())
+    crate::platform::file_writes::validate_metadata(values)
 }
 
 /// Follow symlinks as the Go xattr library does. Unsupported filesystems read empty.

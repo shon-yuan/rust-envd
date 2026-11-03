@@ -20,6 +20,10 @@ pub mod linux;
 #[cfg(windows)]
 pub mod windows;
 
+/// The `POST /files` write seam: directory creation, ownership, open mode,
+/// file identity and `user.e2b.*` metadata, one implementation per platform.
+pub mod file_writes;
+
 /// Resolve a username to the account record the HTTP and filesystem adapters
 /// pass around. Linux reads the password database; Windows resolves the SID
 /// through the local SAM and synthesizes `uid`/`gid`.

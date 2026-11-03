@@ -56,7 +56,6 @@ pub mod http1;
 mod metrics;
 pub mod nfs;
 mod process_rpc;
-mod upload;
 
 impl crate::http::ConfigurationState for Daemon {
     fn configuration(&self) -> &Arc<Mutex<Configuration>> {
@@ -559,7 +558,7 @@ fn http_routes(state: Arc<Daemon>) -> Router {
 async fn files(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
     match *request.method() {
         Method::GET => crate::files_http::get_files(State(daemon), request).await,
-        Method::POST => upload::upload(State(daemon), request).await,
+        Method::POST => crate::files_upload::upload(State(daemon), request).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
 }

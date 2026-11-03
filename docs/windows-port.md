@@ -89,10 +89,10 @@ implementation; the rest is reused.
 | `POST /upgrade` | Spawn the new binary, transfer the listening socket with `WSADuplicateSocket`, pass the handover blob, retire the old process | Endpoint contract unchanged. Windows has no `exec`, so the PID changes; the handover blob carries process metadata instead of open file descriptors. |
 | `OPTIONS *`, CORS preflight | Shared code | Unchanged. |
 
-Implementation status (2026-11-03): `GET /health`, `GET /envs`, `POST /init`
-and `GET /files` are served by the Windows daemon and covered by contract
-tests. `POST /files`, `/files/compose` and the remaining REST operations are
-not served yet.
+Implementation status (2026-11-03): `GET /health`, `GET /envs`, `POST /init`,
+`GET /files` and `POST /files` are served by the Windows daemon and covered by
+contract tests. `/files/compose` and the remaining REST operations are not
+served yet.
 
 ### 4.2 Connect procedures
 
@@ -326,11 +326,39 @@ Status: all P0 items are done, including the Linux gate rerun.
   document copies: `/tmp/envd-gates-5eb94465/`. Linux suite: 814 tests, 0
   failed; clippy `-D warnings` and fmt clean; the notice bundle still matches
   the lockfile.
+- **`POST /files` (2026-11-03)**: the upload flow moved from the Linux daemon
+  to `src/files_upload.rs` and is generic over `ConfigurationState`, so both
+  daemons mount the same decoder, multipart scanner, alias check and response
+  shape. Its platform-owned parts sit behind `src/platform/file_writes.rs`
+  (shared `user.e2b.*` validation policy) with one adapter per platform:
+  Linux delegates to the existing `filesystem::{paths, metadata}`
+  (chown/fchown, `0666` creation mode, `ENOSPC`/`EDQUOT` mapping, xattr
+  metadata), so the parity path is unchanged. Windows creates parents one
+  component at a time, creates/truncates with the service account's ACL
+  instead of chowning, identifies files for the multipart same-path refusal
+  with `GetFileInformationByHandle` (volume serial + file index), maps the
+  Windows disk-full/quota errors to the same 507 responses, and answers
+  `Unsupported` for `user.e2b.*` writes — the shared flow logs and continues,
+  exactly as it does on a Linux filesystem without xattr support.
+  `src/daemon_windows.rs` now routes `POST /files` to that shared handler.
+  Contract tests (four new, in `src/daemon_windows.rs`) drive a real loopback
+  listener: raw upload into a missing directory then read it back through
+  `GET /files`, a two-part multipart upload, the directory-target /
+  invalid-metadata / unsupported-content-type 400 shapes, and the 401 without
+  a token.
+- **Linux evidence for the `POST /files` slice**: candidate sha
+  `bccb04e9e6b38d2dbb3d3e7eddbb7b05fd05738e4cfcb673d37e070ae8eec3e7`. The
+  schema, malformed, HTTP/1 edge and both upgrade documents are IDENTICAL to
+  the oracle; conformance, freeze, guestprobe, MMDS, CPUs, OOM
+  global/cgroup/group and both NFS scenarios are `passed=true`. Status log and
+  document copies: `/tmp/envd-gates-bccb04e9/`. Linux suite: 814 tests, 0
+  failed; clippy `-D warnings` (Linux all-targets and Windows `--lib`) and fmt
+  clean.
 - **Still `Unsupported`**: watchers (`ReadDirectoryChangesW` is the next
-  slice), process, resource, port-scan, and metadata backends; `POST /files`,
-  compose, and the Connect procedure surface. The Windows binary entry point
-  still exits with "not implemented"; the daemon state and router exist and
-  are contract-tested, but nothing serves them in a guest yet.
+  slice), process, resource, port-scan, and metadata backends; compose and the
+  Connect procedure surface. The Windows binary entry point still exits with
+  "not implemented"; the daemon state and router exist and are contract-tested,
+  but nothing serves them in a guest yet.
 
 Rough effort: 30–45 person-weeks (6–9 months for one engineer; 3–5 months with
 2–3 engineers). P0 alone is 2–3 weeks and calibrates the rest.

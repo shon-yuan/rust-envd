@@ -1,12 +1,16 @@
 //! Streaming POST /files behavior pinned to runtime 51083a83, upload.go.
-// HTTP adapter errors carry complete protocol responses from shared auth helpers.
+//!
+//! The decoder, the multipart scanner and the response shape are shared by
+//! both daemons; the platform-owned parts (ownership, creation mode, file
+//! identity, `user.e2b.*` metadata) go through [`crate::platform::file_writes`].
+//! HTTP adapter errors carry complete protocol responses from shared auth helpers.
 #![allow(clippy::result_large_err)]
-use super::Daemon;
 use crate::{
     auth::ReadWrite,
     exec_context::{Account, Defaults},
     files_http::{authorize, json_error, lookup_account, Parameters},
-    filesystem::{metadata, paths},
+    http::ConfigurationState,
+    platform::file_writes as files,
 };
 use axum::{
     body::{Body, Bytes},
@@ -16,15 +20,10 @@ use axum::{
 };
 use flate2::read::MultiGzDecoder;
 use futures_util::{Stream, StreamExt, TryStreamExt};
-use nix::unistd::{chown, Gid, Uid};
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
+    fs,
     io::{self, Read},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt},
-    },
     path::Path,
     pin::Pin,
     sync::Arc,
@@ -35,8 +34,11 @@ use tokio::{
 };
 use tokio_util::io::{StreamReader, SyncIoBridge};
 
-pub(super) async fn upload(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
-    match receive(&daemon, request).await {
+pub async fn upload<S: ConfigurationState>(
+    State(state): State<Arc<S>>,
+    request: Request<Body>,
+) -> Response {
+    match receive(state.as_ref(), request).await {
         Ok(response) | Err(response) => response,
     }
 }
@@ -54,11 +56,14 @@ impl Drop for Input {
     }
 }
 
-async fn receive(daemon: &Daemon, request: Request<Body>) -> Result<Response, Response> {
+async fn receive<S: ConfigurationState>(
+    state: &S,
+    request: Request<Body>,
+) -> Result<Response, Response> {
     let query = request.uri().query().unwrap_or("");
     let params = Parameters::parse(query)?;
     let supplied_path = params.path_present;
-    let defaults = authorize(daemon, &params, request.headers(), ReadWrite::Write).await?;
+    let defaults = authorize(state, &params, request.headers(), ReadWrite::Write).await?;
     let username = defaults
         .resolve_username(params.username.as_deref())
         .map_err(|e| json_error(400, &e.to_string()))?
@@ -156,7 +161,7 @@ fn metadata_headers(headers: &HeaderMap) -> Result<HashMap<String, String>, Resp
             values.insert(key.to_owned(), value.to_owned());
         }
     }
-    metadata::validate_metadata(&values)
+    files::validate_metadata(&values)
         .map_err(|e| json_error(400, &format!("invalid metadata: {e}")))?;
     Ok(values)
 }
@@ -256,9 +261,9 @@ async fn open(path: &str, account: &Account) -> Result<tokio::fs::File, Response
     let account = account.clone();
     let file = tokio::task::spawn_blocking(move || {
         let path = Path::new(&path);
-        paths::ensure_dirs(path.parent().unwrap_or(Path::new("/")), &account)
+        files::ensure_dirs(path.parent().unwrap_or(path), &account)
             .map_err(|e| json_error(500, &format!("error ensuring directories: {e}")))?;
-        let mut chowned = false;
+        let mut adopted = false;
         match fs::metadata(path) {
             Ok(info) if info.is_dir() => {
                 return Err(json_error(
@@ -266,43 +271,23 @@ async fn open(path: &str, account: &Account) -> Result<tokio::fs::File, Response
                     &format!("path is a directory: {}", path.display()),
                 ))
             }
-            Ok(_) => match chown(
-                path,
-                Some(Uid::from_raw(account.uid)),
-                Some(Gid::from_raw(account.gid)),
-            ) {
-                Ok(()) => chowned = true,
-                Err(nix::errno::Errno::ENOENT) => {}
-                Err(e) => {
-                    return Err(json_error(
-                        500,
-                        &format!("error changing file ownership: {e}"),
-                    ))
-                }
-            },
+            Ok(_) => {
+                adopted = files::adopt_path_owner(path, &account)
+                    .map_err(|e| json_error(500, &format!("error changing file ownership: {e}")))?
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(json_error(500, &format!("error getting file info: {e}"))),
         }
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o666)
-            .open(path)
-            .map_err(|e| {
-                if e.raw_os_error() == Some(nix::libc::ENOSPC) {
-                    json_error(507, &format!("not enough inodes available: {e}"))
-                } else {
-                    json_error(500, &format!("error opening file: {e}"))
-                }
-            })?;
-        if !chowned {
-            nix::unistd::fchown(
-                file.as_raw_fd(),
-                Some(Uid::from_raw(account.uid)),
-                Some(Gid::from_raw(account.gid)),
-            )
-            .map_err(|e| json_error(500, &format!("error changing file ownership: {e}")))?;
+        let file = files::open_for_write(path).map_err(|e| {
+            if files::is_no_space(&e) {
+                json_error(507, &format!("not enough inodes available: {e}"))
+            } else {
+                json_error(500, &format!("error opening file: {e}"))
+            }
+        })?;
+        if !adopted {
+            files::adopt_file_owner(&file, &account)
+                .map_err(|e| json_error(500, &format!("error changing file ownership: {e}")))?;
         }
         Ok(file)
     })
@@ -334,23 +319,16 @@ where
     file.flush().await.map_err(|e| write_error(e, length))?;
     let file = file.into_std().await;
     let values = metadata.clone();
-    tokio::task::spawn_blocking(move || match metadata::write_metadata(&file, &values) {
+    tokio::task::spawn_blocking(move || match files::write_metadata(&file, &values) {
         Ok(()) => Ok(()),
-        Err(e) if metadata::is_unsupported(&e) => {
+        Err(e) if files::metadata_unsupported(&e) => {
             eprintln!("upload filesystem does not support xattrs; metadata not persisted: {e}");
             Ok(())
         }
-        Err(e)
-            if matches!(
-                e.raw_os_error(),
-                Some(nix::libc::ENOSPC | nix::libc::EDQUOT)
-            ) =>
-        {
-            Err(json_error(
-                507,
-                &format!("not enough space for file metadata: {e}"),
-            ))
-        }
+        Err(e) if files::is_no_space_or_quota(&e) => Err(json_error(
+            507,
+            &format!("not enough space for file metadata: {e}"),
+        )),
         Err(e) => Err(json_error(
             500,
             &format!("error writing file metadata: {e}"),
@@ -360,7 +338,7 @@ where
     .map_err(|_| json_error(500, "metadata worker failed"))?
 }
 fn write_error(error: io::Error, length: Option<u64>) -> Response {
-    if error.raw_os_error() == Some(nix::libc::ENOSPC) {
+    if files::is_no_space(&error) {
         let prefix = length
             .filter(|length| *length > 0)
             .map(|length| format!("attempted to write {length} bytes: "))
@@ -373,7 +351,7 @@ fn write_error(error: io::Error, length: Option<u64>) -> Response {
 async fn entry(path: String) -> Result<serde_json::Value, Response> {
     tokio::task::spawn_blocking(move || {
         let mut entry=serde_json::json!({"name":Path::new(&path).file_name().unwrap_or_default().to_string_lossy(),"path":path,"type":"file"});
-        match metadata::read_metadata(Path::new(&path)) {
+        match files::read_metadata(Path::new(&path)) {
             Ok(values) if !values.is_empty()=>entry["metadata"]=serde_json::json!(values),
             Err(e)=>eprintln!("failed to read back file metadata for upload response: {e}"),
             _=>{},
@@ -731,10 +709,14 @@ async fn multipart(
         let path = resolve(defaults, account, supplied)?;
         let target = tokio::fs::metadata(&path).await.ok();
         for old in &paths {
-            let same = if let Some(target) = &target {
-                tokio::fs::metadata(old)
-                    .await
-                    .is_ok_and(|info| info.dev() == target.dev() && info.ino() == target.ino())
+            let same = if target.is_some() {
+                let old = old.clone();
+                let current = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    files::same_file(Path::new(&old), Path::new(&current))
+                })
+                .await
+                .unwrap_or(false)
             } else {
                 false
             };

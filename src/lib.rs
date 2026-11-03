@@ -19,6 +19,7 @@ pub mod daemon;
 pub mod errno_text;
 pub mod exec_context;
 pub mod files_http;
+pub mod files_upload;
 #[cfg(target_os = "linux")]
 pub mod fsfreeze;
 pub mod goquote;

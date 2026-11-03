@@ -7,6 +7,7 @@
 pub mod account;
 pub mod cgroup;
 pub mod clock;
+pub mod file_writes;
 pub mod fs;
 pub mod metadata;
 pub mod net;

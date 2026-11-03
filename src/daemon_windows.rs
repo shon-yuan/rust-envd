@@ -1,11 +1,12 @@
 //! The Windows daemon: the shared HTTP surface of `docs/windows-port.md`
 //! served over the Windows backend.
 //!
-//! Scope of this slice (P1): `/health`, `/envs`, `/init` and `GET /files`,
-//! behind the same connection-level checks, CORS, authorization and mux
-//! frontdoor the Linux daemon uses. The endpoint code is shared
-//! (`crate::http`, `crate::files_http`), so this module only owns the state
-//! that has no Linux counterpart and the Windows `/init` effects.
+//! Scope of this slice (P1): `/health`, `/envs`, `/init`, `GET /files` and
+//! `POST /files`, behind the same connection-level checks, CORS,
+//! authorization and mux frontdoor the Linux daemon uses. The endpoint code is
+//! shared (`crate::http`, `crate::files_http`, `crate::files_upload`), so this
+//! module only owns the state that has no Linux counterpart and the Windows
+//! `/init` effects.
 //!
 //! Declared deviations from the Linux daemon, all recorded in
 //! `docs/windows-port.md`:
@@ -13,7 +14,10 @@
 //! - no cgroup/freezer/CA/NFS effects: accepted and reported as no-ops;
 //! - `X-Envd-Memory` reports `partial: true`, since no cgroup v2 exists;
 //! - the builtin default user is the account the service runs as, because
-//!   Windows has no `root`.
+//!   Windows has no `root`;
+//! - uploads create files with the service account's ACL instead of chowning
+//!   them, and `user.e2b.*` metadata is not persisted (logged, as on a Linux
+//!   filesystem without xattr support).
 use axum::{
     body::{to_bytes, Body},
     extract::State,
@@ -119,11 +123,12 @@ async fn procedure_unimplemented(request: Request<Body>) -> Response {
 }
 
 /// chi registers GET and POST on `/files`; the gate has already rejected every
-/// other method. Only the read half exists in this slice.
+/// other method. The read half is `crate::files_http`, the write half
+/// `crate::files_upload`, so both platforms run the same handlers.
 async fn files(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
     match *request.method() {
         axum::http::Method::GET => crate::files_http::get_files(State(daemon), request).await,
-        axum::http::Method::POST => not_yet("POST /files"),
+        axum::http::Method::POST => crate::files_upload::upload(State(daemon), request).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
 }
@@ -607,13 +612,174 @@ mod contract_tests {
             .contains("docs/windows-port.md"));
     }
 
+    fn encoded(path: &std::path::Path) -> String {
+        url::form_urlencoded::byte_serialize(path.to_str().expect("utf8").as_bytes()).collect()
+    }
+
+    #[tokio::test]
+    async fn post_files_writes_a_raw_body_for_the_installed_user() {
+        let running = initialized().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let file = directory.path().join("nested").join("hello.txt");
+        let query = format!("/files?path={}", encoded(&file));
+        let (status, _, body) = send(
+            running.address,
+            Method::POST,
+            &query,
+            &[
+                ("x-access-token", TOKEN),
+                ("content-type", "application/octet-stream"),
+            ],
+            b"hello windows",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let entries: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let path = file.to_string_lossy().into_owned();
+        assert_eq!(
+            entries,
+            serde_json::json!([{ "name": name, "path": path, "type": "file" }])
+        );
+        assert_eq!(std::fs::read(&file).expect("read"), b"hello windows");
+
+        // The read half serves the bytes the write half stored.
+        let (status, _, body) = send(
+            running.address,
+            Method::GET,
+            &format!("/files?path={}", encoded(&file)),
+            &[("x-access-token", TOKEN)],
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"hello windows");
+    }
+
+    #[tokio::test]
+    async fn post_files_multipart_uploads_each_file_part() {
+        let running = initialized().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first = directory.path().join("first.bin");
+        let second = directory.path().join("second.bin");
+        // Windows accepts `/` in absolute paths, and a `\` inside a
+        // Content-Disposition quoted-string would be an escape character.
+        let first_name = first.to_string_lossy().replace('\\', "/");
+        let second_name = second.to_string_lossy().replace('\\', "/");
+        let body = format!(
+            "--bound\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{first_name}\"\r\n\r\none\r\n--bound\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{second_name}\"\r\n\r\ntwo\r\n--bound--\r\n"
+        );
+        let (status, _, response) = send(
+            running.address,
+            Method::POST,
+            "/files",
+            &[
+                ("x-access-token", TOKEN),
+                ("content-type", "multipart/form-data; boundary=bound"),
+            ],
+            body.as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        let entries: serde_json::Value = serde_json::from_slice(&response).expect("json");
+        assert_eq!(entries.as_array().unwrap().len(), 2);
+        assert_eq!(std::fs::read(&first).expect("read"), b"one");
+        assert_eq!(std::fs::read(&second).expect("read"), b"two");
+    }
+
+    #[tokio::test]
+    async fn post_files_answers_the_oracle_error_shapes() {
+        let running = initialized().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+
+        // A directory target is refused before anything is truncated.
+        let query = format!("/files?path={}", encoded(directory.path()));
+        let (status, _, body) = send(
+            running.address,
+            Method::POST,
+            &query,
+            &[
+                ("x-access-token", TOKEN),
+                ("content-type", "application/octet-stream"),
+            ],
+            b"x",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("path is a directory: "));
+
+        // Metadata is validated before the file is opened.
+        let file = directory.path().join("metadata.txt");
+        let query = format!("/files?path={}", encoded(&file));
+        let (status, _, body) = send(
+            running.address,
+            Method::POST,
+            &query,
+            &[
+                ("x-access-token", TOKEN),
+                ("content-type", "application/octet-stream"),
+                ("x-metadata-author", "bad\tvalue"),
+            ],
+            b"x",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            error["message"],
+            "invalid metadata: metadata must be printable ASCII"
+        );
+        assert!(!file.exists());
+
+        // An unsupported content type is the oracle's 400.
+        let (status, _, body) = send(
+            running.address,
+            Method::POST,
+            &query,
+            &[("x-access-token", TOKEN), ("content-type", "text/plain")],
+            b"x",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("unsupported content type"));
+    }
+
+    #[tokio::test]
+    async fn post_files_requires_the_write_token() {
+        let running = initialized().await;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let file = directory.path().join("guarded.txt");
+        let query = format!("/files?path={}", encoded(&file));
+        let (status, _, body) = send(
+            running.address,
+            Method::POST,
+            &query,
+            &[("content-type", "application/octet-stream")],
+            b"x",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(error["code"], 401);
+        assert!(!file.exists());
+    }
+
     #[tokio::test]
     async fn unimplemented_endpoints_answer_with_the_documented_gap() {
         let running = initialized().await;
         let (status, _, body) = send(
             running.address,
             Method::POST,
-            "/files",
+            "/files/compose",
             &[("x-access-token", TOKEN)],
             b"",
         )

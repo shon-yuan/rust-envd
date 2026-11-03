@@ -7,6 +7,7 @@
 pub mod account;
 pub mod cgroups;
 pub mod cpus;
+pub mod file_writes;
 pub mod filesystem;
 pub mod mmds;
 pub mod port;
