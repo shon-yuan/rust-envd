@@ -23,6 +23,50 @@ The distributable notice bundle
 and the release manifest procedure are specified in
 [`third_party/PACKAGING.md`](third_party/PACKAGING.md).
 
+## Differences from the Go daemon
+
+Within the differential corpora listed in
+[`docs/acceptance-notes.md`](docs/acceptance-notes.md), the daemon is
+semantically identical to the pinned Go binary: status lines, header
+values, framing, trailers and bodies match, and every VM gate passes on the
+same candidate. The differences that remain are these.
+
+### Deliberate behaviour differences
+
+| Difference | Go envd | This daemon |
+| --- | --- | --- |
+| Boot mode | Runs the guest path whenever started; `--isnotfc` only skips MMDS and the log exporter | Requires `--guest`, root, PID 1 and `coorworker.envd=1` on the kernel command line. A bare Go-style invocation (`coorworker-envd --port 49983`) refuses to start, so switching an image also changes its launch line and kernel arguments. `--development` (ordinary user, loopback address) is the local mode. |
+| Port-forwarder availability | `forwardingAvailable()` returns nil unconditionally (`internal/port/forward.go:77`) | Only a `--guest` daemon scans ports and spawns `socat`; development mode never touches host loopback services. Guest behaviour is identical. |
+| `cpu-online` helper identity | The reexec helper writes the online file with no boot check | Additionally requires root, the kernel opt-in and `/proc/1/exe` to be the helper itself (`src/guest.rs`), a hardening deviation. |
+
+The three extra flags (`--development`, `--guest`, `--listen`) are not
+advertised: `-h` lists exactly the oracle's eight flags and reproduces its
+usage text apart from the program name in the first line. Conversely every
+oracle flag, both dash forms, `=value`, base-0 int64 parsing and Go `flag`
+diagnostics/exit codes are reproduced.
+
+### Comparison granularity
+
+- Header names are compared case-insensitively and order-insensitively:
+  Go writes canonical MIME casing in sorted order, this daemon writes
+  lowercase in insertion order. Values themselves are compared.
+- `Date` and volatile runtime values (clock, PIDs, CPU/memory samples,
+  latencies) are normalised; bodies are compared byte-for-byte.
+- Inputs outside the captured corpora are not claimed, including arbitrary
+  malformed protocol traffic and unenumerated system behaviour.
+
+### Outside the parity claim
+
+- TLS and a completed h2c switch. Go envd itself serves plaintext HTTP/1.1
+  (`main.go:328-335`), and the corpus compares both sides' rejection paths.
+- Chains longer than eight consecutive upgrade swaps (they repeat the same
+  export/relocate path).
+- The production Firecracker transport path and the host facade, and the
+  Go repository's separate host-side proxies (`client-proxy`, the
+  orchestrator `tcpfirewall`), which are different programs.
+- A distributable release artifact: the provenance manifest must be
+  regenerated from a clean checkout of the published commit.
+
 ## Build and test
 
 ```sh
