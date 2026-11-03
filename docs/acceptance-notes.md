@@ -816,8 +816,9 @@ The backend is not yet reachable from the daemon, which stays Linux-gated.
 
 Verification: Windows-target `cargo check --lib --bins` and clippy
 `-D warnings` clean on a Linux cross toolchain; the module's unit tests run
-on the new `windows-test` CI job (`cargo test --lib` on `windows-latest`),
-not on this host. Linux is unchanged behaviourally: the full suite is 814
+on the new `windows-test` CI job and pass on `windows-latest` (run
+`41585352844`: 6 passed, including all five filesystem tests), so the
+backend has real Windows runtime evidence, not just cross-compilation. Linux is unchanged behaviourally: the full suite is 814
 passed / 0 failed, clippy and fmt clean, and the full parity gate set on the
 same candidate (sha `ca97781c…`) is IDENTICAL for the schema, malformed,
 HTTP/1 edge and both upgrade documents, with conformance, freeze, guestprobe,
@@ -831,4 +832,9 @@ its PID through a file, judges liveness by `/proc/<pid>/cmdline` (empty for a
 zombie), execs `/usr/bin/sleep` by absolute path because sibling tests mutate
 `PATH`, and surfaces an early runner error with its output. It is test-only and
 does not change the daemon; the guest binary is byte-identical to the gated
-candidate.
+candidate. Two further CI-only findings were fixed the same way: the
+hyperloop tests now poll with 1 ms sleeps instead of a fixed number of
+`yield_now` calls (a `spawn_blocking` rewrite could outlast the budget on a
+loaded runner), and the Linux job runs `cargo fetch --locked` before the
+notice check because `cargo metadata --offline` needs the non-Linux sources
+that the bundle covers.

@@ -274,8 +274,9 @@ Status: all P0 items are done, including the Linux gate rerun.
   target with the `\\?\` prefix stripped, and returns an empty `metadata`
   map. Declared difference: Windows has no POSIX special bits, so
   `permissions` renders only the `r`/`w`/`x` triples. Unit tests live in
-  `src/platform/windows/fs.rs` and run on the `windows-test` CI job
-  (`cargo test --lib` on `windows-latest`).
+  `src/platform/windows/fs.rs`; the `windows-test` CI job runs them on
+  `windows-latest` with `cargo test --lib` (run `41585352844`: 6 passed,
+  including all five filesystem tests).
 - **Linux evidence for this slice**: candidate sha
   `ca97781c8b08c74b8cf30ca05a09b3f94c23ca7eabf551bfc7a6286c91f7bb4d` — the
   schema, malformed, HTTP/1 edge and both upgrade documents are IDENTICAL to
