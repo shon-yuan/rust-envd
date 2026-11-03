@@ -12,7 +12,7 @@ Every covered distribution must ship:
 | 4 | `third_party/NOTICES.md` | Aggregate third-party notice: scope statement, project MIT grant, e2b Apache-2.0 pointer, Go BSD-3-Clause notice, per-crate index and copyright lines. |
 | 5 | The complete `third_party/licenses/` tree | Verbatim license texts for every crate in the locked dependency graph, one directory per crate-version. |
 | 6 | The Go Authors' BSD-3-Clause notice for `src/mmds/go_url.rs` | Required for binary redistribution; the notice is reproduced in `third_party/NOTICES.md` ("Copyright 2009 The Go Authors."), so including item 4 satisfies it. Source distributions must also keep the notice in the file header itself. |
-| 7 | `vendor/connectrpc/LICENSE` and `vendor/connectrpc/PATCHES.md` | The in-tree `connectrpc` 0.9.1 fork selected by `[patch.crates-io]`; the license text is also enumerated as `licenses/connectrpc-0.9.1/`, and `PATCHES.md` records the upstream revision and every local change. |
+| 7 | `vendor/connectrpc/LICENSE` + `vendor/connectrpc/PATCHES.md`, and `vendor/hyper/LICENSE` + `vendor/hyper/PATCHES.md` | The in-tree `connectrpc` 0.9.1 (Apache-2.0) and `hyper` 1.12.0 (MIT) forks selected by `[patch.crates-io]`; each license text is also enumerated under `licenses/`, and each `PATCHES.md` records the upstream revision and every local change. |
 | 8 | A provenance manifest from `scripts/packaging_manifest.py` | Binds the binary to `git rev-parse HEAD`, dirty state, toolchain, canonical build command, and SHA-256 digests of every covered file and the whole license tree. |
 
 Do not drop, truncate, or reflow items 2–5: the license texts are copied
@@ -71,4 +71,5 @@ cargo build --locked --release -j4 --target x86_64-unknown-linux-musl
 - [ ] `third_party/NOTICES.md`
 - [ ] `third_party/licenses/` — full tree, unmodified
 - [ ] `vendor/connectrpc/LICENSE` + `vendor/connectrpc/PATCHES.md`
+- [ ] `vendor/hyper/LICENSE` + `vendor/hyper/PATCHES.md`
 - [ ] provenance manifest for this artifact

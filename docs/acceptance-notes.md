@@ -698,7 +698,7 @@ Explicitly **not** claimed:
 
 - inputs outside the captured corpora, including arbitrary malformed protocol
   traffic and unenumerated system behavior;
-- TLS, a completed h2c switch, and response trailers;
+- TLS and a completed h2c switch;
 - chains longer than eight consecutive swaps (they repeat the same
   export/relocate path);
 - the production Firecracker transport path (P2/P3) and the host facade (S4);
@@ -707,4 +707,76 @@ Explicitly **not** claimed:
 
 The 2026-11-02 non-claims for HTTP/1 parser edges, nested cgroup
 `memory.oom.group`, and non-loopback bindings are superseded by this section.
+The 2026-11-03 non-claim for HTTP/1 response trailers is superseded by the
+section below (gRPC terminal trailers over HTTP/1.1 are now compared).
+
+## Parity campaign closure (2026-11-03, HTTP/1 drain and gRPC error frames)
+
+Final candidate: `1215b0b35ede5992d7481f2c64a12a9ea0f990966f9fd85a13f32cd062d5a739`
+(`/tmp/rust-envd-candidate-1215b0b3/coorworker-envd`, `-version 0.10.2`,
+`-commit 51083a83…`). Its `src/` and `tests/` are byte-identical to the copies
+in this repository, and both vendored forks (`vendor/connectrpc`,
+`vendor/hyper`) match theirs (`diff -r` verified).
+
+Gaps closed on this candidate, each bound to oracle documents:
+
+- **Go's post-handler drain.** When a handler leaves the request body unread,
+  Go consumes at most 256 KiB + 1 bytes; a corrupt chunked body or an
+  oversized one sets `closeAfterReply`, an unconsumed `Expect: 100-continue`
+  body closes without a drain, and CONNECT never reuses the connection
+  (`server.go:1369-1375,1393-1435`). `daemon/http1/mod.rs` wraps the body in a
+  `Drainable` that recovers it from the handler future and drains it before the
+  response head is written; corrupt/oversized bodies and HTTP/1.1 non-2xx
+  CONNECT responses carry `Connection: close`, while HTTP/1.0 deletes that
+  header instead (`server.go:1529-1540`).
+- **Chunked limits.** The vendored hyper decoder now follows
+  `internal/chunked.go`: a chunk-size line of 4094 bytes is accepted and 4095
+  is rejected, and the running non-data overhead is capped at 16 KiB after
+  crediting 16 + 2n per chunk. Without this the drain above disagreed with Go
+  on bodies the oracle refuses.
+- **gRPC and gRPC-Web error frames.** The vendored connectrpc fork matches
+  connect-go 1.18.1: `grpc-accept-encoding` on every response including
+  errors, `grpc-status`/`grpc-message` only as trailers, padded
+  `grpc-status-details-bin` only when details exist, and the gRPC-Web
+  trailers-only error as HTTP headers with an empty body
+  (`protocol_grpc.go:171,533-543,558-572,859-866`). The handler-visible
+  `Transfer-Encoding` stays deleted (`transfer.go:636`) while the canonical
+  chunked form is re-emitted to hyper so it still frames the body.
+- **Smaller net/http details.** `OPTIONS *?x` no longer reaches the general
+  options handler (`server.go:3327`), the listener uses Go's `SO_REUSEADDR`
+  and somaxconn backlog, and the daemon installs no signal handler, so
+  SIGINT/SIGTERM terminate immediately as Go envd does.
+
+Evidence on that candidate (VM artifacts under `/tmp/envd-gates-1215b0b3/`):
+the HTTP/1 protocol-edge corpus grew from 34 to 71 cases (Expect combinations,
+HTTP/1.0 keep-alive/pipelining, TE and chunked boundaries, header-block
+shapes, gRPC and gRPC-Web errors, CONNECT over HTTP/1.0 and 1.1) and is
+IDENTICAL (`/tmp/envd-http1-edges-vm-{ikizpbrz,jrls9izp}`, 71/71). Schema
+(`/tmp/envd-schema-vm-{zr35ghpe,gzgtrh4m}`), malformed
+(`/tmp/envd-malformed-vm-{5anlhm5y,glrx3hll}`) and both live-upgrade modes
+(install `/tmp/envd-upgrade-vm-{qymfncd4,ae41z5e6}`, reexec
+`/tmp/envd-upgrade-vm-{d5fgoqp8,54krm1ql}`) are IDENTICAL. Conformance
+`--expanded --repeat 2` (`/tmp/envd-oracle-vm-yj6jz611`), OOM global
+`/tmp/envd-oom-vm-c7zhihnh`, cgroup `/tmp/envd-oom-vm-cd9tsm82`, group
+`/tmp/envd-oom-vm-nqe6ybma`, CPU `/tmp/envd-cpus-vm-qlxq42t5`, MMDS
+`/tmp/envd-mmds-vm-flu3owp_`, freeze `/tmp/envd-freeze-vm-js1otrer`, guest
+probes `/tmp/envd-guestprobe-vm-4p8ggexb`, NFS default
+`/tmp/envd-nfs-vm-wz8xds61` and helper-missing `/tmp/envd-nfs-vm-kqpueczr`
+all report `passed=true`. The first reexec upgrade attempt failed on each side
+in the same post-OOM phase (listener-forwarder timing); fresh guests passed on
+both sides and the documents are identical, so the failure is recorded as a
+timing flake, not a parity difference.
+
+The malformed gate's `/metrics` normalizer now collapses a whole decimal
+literal (`0`, `0.0`, `0.01`, `1e-05`) to `N`; an idle guest can report an
+integral percentage on one run and a fractional one on the next, and the old
+digit-only rule left a spurious `N` vs `N.N` difference.
+
+Tests on this tree: `cargo test -j4 --offline` green (814 passed, 0 failed;
+24 generated-code doctests ignored), clippy `-D warnings` and `cargo fmt
+--check` clean, harness `254 passed / 295 subtests`. A full workspace run is not applicable to this standalone
+crate; in the upstream agent workspace the same sources pass 1184 tests with
+two known failures that depend on a stale local guest image (2026-10-14)
+lacking the current `counter`/`extension` tool declarations, unrelated to
+envd, hyper or connectrpc.
 

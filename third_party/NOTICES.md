@@ -22,9 +22,11 @@ Copyright (c) 2026 shon-yuan
 
 `src/mmds/go_url.rs` is a Go-derived redirect URL helper carrying The Go Authors' BSD-3-Clause notice ("Copyright 2009 The Go Authors.") in its file header. Binary redistribution of a covered distribution must reproduce that notice; source distributions include the file itself.
 
-## Vendored Rust crate fork (Apache-2.0)
+## Vendored Rust crate forks
 
-`vendor/connectrpc/` is an in-tree fork of crates.io `connectrpc` 0.9.1 (Apache-2.0), selected with `[patch.crates-io]`. Covered distributions must include this file, the Apache-2.0 text under `licenses/connectrpc-0.9.1/`, and `vendor/connectrpc/PATCHES.md`, which records the upstream revision and every local change. The fork's license text is enumerated below with the other third-party crates.
+`vendor/connectrpc/` is an in-tree fork of crates.io `connectrpc` 0.9.1 (Apache-2.0), selected with `[patch.crates-io]`. Covered distributions must include this file, the license text(s) under `licenses/connectrpc-0.9.1/`, and `vendor/connectrpc/PATCHES.md`, which records the upstream revision and every local change. The fork's license text is enumerated below with the other third-party crates.
+
+`vendor/hyper/` is an in-tree fork of crates.io `hyper` 1.12.0 (MIT), selected with `[patch.crates-io]`. Covered distributions must include this file, the license text(s) under `licenses/hyper-1.12.0/`, and `vendor/hyper/PATCHES.md`, which records the upstream revision and every local change. The fork's license text is enumerated below with the other third-party crates.
 
 ## Third-party crates
 

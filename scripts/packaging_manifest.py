@@ -37,6 +37,8 @@ REQUIRED_FILES = (
     "third_party/e2b/PROVENANCE",
     "vendor/connectrpc/LICENSE",
     "vendor/connectrpc/PATCHES.md",
+    "vendor/hyper/LICENSE",
+    "vendor/hyper/PATCHES.md",
     "Cargo.toml",
     "Cargo.lock",
 )

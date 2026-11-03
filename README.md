@@ -15,7 +15,10 @@ schemas carries the same attribution. The Go-derived redirect URL helper in
 `src/mmds/go_url.rs` retains The Go Authors' BSD-3-Clause notice.
 `vendor/connectrpc/` is an Apache-2.0 in-tree fork of `connectrpc` 0.9.1
 carrying connect-go error-text parity; its changes are recorded in
-`vendor/connectrpc/PATCHES.md`. The distributable notice bundle
+`vendor/connectrpc/PATCHES.md`. `vendor/hyper/` is an MIT in-tree fork of
+`hyper` 1.12.0 carrying Go `net/http`'s HTTP/1.1 trailer write path and
+chunked-body limits; its changes are recorded in `vendor/hyper/PATCHES.md`.
+The distributable notice bundle
 ([`third_party/NOTICES.md`](third_party/NOTICES.md), `third_party/licenses/`)
 and the release manifest procedure are specified in
 [`third_party/PACKAGING.md`](third_party/PACKAGING.md).

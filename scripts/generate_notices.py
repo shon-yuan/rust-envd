@@ -499,7 +499,7 @@ def render_notices(
         " include the file itself."
     )
     add("")
-    add("## Vendored Rust crate fork (Apache-2.0)")
+    add("## Vendored Rust crate forks")
     add("")
     forks = vendored_forks(repo, collected)
     if not forks:
@@ -515,7 +515,7 @@ def render_notices(
             f"`{relative}/` is an in-tree fork of crates.io `{pkg['name']}`"
             f" {pkg['version']} ({pkg['license'] or 'see files'}), selected with"
             " `[patch.crates-io]`. Covered distributions must include this"
-            f" file, the Apache-2.0 text under `{LICENSES_DIR}/{crate}/`,"
+            f" file, the license text(s) under `{LICENSES_DIR}/{crate}/`,"
             f" and `{relative}/PATCHES.md`, which records the upstream"
             " revision and every local change. The fork's license text is"
             " enumerated below with the other third-party crates."
