@@ -310,11 +310,14 @@ Status: all P0 items are done, including the Linux gate rerun.
   `POST /files`, `/files/compose` and the other REST operations answer 501
   with a message naming this document; the 17 Connect procedures answer
   connect-go's 404 `unimplemented` JSON error with the same message.
-  Contract tests live in `src/daemon_windows.rs` and drive a real loopback
-  listener: 204 `/health` with the empty content-type header, the 401 JSON
-  envelope, `/init` token install and `X-Envd-*` headers, file read and
-  missing-path errors, chi 404/405, CORS preflight, and raw-socket
-  `OPTIONS *`/failing-`Expect` checks.
+  Contract tests live in `src/daemon_windows.rs` (11 tests) and drive a real
+  loopback listener: 204 `/health` with the empty content-type header, the
+  401 JSON envelope, `/init` token install and `X-Envd-*` headers (error
+  responses included), file read and missing-path errors, chi 404/405, CORS
+  preflight, raw-socket `OPTIONS *`/failing-`Expect` checks, and the 501/404
+  gap responses. The `windows-test` job ran them natively on
+  `windows-latest` in run `41590760185`: 29 tests passed (the 11 contract
+  tests plus the existing backend tests).
 - **Linux evidence for the HTTP slice**: candidate sha
   `5eb944656b644c4f42f392c0dbfe9e517e355430a70979b27e945f9493ac188d`. The
   schema, malformed, HTTP/1 edge and both upgrade documents are IDENTICAL to

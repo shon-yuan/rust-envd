@@ -863,9 +863,10 @@ upgrade reexec and install) and every single-side gate `passed=true`
 cross-compile job, and clippy on the Windows target (`--lib`, `-D warnings`)
 plus `cargo test --no-run --lib` (which type-checks the Windows test bodies;
 only the MSVC linker is absent locally) are clean. The contract tests
-themselves run on
-`windows-latest` in the `windows-test` job (`cargo test --lib`), where the
-real Win32 account database and filesystem answer. They assert the wire
+themselves ran on `windows-latest` in the `windows-test` job
+(`cargo test --lib`) in run `41590760185`: 29 passed / 0 failed, including
+all 11 contract tests, against the real Win32 account database and
+filesystem. They assert the wire
 behaviour an SDK sees: 204 `/health` with an empty content-type, the 401 JSON
 envelope, `/init` token install plus `X-Envd-Version`/`X-Envd-Memory`, a real
 file read and the missing-path error shape, chi 404/405 with `Allow`, CORS
