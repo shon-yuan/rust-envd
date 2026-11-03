@@ -600,7 +600,10 @@ async fn review_unfinished_part_headers_reject_before_sender_closes() {
         )
         .await
     });
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut task).await;
+    // The budget is 10 MiB, and in a debug build multer rescans the growing
+    // unterminated header line on every read, so this test alone costs several
+    // seconds; the deadline is a hang guard, not a latency target.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(60), &mut task).await;
     if result.is_err() {
         task.abort();
         drop(sender);
