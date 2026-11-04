@@ -1,13 +1,14 @@
 # Windows sandbox port — evaluation and plan
 
-Status: P0 complete 2026-11-03 — the platform seam exists, the Linux backends
-are moved under `src/platform/linux/`, the Windows skeleton compiles for
-`x86_64-pc-windows-msvc`, and the full Linux parity gate set is IDENTICAL on
-the same candidate.
-P1 in progress — the filesystem backend, the shared HTTP surface, the
-resource endpoints and all seventeen Connect procedures (filesystem and
-process) are implemented and contract-tested; only `POST /upgrade` remains.
-See "P1 progress".
+Status: **P0–P3 complete (2026-11-04)** — the platform seam, the native
+Windows backends and the complete API surface are implemented and
+contract-tested: all 13 REST operations and all 17 Connect procedures,
+`POST /upgrade` included. The library suite runs natively on a Windows 11
+guest (314 passed / 0 failed), and the official E2B Python SDK (2.62.1)
+conformance run passes 27/27 against a live guest. P4 (Windows guest image +
+Cloud Hypervisor backend + tool bridge) and P5's remaining baselines are
+still open. Windows behaviour is contract evidence only — there is no
+Windows oracle, so no differential claim is made.
 This document scopes goal D: **a Windows guest sandbox that serves the complete
 existing envd API**, while the Linux daemon keeps its byte-level parity with the
 pinned Go oracle.
@@ -901,8 +902,49 @@ Status: all P0 items are done, including the Linux gate rerun.
   `cargo test -j4 --offline` 819 passed / 0 failed; the notices check matches
   the locked graph. Windows behaviour remains contract evidence — there is no
   Windows oracle, so no differential claim is made.
-- **Still open**: the Windows guest image + Cloud Hypervisor backend (P4) and
-  the SDK matrix (P5). Every REST operation and all seventeen Connect
+- **One neutral `/init` decoder and an official-SDK conformance run
+  (2026-11-04)**: the body decoder both daemons use now lives in one module
+  (`src/init_payload.rs`): the `InitRequest` visitor, the raw-bytes
+  `timestamp`/`accessToken` capture, Go's field folding, the Go-typed checks
+  for ignored members, and the streamed body reader. Linux's `/init` and the
+  Windows daemon call the same `decode` and `collect_body`, so the decoder
+  divergence class the native Windows run found cannot recur on one target
+  only. Three smaller consequences: the Windows body reader no longer applies
+  its own 32 MB `to_bytes` cap (the shared reader is unbounded, like the
+  oracle), `VolumeMount` is decoded by the shared visitor (the NFS module's
+  local copy — which folded `K` but not U+212A — is gone), and
+  `daemon_windows/contract_tests.rs` imports `axum::body::to_bytes` itself.
+  Evidence: Windows 11 guest `cargo test -j4 --lib -- --test-threads=1`, 314
+  passed / 0 failed (exit 0); Linux `cargo test -j4 --offline` 830 passed;
+  `cargo fmt --check`, `cargo check --locked --all-targets`, and
+  `cargo clippy --all-targets -D warnings` clean.
+  The official E2B Python SDK (2.62.1) now drives the daemon end to end:
+  `scripts/tests/envd-parity/sdk_conformance.py` in the agent repo exercises
+  REST health/init/envs/metrics/upload/download/Range/compose, the
+  filesystem RPC surface (write/read/info/exists/list/watchers/make_dir/
+  rename/remove) and the process RPC surface (start, list, kill, connect,
+  stdin) through the SDK's own codec, clients and `CommandHandle`. Result:
+  **27/27 on the Windows guest and 27/27 on the Linux daemon**. The Linux
+  daemon was run by an ordinary user and the harness passed `--user xuyuan`,
+  because with no `defaultUser` the oracle's compiled-in fallback is `root`
+  (`execcontext.BuiltinDefaultUser`) and a non-root daemon then correctly
+  fails to spawn as root. The run is
+  also a wire fact-check, and it corrected three harness assumptions rather
+  than daemon defects: `GET /envs` answers the flat env map (Go
+  `api/envs.go`), `POST /files/compose` takes `source_paths` (`api.gen.go`
+  `ComposeRequest`), and compose consumes its sources (upstream
+  `TestCompose_DeletesSourceFiles`).
+  Declared SDK-level deviation, unchanged by this slice: the SDK's
+  `commands.run` hardcodes `/bin/bash -l -c`, so on a Windows guest it is
+  refused with `invalid_argument` ("system cannot find the file"); the
+  process surface itself is exercised through processes the harness starts
+  with an explicit `cmd.exe` command line. The Linux daemon cannot be
+  started inside a sandboxed parent that denies `fork/exec`; that is an
+  environment limit, not a daemon defect (verified by rerunning with an
+  unconstrained parent: 27/27).
+- **Still open**: the Windows guest image + Cloud Hypervisor backend (P4).
+  The official-SDK conformance matrix (P5) is green for the surface above;
+  it does not cover `commands.run` on Windows, which is refused by design. Every REST operation and all seventeen Connect
   procedures are implemented and served. The metrics, freeze/unfreeze,
   collapse and fsfreeze resource backends are implemented and served. The
   port-scan backend (GetExtendedTcpTable) and the loopback port forwarder are

@@ -25,17 +25,55 @@ and the release manifest procedure are specified in
 
 ## Platforms
 
-Linux x86_64 is the only supported runtime target today, the same as the Go
-daemon. The Windows port (goal D) is at P0: the platform seam and a
-Windows-target skeleton exist, so the shared crate checks and builds for
-`x86_64-pc-windows-msvc`, but no Windows endpoint or backend is implemented
-and the binary itself still needs a Windows toolchain to link. The endpoint
-matrix, semantics, and phased plan are in
-[docs/windows-port.md](docs/windows-port.md).
+Linux x86_64 is the differential-parity target: the tables below and the
+differential gates in [`docs/acceptance-notes.md`](docs/acceptance-notes.md)
+are Linux evidence.
+
+Windows x86_64 is a supported guest target (tested on Windows 11) with a
+native Windows backend behind the same API. Both daemons serve the complete
+surface — all 13 REST operations and all 17 Connect procedures — with the
+same schemas, status codes, error envelopes and Connect framing:
+
+- **Process**: `CreateProcessW` under job objects, ConPTY pseudo-terminals,
+  `CTRL_BREAK`/ETX/`WM_CLOSE` termination for signals, retained-exit registry.
+- **Filesystem**: the REST and RPC surface, with watchers over
+  `ReadDirectoryChangesW`.
+- **Resources**: metrics from Win32 counters, freeze/unfreeze through thread
+  suspension, and the collapse/fsfreeze backends.
+- **Ports**: scanning through `GetExtendedTcpTable` and the in-process
+  loopback forwarder on `169.254.0.21`.
+- **`/init`**: token and defaults, CA install into the Windows certificate
+  store, clock correction and step through `SetSystemTime`, thaw; metadata
+  persistence through DPAPI.
+- **Lifecycle**: incoming handover adoption and outgoing live upgrade, and
+  the SCM service lifecycle (a service is a guest by construction; a console
+  start needs `COORWORKER_ENVD=1` and binds `0.0.0.0:49983` like the oracle).
+
+Build it with a Windows MSVC toolchain and `PROTOC` set to a `protoc`
+executable:
+
+```sh
+cargo build --locked --bin coorworker-envd
+```
+
+Evidence: the library suite runs natively on a Windows 11 guest (314 passed,
+0 failed), and the official E2B Python SDK 2.62.1 drives a live guest through
+its own codec, generated clients and `CommandHandle` (27/27; the agent repo's
+`scripts/tests/envd-parity/sdk_conformance.py`). There is no Windows oracle,
+so Windows behaviour is contract evidence only — no differential claim is
+made. Declared deviations: freeze is thread suspension rather than cgroup v2;
+processes run as the daemon's own account (no arbitrary-user impersonation);
+and the SDK's `commands.run`, which hardcodes `/bin/bash -l -c`, is refused
+with `invalid_argument` because a Windows guest has no POSIX shell.
+
+The full API matrix, semantics, native evidence log and open decisions are in
+[`docs/windows-port.md`](docs/windows-port.md). Booting Windows under Cloud
+Hypervisor/Hyper-V (the guest image pipeline) is separate open work; the
+daemon itself runs in an existing Windows VM.
 
 ## Differences from the Go daemon
 
-Within the differential corpora listed in
+On Linux, within the differential corpora listed in
 [`docs/acceptance-notes.md`](docs/acceptance-notes.md), the daemon is
 semantically identical to the pinned Go binary: status lines, header
 values, framing, trailers and bodies match, and every VM gate passes on the
@@ -54,6 +92,22 @@ advertised: `-h` lists exactly the oracle's eight flags and reproduces its
 usage text apart from the program name in the first line. Conversely every
 oracle flag, both dash forms, `=value`, base-0 int64 parsing and Go `flag`
 diagnostics/exit codes are reproduced.
+
+### Windows behaviour
+
+Windows has no Go oracle, so the Windows backend is verified by contract
+tests and by the official SDK rather than by differential comparison. Its
+declared deviations are:
+
+- **Freeze** suspends threads instead of freezing a cgroup v2 subtree.
+- **Processes** always run as the daemon's own account; there is no
+  arbitrary-user impersonation.
+- **`X-Envd-Memory`** reports `partial: true` with zeroed figures, because
+  there is no cgroup from which to read them.
+- **`permissions`** carries only the `r`/`w`/`x` triples; Windows has no
+  POSIX special bits.
+- **The SDK's `commands.run`** is refused: it hardcodes `/bin/bash -l -c`,
+  and a Windows guest has no POSIX shell.
 
 ### Comparison granularity
 

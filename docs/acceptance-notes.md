@@ -1328,3 +1328,37 @@ Windows target `cargo check`/`clippy -D warnings` on `--lib --bins` clean;
 819 passed / 0 failed; `python3 scripts/generate_notices.py --check` matches
 the locked graph. **Windows behaviour is contract evidence only; no
 differential claim.**
+
+## Windows port P0/P1 — one neutral `/init` decoder and official-SDK conformance (2026-11-04)
+
+`/init` is now decoded by one module for both targets
+(`src/init_payload.rs`): the request visitor, the raw-bytes capture of
+`timestamp`/`accessToken`, Go's field folding, the Go-typed checks for members
+the daemon ignores, and the streamed body reader. Linux's daemon and the
+Windows daemon call the same `decode` and `collect_body`, so a decoder
+divergence cannot exist on one target only. This also removes the Windows
+body reader's own 32 MB `to_bytes` cap (the oracle is unbounded) and deletes
+the NFS module's local `VolumeMount` decoder, whose folding missed U+212A.
+
+Evidence, Windows guest (`cargo test -j4 --lib -- --test-threads=1`): 314
+passed / 0 failed, exit 0. Evidence, Linux host: `cargo test -j4 --offline`
+830 passed; `cargo fmt --check`, `cargo check --locked --all-targets` and
+`cargo clippy --all-targets -D warnings` clean.
+
+The official E2B Python SDK (2.62.1) then drove the live daemon through its
+own codec, generated Connect clients and `CommandHandle`
+(`scripts/tests/envd-parity/sdk_conformance.py` in the agent repo): REST
+health/init/envs/metrics/upload/download/Range/compose, filesystem
+write/read/info/exists/list/make_dir/rename/remove/watchers, and process
+start/list/kill/connect/stdin. Result: **27/27 on the Windows guest** and
+**27/27 on the Linux daemon** (the Linux run passes `--user xuyuan`: with no
+`defaultUser` the oracle's fallback is the compiled-in `root`, and a non-root
+daemon then correctly fails to spawn and chown as root). The run corrected three
+harness assumptions
+against the pinned Go source (flat `/envs` body, `source_paths` in the
+compose body, compose consuming its sources), not the daemon.
+
+Declared deviation: the SDK's `commands.run` hardcodes `/bin/bash -l -c`, so
+a Windows guest refuses it with `invalid_argument` naming the missing
+executable; the process surface is otherwise fully exercised. Windows
+behaviour remains contract evidence only; no differential claim.
