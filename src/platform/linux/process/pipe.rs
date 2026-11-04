@@ -126,3 +126,32 @@ pub(super) fn relocate_carried_fd(slot: RawFd) -> io::Result<OwnedFd> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::relocate_carried_fd;
+
+    #[test]
+    fn relocate_carried_fd_rejects_closed_nonnegative_descriptor() {
+        // This cannot be allocated by another parallel test, unlike a low fd
+        // that this test opens and closes to manufacture EBADF.
+        let result = relocate_carried_fd(i32::MAX);
+        match result {
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EBADF)),
+            Ok(fd) => {
+                // The current fallback constructs invalid ownership on EBADF.
+                // Do not let OwnedFd::drop abort while reporting this RED.
+                std::mem::forget(fd);
+                panic!("relocate_carried_fd accepted a closed nonnegative descriptor");
+            }
+        }
+    }
+
+    #[test]
+    fn relocate_carried_fd_rejects_absent_descriptor() {
+        for absent in [-1, i32::MIN] {
+            let error = relocate_carried_fd(absent).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        }
+    }
+}

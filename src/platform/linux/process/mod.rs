@@ -25,6 +25,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Instant;
 
+#[cfg(test)]
+mod handover_tests;
 mod pipe;
 mod pty;
 mod spawn;
