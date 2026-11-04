@@ -20,7 +20,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler \
             libx11-dev libxi-dev libxtst-dev libxfixes-dev libxrandr-dev \
-            libxcomposite-dev libxrender-dev libxext-dev libxdamage-dev
+            libxcomposite-dev libxrender-dev libxext-dev libxdamage-dev \
+            libxkbcommon-dev
       - run: cargo build --locked -j4
       - run: cargo test --locked -j4
       - run: cargo clippy --locked -j4 --all-targets -- -D warnings
