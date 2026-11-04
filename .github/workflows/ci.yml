@@ -29,7 +29,7 @@ jobs:
       - name: Build, test and lint the cua worker
         run: |
           cargo build --locked -j4 --manifest-path cua-worker/Cargo.toml --bin coorworker-cua
-          cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins
+          cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins --tests
           cargo clippy --locked -j4 --manifest-path cua-worker/Cargo.toml --all-targets -- -D warnings
           cargo fmt --manifest-path cua-worker/Cargo.toml --check
       - name: Fetch both lockfiles for the notice bundles
@@ -70,4 +70,4 @@ jobs:
         # "Windows worker unverified" gap without a desktop session.
         run: |
           cargo build --locked -j4 --manifest-path cua-worker/Cargo.toml --bin coorworker-cua
-          cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins
+          cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins --tests
