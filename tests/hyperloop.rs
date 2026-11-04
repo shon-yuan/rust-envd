@@ -389,8 +389,17 @@ async fn user_env_vars_cannot_override_the_events_address() {
         .await,
         StatusCode::NO_CONTENT
     );
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let values = envs(router, None).await;
+    // The rejection is applied by the same background writer that publishes
+    // the daemon's own value, so poll for the settled value instead of racing
+    // it with a fixed sleep (which failed under CI load).
+    let mut values = serde_json::Value::Null;
+    for _ in 0..200 {
+        values = envs(router.clone(), None).await;
+        if values["E2B_EVENTS_ADDRESS"] == "http://192.0.2.5" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(values["E2B_EVENTS_ADDRESS"], "http://192.0.2.5");
 }
 
