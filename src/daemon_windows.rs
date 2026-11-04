@@ -45,22 +45,18 @@
 //!   stay zero, and Windows error text replaces Go errno text; see
 //!   `docs/windows-port.md` for the full list.
 use axum::{
-    body::{to_bytes, Body},
+    body::Body,
     extract::{RawQuery, State},
     http::{header, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
     Json, Router,
 };
-use serde_json::value::RawValue;
-use serde_json::Value;
-use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
-use zeroize::Zeroizing;
 
 use crate::collapse::Collapser;
 use crate::configuration::Configuration;
@@ -513,225 +509,9 @@ async fn files(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Res
     }
 }
 
-/// The `/init` fields with Windows effects, plus the Go-typed fields this
-/// daemon validates but does not use. Decoding follows the oracle closely
-/// enough that a body Go rejects is rejected here too; the Linux-only effects
-/// are listed in the module docs.
-#[derive(Default)]
-struct InitRequest {
-    access_token: Option<Zeroizing<String>>,
-    env_vars: Option<BTreeMap<String, String>>,
-    default_user: Option<String>,
-    default_workdir: Option<String>,
-    /// Go `PostInitJSONBodyThaw`: only `skip` withholds the resume thaw.
-    thaw: Option<String>,
-    /// Go api.gen.go:386 `*time.Time json:"timestamp,omitempty"`: the client's
-    /// observation of the guest clock, in nanoseconds since the epoch. Feeds
-    /// the correction header, the newest-wins gate and the clock step
-    /// (init.go:316-336, 433-443).
-    timestamp: Option<i128>,
-}
-
-/// Go's encoding/json folds ASCII case; the same fold keeps `accessToken`
-/// and `AccessToken` equivalent on the wire.
-fn folded(key: &str) -> String {
-    key.chars()
-        .map(|ch| match ch {
-            'ſ' => 'S',
-            'K' => 'K',
-            ch => ch.to_ascii_uppercase(),
-        })
-        .collect()
-}
-
-/// The members whose Go types implement `json.Unmarshaler`, captured from the
-/// RAW body text. Go hands `time.Time` and `SecureToken` the still-escaped
-/// bytes of their value, so `"2026-10-31T01:23:45.5Z"` is a decode error
-/// (probed against the pinned oracle); a `serde_json::Value` walk would see
-/// `01:23:45.5` and accept it.
-#[derive(Default)]
-struct RawInitMembers {
-    timestamp: Option<String>,
-    access_token: Option<String>,
-}
-
-impl<'de> serde::Deserialize<'de> for RawInitMembers {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct RawVisitor;
-        impl<'de> serde::de::Visitor<'de> for RawVisitor {
-            type Value = RawInitMembers;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an init object")
-            }
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> Result<Self::Value, M::Error> {
-                let mut raw = RawInitMembers::default();
-                while let Some(key) = map.next_key::<String>()? {
-                    match folded(&key).as_str() {
-                        "TIMESTAMP" => {
-                            raw.timestamp = Some(map.next_value::<&RawValue>()?.get().to_owned());
-                        }
-                        "ACCESSTOKEN" => {
-                            raw.access_token =
-                                Some(map.next_value::<&RawValue>()?.get().to_owned());
-                        }
-                        _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(raw)
-            }
-        }
-        deserializer.deserialize_map(RawVisitor)
-    }
-}
-
-/// Go `SecureToken.UnmarshalJSON`: a JSON string with no escape sequences and
-/// no empty token; null is the nil pointer.
-fn parse_token(raw: Option<&str>) -> Result<Option<Zeroizing<String>>, String> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    if raw == "null" {
-        return Ok(None);
-    }
-    let token = raw
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .ok_or_else(|| "invalid secure token JSON string".to_owned())?;
-    if token.is_empty() {
-        return Err("empty token not allowed".to_owned());
-    }
-    if token.contains('\\') {
-        return Err("invalid secure token: unexpected escape sequence".to_owned());
-    }
-    Ok(Some(Zeroizing::new(token.to_owned())))
-}
-
-/// Go `time.Time.UnmarshalJSON`: a quoted RFC3339 string, parsed from its raw
-/// (still-escaped) bytes; null is the nil pointer.
-fn decode_timestamp(raw: Option<&str>) -> Result<Option<i128>, String> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    if raw == "null" {
-        return Ok(None);
-    }
-    if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
-        return Err("invalid timestamp JSON string".to_owned());
-    }
-    crate::clock::rfc3339_nanos(&raw[1..raw.len() - 1])
-        .map(Some)
-        .ok_or_else(|| "invalid RFC3339 timestamp".to_owned())
-}
-
-/// Go api.gen.go:245-252 `VolumeMount`: two non-omitempty strings a null
-/// decodes to the zero value; a wrong JSON type fails the whole-body decode.
-/// The mount is not used on Windows, but Go decodes the whole body before the
-/// handler runs, so a body it rejects must be a 400 here too.
-fn check_volume_mounts(value: &Value) -> Result<(), String> {
-    let Value::Array(items) = value else {
-        return match value {
-            Value::Null => Ok(()),
-            _ => Err("volumeMounts must be an array".to_owned()),
-        };
-    };
-    for item in items {
-        let Value::Object(fields) = item else {
-            if item.is_null() {
-                continue;
-            }
-            return Err("volumeMounts elements must be objects".to_owned());
-        };
-        for (key, value) in fields {
-            if matches!(folded(key).as_str(), "NFS_TARGET" | "PATH")
-                && !matches!(value, Value::Null | Value::String(_))
-            {
-                return Err("volumeMounts field must be a string".to_owned());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Go `*string` fields: absent, null and string decode; anything else fails.
-fn check_optional_string(value: &Value) -> Result<(), String> {
-    match value {
-        Value::Null | Value::String(_) => Ok(()),
-        _ => Err("field must be a string".to_owned()),
-    }
-}
-
-fn decode_init(body: &[u8]) -> Result<InitRequest, String> {
-    if body.is_empty() {
-        return Ok(InitRequest::default());
-    }
-    let value: Value = serde_json::from_slice(body).map_err(|_| "invalid JSON".to_owned())?;
-    let Value::Object(map) = value else {
-        // Go's decoder maps a literal null body to the zero struct.
-        return match value {
-            Value::Null => Ok(InitRequest::default()),
-            _ => Err("init body must be an object or null".to_owned()),
-        };
-    };
-    let raw: RawInitMembers =
-        serde_json::from_slice(body).map_err(|_| "invalid JSON".to_owned())?;
-    let mut init = InitRequest::default();
-    for (key, value) in map {
-        match folded(&key).as_str() {
-            // Decoded from the raw body above; see RawInitMembers.
-            "ACCESSTOKEN" | "TIMESTAMP" => {}
-            "ENVVARS" => match value {
-                Value::Null => init.env_vars = None,
-                Value::Object(values) => {
-                    let mut envs = BTreeMap::new();
-                    for (name, value) in values {
-                        let Value::String(value) = value else {
-                            return Err("envVars values must be strings".to_owned());
-                        };
-                        envs.insert(name, value);
-                    }
-                    init.env_vars = Some(envs);
-                }
-                _ => return Err("envVars must be an object".to_owned()),
-            },
-            "DEFAULTUSER" => match value {
-                Value::Null => init.default_user = None,
-                Value::String(user) => init.default_user = Some(user),
-                _ => return Err("defaultUser must be a string".to_owned()),
-            },
-            "DEFAULTWORKDIR" => match value {
-                Value::Null => init.default_workdir = None,
-                Value::String(workdir) => init.default_workdir = Some(workdir),
-                _ => return Err("defaultWorkdir must be a string".to_owned()),
-            },
-            // Go api.gen.go decodes any string; only "skip" withholds the
-            // thaw, while inline/unknown values thaw (init.go:695-697).
-            "THAW" => match value {
-                Value::Null => init.thaw = None,
-                Value::String(thaw) => init.thaw = Some(thaw),
-                _ => return Err("thaw must be a string".to_owned()),
-            },
-            // Go-typed fields with Linux-only effects: validated the way Go
-            // validates them, then ignored.
-            "CABUNDLE" | "HYPERLOOPIP" | "LIFECYCLEID" => check_optional_string(&value)?,
-            "CPUCOUNT" => match value {
-                Value::Null => {}
-                Value::Number(number) if number.as_i64().is_some() => {}
-                _ => return Err("cpuCount must be an integer".to_owned()),
-            },
-            "VOLUMEMOUNTS" => check_volume_mounts(&value)?,
-            _ => {}
-        }
-    }
-    init.access_token = parse_token(raw.access_token.as_deref())?;
-    init.timestamp = decode_timestamp(raw.timestamp.as_deref())?;
-    Ok(init)
-}
-
+/// `/init` bodies are decoded by [`crate::init_payload`], the same code the
+/// Linux daemon runs, so a body the oracle rejects is a 400 on both targets
+/// even for fields whose effect is Linux-only.
 async fn init(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
     let mut response = apply_init(daemon.clone(), request).await;
     // Go store.go:119-133 and init.go:211-218: the handover outcome rides
@@ -762,7 +542,7 @@ async fn apply_init(daemon: Arc<Daemon>, request: Request<Body>) -> Response {
     // the Linux generation guard. Taken under the freeze lock so an accepted
     // freeze that has not bumped the counter yet is waited out.
     let freeze_generation = daemon.resource.generation().await;
-    let body = match to_bytes(request.into_body(), 32 << 20).await {
+    let body = match crate::init_payload::collect_body(request.into_body()).await {
         Ok(body) => body,
         Err(_) => return (StatusCode::BAD_REQUEST, "failed to read request body").into_response(),
     };
@@ -770,7 +550,7 @@ async fn apply_init(daemon: Arc<Daemon>, request: Request<Body>) -> Response {
     // from the end of the body read, so the reading is taken now, before the
     // body is decoded.
     let body_read = (daemon.now)();
-    let payload = match decode_init(&body) {
+    let payload = match crate::init_payload::decode(&body) {
         Ok(payload) => payload,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };

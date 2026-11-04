@@ -1,6 +1,5 @@
 //! HTTP surface and `/init` effects. NFS volume mounts are implemented with
 //! oracle parity through the [`nfs`] module; every SetData effect is live.
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,11 +11,11 @@ use axum::{
     routing::any,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, value::RawValue};
+use serde::Serialize;
+use serde_json::json;
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
 
+use crate::init_payload::InitRequest;
 use crate::{
     configuration::Configuration,
     exec_context::Defaults,
@@ -931,165 +930,6 @@ struct FreezeAuditWire {
     truncated: bool,
 }
 
-#[derive(Default)]
-struct InitRequest {
-    access_token: Option<Zeroizing<String>>,
-    env_vars: Option<BTreeMap<String, String>>,
-    hyperloop_ip: Option<String>,
-    default_user: Option<String>,
-    default_workdir: Option<String>,
-    cpu_count: Option<i64>,
-    // Go api.gen.go:386: *time.Time json:"timestamp,omitempty", decoded as
-    // RFC3339 into nanoseconds since the epoch at full precision.
-    timestamp: Option<i128>,
-    // Go api.gen.go:362: *string json:"caBundle,omitempty"; "" behaves as nil
-    // at the init.go:474 gate.
-    ca_bundle: Option<String>,
-    // Go api.gen.go:383: *PostInitJSONBodyThaw json:"thaw,omitempty" with the
-    // enum values "inline"/"skip" (api.gen.go:68-79). Go decodes any string;
-    // only "skip" withholds the thaw (init.go:695-697).
-    thaw: Option<String>,
-    // Go api.gen.go:380: *string json:"lifecycleID,omitempty"; nil behaves as
-    // "" everywhere the ledger and the failure memo read it (init.go:797,
-    // :1009-1015 derefString).
-    lifecycle_id: Option<String>,
-    // Go api.gen.go:387: *[]VolumeMount json:"volumeMounts,omitempty".
-    // Absent and JSON null decode to None (the nil pointer that skips
-    // setupNFS, init.go:480); an empty slice is Some(vec![]) — setupNFS still
-    // runs for it, including the memoized-failure short-circuit; any other
-    // JSON type fails the whole-body decode as 400.
-    volume_mounts: Option<Vec<nfs::VolumeMount>>,
-}
-
-// Go encoding/json folds ASCII case plus Unicode simple-fold equivalents.
-// For these ASCII field names, only long-s and Kelvin sign add equivalents.
-use crate::compose_decode::folded_field;
-
-impl<'de> Deserialize<'de> for InitRequest {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct InitVisitor;
-        impl<'de> serde::de::Visitor<'de> for InitVisitor {
-            type Value = InitRequest;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an init object or null")
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(InitRequest::default())
-            }
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> Result<Self::Value, M::Error> {
-                let mut init = InitRequest::default();
-                while let Some(key) = map.next_key::<String>()? {
-                    match folded_field(&key).as_str() {
-                        "ACCESSTOKEN" => {
-                            let raw = map.next_value::<&RawValue>()?;
-                            init.access_token =
-                                parse_token(Some(raw)).map_err(serde::de::Error::custom)?;
-                        }
-                        "ENVVARS" => match map.next_value::<Option<BTreeMap<String, String>>>()? {
-                            Some(values) => init
-                                .env_vars
-                                .get_or_insert_with(BTreeMap::new)
-                                .extend(values),
-                            None => init.env_vars = None,
-                        },
-                        "DEFAULTUSER" => init.default_user = map.next_value()?,
-                        "DEFAULTWORKDIR" => init.default_workdir = map.next_value()?,
-                        "CPUCOUNT" => {
-                            let raw = map.next_value::<&RawValue>()?;
-                            init.cpu_count = if raw.get() == "null" {
-                                None
-                            } else {
-                                Some(raw.get().parse::<i64>().map_err(serde::de::Error::custom)?)
-                            };
-                        }
-                        // Go api.gen.go:376: *string json:"hyperloopIP,omitempty"
-                        "HYPERLOOPIP" => init.hyperloop_ip = map.next_value()?,
-                        // Go api.gen.go:386: *time.Time json:"timestamp,omitempty"
-                        "TIMESTAMP" => {
-                            let raw = map.next_value::<&RawValue>()?;
-                            init.timestamp =
-                                decode_timestamp(raw).map_err(serde::de::Error::custom)?;
-                        }
-                        // Go api.gen.go:362: *string json:"caBundle,omitempty".
-                        // Any other JSON type is a decode error failing the
-                        // whole /init as a 400.
-                        "CABUNDLE" => init.ca_bundle = map.next_value::<Option<String>>()?,
-                        // Go api.gen.go:383: any non-string JSON value is a
-                        // decode error failing the whole /init as a 400.
-                        "THAW" => init.thaw = map.next_value::<Option<String>>()?,
-                        // Go api.gen.go:380: *string json:"lifecycleID";
-                        // null/absent is the nil pointer, any other JSON type
-                        // a decode error.
-                        "LIFECYCLEID" => init.lifecycle_id = map.next_value::<Option<String>>()?,
-                        // Go api.gen.go:387 decodes VolumeMounts as
-                        // *[]VolumeMount: absent/null is None (init.go:480
-                        // treats it as absent), [] is Some(vec![]) and still
-                        // runs setupNFS (init.go:796-864), a null ELEMENT is
-                        // the zero VolumeMount, and any other JSON type fails
-                        // the whole-body decode as 400.
-                        "VOLUMEMOUNTS" => {
-                            init.volume_mounts =
-                                map.next_value::<Option<Vec<nfs::VolumeMount>>>()?;
-                        }
-                        _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(init)
-            }
-        }
-        deserializer.deserialize_any(InitVisitor)
-    }
-}
-
-/// Go api.gen.go:386 decodes `timestamp` as *time.Time: a JSON string holding
-/// RFC3339, `null` meaning absent, any other JSON type a decode error (which
-/// fails the whole /init as a 400).
-fn decode_timestamp(raw: &RawValue) -> Result<Option<i128>, &'static str> {
-    let text = raw.get();
-    if text == "null" {
-        return Ok(None);
-    }
-    // Go's encoding/json hands a json.Unmarshaler the RAW bytes of the value,
-    // so time.Time.UnmarshalJSON parses the still-escaped text: escape
-    // sequences are NOT decoded first, and any backslash fails the RFC3339
-    // parse (probed against the pinned oracle in a real guest: an escaped
-    // timestamp answers 400, while an unescaped fraction separator is still
-    // accepted). A non-string value fails the same way Go's quoted-string
-    // guard does.
-    if text.len() < 2 || !text.starts_with('"') || !text.ends_with('"') {
-        return Err("invalid timestamp JSON string");
-    }
-    crate::clock::rfc3339_nanos(&text[1..text.len() - 1])
-        .map(Some)
-        .ok_or("invalid RFC3339 timestamp")
-}
-
-fn parse_token(raw: Option<&RawValue>) -> Result<Option<Zeroizing<String>>, &'static str> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let raw = raw.get();
-    if raw == "null" {
-        return Ok(None);
-    }
-    if !raw.starts_with('"') || !raw.ends_with('"') {
-        return Err("invalid secure token JSON string");
-    }
-    let token = &raw[1..raw.len() - 1];
-    if token.is_empty() {
-        return Err("empty token not allowed");
-    }
-    if token.contains('\\') {
-        return Err("invalid secure token: unexpected escape sequence");
-    }
-    Ok(Some(Zeroizing::new(token.to_owned())))
-}
-
 async fn init(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
     // Go runs a handler to completion even when its client leaves; the request
     // context is what notices (ctx.Err()), cancelling the ctx-aware waits —
@@ -1149,33 +989,6 @@ async fn init(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Resp
     response
 }
 
-async fn collect_init_body(body: Body) -> Result<Zeroizing<Vec<u8>>, axum::Error> {
-    use futures_util::StreamExt;
-    let mut stream = body.into_data_stream();
-    let mut chunks = Vec::new();
-    let mut length = 0usize;
-    while let Some(chunk) = stream.next().await {
-        // Consume Bytes into its Vec rather than copy then free its allocation.
-        // Unique transport allocations transfer directly; externally shared/static
-        // Bytes necessarily copy, and their other owners retain responsibility.
-        let chunk = Zeroizing::new(Vec::<u8>::from(chunk?));
-        length = length
-            .checked_add(chunk.len())
-            .ok_or_else(|| axum::Error::new(std::io::Error::other("init body length overflow")))?;
-        chunks.push(chunk);
-    }
-    if chunks.len() == 1 {
-        return Ok(chunks.remove(0));
-    }
-    // Allocate once so growing a Vec never releases an unwiped partial body.
-    // Every consumed chunk is wiped when dropped, including on read errors and cancellation.
-    let mut body = Zeroizing::new(Vec::with_capacity(length));
-    for chunk in chunks {
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
 async fn apply_init(
     daemon: Arc<Daemon>,
     request: Request<Body>,
@@ -1187,7 +1000,7 @@ async fn apply_init(
     // waits on either, has voided it. Under Expect: 100-continue the body
     // goes out only at the first body read, after this read.
     let freeze_generation = daemon.freezer.freeze_generation().await;
-    let body = match collect_init_body(request.into_body()).await {
+    let body = match crate::init_payload::collect_body(request.into_body()).await {
         Ok(bytes) => bytes,
         Err(_) => return (StatusCode::BAD_REQUEST, "failed to read request body").into_response(),
     };
@@ -1195,13 +1008,11 @@ async fn apply_init(
     // from the end of the body read, so the reading is taken now, before the
     // body is decoded.
     let body_read = (daemon.now)();
-    let payload: InitRequest = if body.is_empty() {
-        InitRequest::default()
-    } else {
-        match serde_json::from_slice(&body) {
-            Ok(payload) => payload,
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-        }
+    // The body decoder is shared with the Windows daemon so both targets
+    // accept and reject exactly the bodies the oracle does.
+    let payload: InitRequest = match crate::init_payload::decode(&body) {
+        Ok(payload) => payload,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let token = payload.access_token;
     let init_guard = daemon.init_lock.clone().lock_owned().await;
@@ -1681,7 +1492,7 @@ mod body_tests {
             Ok::<_, std::io::Error>(Bytes::from(br#"{"accessToken":"sensitive"#.to_vec())),
             Ok(Bytes::from(br#"-token"}"#.to_vec())),
         ]));
-        let protected = collect_init_body(body).await.unwrap();
+        let protected = crate::init_payload::collect_body(body).await.unwrap();
         assert_eq!(
             protected.as_slice(),
             br#"{"accessToken":"sensitive-token"}"#
@@ -1690,14 +1501,17 @@ mod body_tests {
             Ok(Bytes::from(b"partial-secret".to_vec())),
             Err(std::io::Error::other("read interrupted")),
         ]));
-        assert!(collect_init_body(body).await.is_err());
+        assert!(crate::init_payload::collect_body(body).await.is_err());
     }
 
     #[tokio::test]
     async fn init_body_takes_ownership_of_the_original_allocation() {
         let original = br#"{"accessToken":"sensitive-original-buffer"}"#.to_vec();
         let original_pointer = original.as_ptr();
-        let protected: Zeroizing<Vec<u8>> = collect_init_body(Body::from(original)).await.unwrap();
+        let protected: zeroize::Zeroizing<Vec<u8>> =
+            crate::init_payload::collect_body(Body::from(original))
+                .await
+                .unwrap();
         assert_eq!(protected.as_ptr(), original_pointer);
         assert!(protected.windows(9).any(|bytes| bytes == b"sensitive"));
     }

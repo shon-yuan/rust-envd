@@ -70,65 +70,10 @@ const GO_WAIT_DELAY_TEXT: &str = "exec: WaitDelay expired before I/O complete";
 /// (os/exec Wait: the context error is returned unless the exit is non-zero).
 const GO_DEADLINE_EXCEEDED_TEXT: &str = "context deadline exceeded";
 
-/// Oracle api.gen.go:245-252 VolumeMount: two plain non-omitempty strings.
-/// Go decodes JSON null for a string field as its zero value and a null ARRAY
-/// element as the zero struct, both without error; a wrong JSON type fails
-/// the whole-body decode. Field names fold ASCII case like encoding/json.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct VolumeMount {
-    pub nfs_target: String,
-    pub path: String,
-}
-
-impl<'de> serde::Deserialize<'de> for VolumeMount {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct VolumeMountVisitor;
-        impl<'de> serde::de::Visitor<'de> for VolumeMountVisitor {
-            type Value = VolumeMount;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a volume mount object or null")
-            }
-            // A null array element decodes as the zero struct, like Go.
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(VolumeMount::default())
-            }
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> Result<Self::Value, M::Error> {
-                let mut mount = VolumeMount::default();
-                while let Some(key) = map.next_key::<String>()? {
-                    match folded_field(&key).as_str() {
-                        "NFS_TARGET" => {
-                            mount.nfs_target =
-                                map.next_value::<Option<String>>()?.unwrap_or_default();
-                        }
-                        "PATH" => {
-                            mount.path = map.next_value::<Option<String>>()?.unwrap_or_default();
-                        }
-                        _ => {
-                            map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(mount)
-            }
-        }
-        deserializer.deserialize_any(VolumeMountVisitor)
-    }
-}
-
-/// Go encoding/json folds ASCII case (plus the Unicode simple folds the
-/// daemon's other decoded fields already share).
-fn folded_field(key: &str) -> String {
-    key.chars()
-        .map(|ch| match ch {
-            'ſ' => 'S',
-            'K' => 'K',
-            ch => ch.to_ascii_uppercase(),
-        })
-        .collect()
-}
+/// The init body's mount entry, shared with the Windows daemon's decoder. It
+/// lives in [`crate::init_payload`] so both targets decode the whole body with
+/// one implementation; NFS setup here is its only consumer.
+pub use crate::init_payload::VolumeMount;
 
 /// One result of a `mount`/`mkdir` exec, the shape CombinedOutput hands the
 /// oracle: an error text (already Go-shaped and exec-wrapped) plus whether

@@ -5,6 +5,7 @@ use super::*;
 use crate::platform::windows::metadata::StaticMetadata;
 use crate::platform::windows::registry::{WorkloadClass, WorkloadRegistry};
 use crate::platform::windows::resource::WindowsResourceBackend;
+use axum::body::to_bytes;
 use axum::http::{HeaderMap, Method};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use http_body_util::{BodyExt, Full};

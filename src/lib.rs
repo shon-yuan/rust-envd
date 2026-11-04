@@ -30,6 +30,7 @@ pub mod guest;
 pub mod http;
 pub mod http1;
 pub mod hyperloop;
+pub mod init_payload;
 pub mod logs;
 pub mod memory_protection;
 pub mod metrics;
