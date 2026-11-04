@@ -70,7 +70,8 @@ cannot live inside the envd daemon binary. On Linux the X11 crates resolve
 `libX11` through `pkg-config` at build time, so the static musl guest build
 would break; on Windows the daemon runs as an SCM service in session 0 and
 cannot drive the interactive desktop. The worker is therefore a separate
-`coorworker-cua` binary that rust-envd starts and supervises.
+`coorworker-cua` binary that rust-envd starts and supervises, or — when the
+worker has to live in another session — adopts and probes.
 
 ```text
 guest / host
@@ -103,6 +104,20 @@ exponential backoff (0.5 s doubling to 30 s; a worker that stayed up for
 accepts on its loopback port. A worker that never comes up does not fail the
 daemon: S0 keeps serving and the extension stays visible as unhealthy with
 the reason in `detail`.
+
+### Adopted workers
+
+With `COORWORKER_CUA_EXTERNAL` set, envd does not spawn the worker; it
+**adopts** the one listening at `COORWORKER_CUA_LISTEN`. The probe runs at
+startup and every 2 s: `GET /health` must answer `204` within 2 s, so a
+process that still accepts but no longer serves is not reported healthy.
+`/cua/health`, `/cua/info`, `/cua/metrics` and the optional proxy behave
+exactly as in spawn mode; a worker that disappears turns the extension
+unhealthy with the connection error in `detail`, and one that comes back is
+picked up again. `restarts` stays `0` in this mode: envd never replaces a
+process it does not own, and `coorworker_envd_cua_worker_restarts_total`
+must not be read as a restart count for it. `COORWORKER_CUA_EXTERNAL` wins
+when both variables are set.
 
 `/cua/metrics` exposes Prometheus text with `coorworker_envd_cua_worker_up`
 (1/0) and `coorworker_envd_cua_worker_restarts_total`. It is extension-owned
@@ -153,6 +168,7 @@ this worker.
 | --- | --- |
 | `COORWORKER_CUA_BIN` | Path to the worker binary. Unset disables the extension. |
 | `COORWORKER_CUA_LISTEN` | Worker listen address; default `127.0.0.1:3211`. |
+| `COORWORKER_CUA_EXTERNAL` | Non-empty and not `0`/`false`: adopt the worker at `COORWORKER_CUA_LISTEN` instead of spawning one. Wins over `COORWORKER_CUA_BIN`. |
 | `COORWORKER_CUA_PROXY_TOKEN` | Enables `POST /cua/mcp` and is the bearer token callers present. Empty means disabled. |
 | `--listen` | Worker flag for the same address (the extension passes it). |
 | `--token-file` / `CUA_ENV_TOKEN` | Bearer token for `/mcp`. Accepted as `Authorization: Bearer …` or `X-Cua-Env-Authorization`. When set in envd's environment the worker inherits it and the proxy injects it on forwards. |
@@ -174,10 +190,23 @@ Set `DISPLAY` for the worker on Linux; it needs a running X server.
 
 ### Windows
 
-The extension is disabled in SCM service mode with a log line, because a
-session-0 service cannot reach the interactive desktop. Running the worker
-next to the logged-in user is the supported shape; a service-to-session
-bridge is separate work.
+A session-0 service cannot drive the interactive desktop, so the service
+must not spawn the worker. It can still serve the `cua` surface by adopting
+one the user session started:
+
+1. Start `coorworker-cua --listen 127.0.0.1:3211` in the logged-in session
+   (for example a logon scheduled task, or the same command in the user's
+   startup folder).
+2. Start envd as the SCM service with `COORWORKER_CUA_EXTERNAL=1` and, if the
+   worker uses one, `CUA_ENV_TOKEN` set to the same token. Loopback is shared
+   between sessions, so the service reaches the worker without a second port.
+
+envd then probes the worker every 2 s and reports `/cua/health`,
+`/cua/info`, `/cua/metrics` and the optional proxy as usual. A service
+started with only `COORWORKER_CUA_BIN` still refuses the extension with a log
+line, and the log now names `COORWORKER_CUA_EXTERNAL`. This is adoption, not
+a `CreateProcessAsUser` bridge: envd does not start the worker in the user's
+session, so the deployment must.
 
 CI builds the worker with the MSVC toolchain and runs its contract tests on
 `windows-latest`, so the Windows code path compiles and serves MCP. Those
@@ -200,14 +229,15 @@ SPDX texts in `scripts/license-overrides/`.
 ### Evidence
 
 - Worker contract tests: 9 passed (`cua-worker/`, `cargo test --lib --bins`).
-- rust-envd suite: 853 passed (24 ignored by features), including
+- rust-envd suite: 856 passed (24 ignored by features), including
   `tests/extensions.rs` (no-shadow, merge over the Connect fallback,
   empty-set identity) and the supervisor/proxy tests in `src/ext/cua.rs`
-  (13 in that module: health and failure reporting, restart count and
+  (16 in that module: health and failure reporting, restart count and
   replacement after exit, backoff bounds, Prometheus exposition, route
   absent without a token, 401 for missing/wrong tokens, forwarding with
   worker-token injection and status pass-through, 502 unreachable, 503 dead
-  worker, discovery fields).
+  worker, discovery fields, launch resolution, adopted-worker probing and
+  recovery).
 - Supervision: a child that exits is replaced within the first backoff step
   and reported healthy once the replacement is installed
   (`supervisor_replaces_a_worker_that_exits`, with a fake relauncher so no
@@ -217,6 +247,18 @@ SPDX texts in `scripts/license-overrides/`.
   `..._restarts_total 0`. After `kill -9` it reported `..._worker_up 0` with
   `..._restarts_total 1`, then `..._worker_up 1` again with a new worker
   PID. S2 `/metrics` still returned the oracle's JSON document unchanged.
+- Adoption run (Xvfb `:98`, worker started by hand on `3212`, envd dev on
+  `49987` with `COORWORKER_CUA_EXTERNAL=1` and a proxy token, no
+  `COORWORKER_CUA_BIN`): `/cua/health` reported healthy with `restarts 0`,
+  `/cua/info` published `proxy_path`/`proxy_auth`, `/cua/metrics` reported
+  `worker_up 1`, and the envd process had no children — it did not spawn a
+  worker. `POST /cua/mcp` without the token returned `401`; with it,
+  `initialize` and `tools/list` (63 tools) went through. `kill -9` on the
+  worker turned `/cua/health` into `503` with the connection error in
+  `detail` and `worker_up 0` while S0 `/health` stayed `204`; envd did not
+  restart it. Starting the worker again returned the extension to healthy
+  with `worker_up 1`, still `restarts_total 0`. Verification processes and
+  the temporary directory were removed.
 - End-to-end run on Xvfb `:99` (before supervision existed, M5): daemon →
   spawned worker → `/cua/health` `200`; MCP `initialize` (`cua-driver
   0.38.0`), `tools/list` (63 tools), `tools/call get_desktop_state` returned

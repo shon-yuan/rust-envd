@@ -13,6 +13,12 @@
 //! supervisor replaces a worker that exits (exponential backoff, reset after a
 //! stable run). A worker that fails to start leaves the extension unhealthy
 //! and visible, and never affects the envd surface.
+//!
+//! With `COORWORKER_CUA_EXTERNAL` the extension instead **adopts** a worker it
+//! does not own: it probes `GET /health` on the same address and reports the
+//! result, but never spawns, kills or restarts it. This is the Windows service
+//! shape — the worker belongs to the logged-in session, envd stays in session
+//! 0 — and it also fits any deployment that starts the worker itself.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -46,6 +52,11 @@ const READY_POLL: Duration = Duration::from_millis(50);
 const RESTART_BASE: Duration = Duration::from_millis(500);
 const RESTART_MAX: Duration = Duration::from_secs(30);
 const STABLE_AFTER: Duration = Duration::from_secs(60);
+/// How often an adopted worker is probed. The worker answers `/health`
+/// without touching the desktop, so two seconds is cheap and keeps a
+/// `/cua/health` caller from reading a stale state for long.
+const PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The path the optional proxy adds under the extension prefix.
 const PROXY_PATH: &str = "/mcp";
@@ -109,7 +120,29 @@ struct CuaState {
     worker_token: Option<Vec<u8>>,
 }
 
-/// Supervises one `coorworker-cua` process.
+/// How the extension gets its worker.
+enum Launch {
+    /// envd owns the process and replaces it when it exits.
+    Spawn(PathBuf),
+    /// A worker started elsewhere is adopted; envd only probes it.
+    External,
+}
+
+/// `COORWORKER_CUA_EXTERNAL` selects adoption and wins when both variables are
+/// set — a mode switch, not a second wire. Spawning is refused outright when
+/// `allow_spawn` is false (SCM service mode): a process started from session 0
+/// has no interactive desktop to drive.
+fn resolve_launch(binary: Option<PathBuf>, external: bool, allow_spawn: bool) -> Option<Launch> {
+    if external {
+        return Some(Launch::External);
+    }
+    match binary {
+        Some(binary) if allow_spawn => Some(Launch::Spawn(binary)),
+        _ => None,
+    }
+}
+
+/// Supervises one `coorworker-cua` process, or watches one it does not own.
 pub struct CuaExtension {
     state: Arc<CuaState>,
 }
@@ -133,7 +166,6 @@ impl CuaExtension {
     }
 
     async fn build(binary: PathBuf, listen: SocketAddr, proxy_token: Option<Vec<u8>>) -> Self {
-        let mcp_url = format!("http://{listen}/mcp");
         // The first launch stays synchronous (and waits for the listener) so a
         // caller that spawns the extension knows whether it came up. After
         // that the supervisor owns the process and replaces it when it exits.
@@ -141,26 +173,13 @@ impl CuaExtension {
             Ok(child) => (WorkerStatus::running(), Some(child), 0),
             Err(error) => (WorkerStatus::stopped(error), None, 1),
         };
-        // An empty token would enable the route with nothing to check against;
-        // treat it as "not configured" instead.
-        let proxy = proxy_token
-            .filter(|token| !token.is_empty())
-            .map(|token| Proxy { token });
-        let worker_token = std::env::var_os("CUA_ENV_TOKEN")
-            .map(|value| value.to_string_lossy().into_owned().into_bytes())
-            .filter(|token| !token.is_empty());
-        let state = Arc::new(CuaState {
-            status: Mutex::new(status),
-            mcp_url,
-            proxy,
-            worker_token,
-        });
-        let status = Arc::clone(&state);
+        let state = shared_state(listen, proxy_token, status);
+        let watched = Arc::clone(&state);
         tokio::spawn(async move {
             supervise(
                 &binary,
                 listen,
-                status,
+                watched,
                 child,
                 attempts,
                 |binary, listen| async move { launch(&binary, listen).await },
@@ -170,10 +189,43 @@ impl CuaExtension {
         Self { state }
     }
 
-    /// `Some` when `COORWORKER_CUA_BIN` is set. The value `None` is the parity
+    /// Adopts a worker envd does not own. The worker is expected to be started
+    /// by the deployment — on Windows, a logon task in the interactive session
+    /// while envd stays in session 0. The probe runs immediately and then every
+    /// [`PROBE_INTERVAL`]; `restarts` stays zero because envd never replaces
+    /// this process.
+    pub async fn adopt(listen: SocketAddr, proxy_token: Option<Vec<u8>>) -> Self {
+        let status = match probe(listen).await {
+            None => WorkerStatus::running(),
+            Some(detail) => WorkerStatus::stopped(detail),
+        };
+        let state = shared_state(listen, proxy_token, status);
+        let watched = Arc::clone(&state);
+        tokio::spawn(async move { watch(listen, watched).await });
+        Self { state }
+    }
+
+    /// `Some` when the worker is configured: `COORWORKER_CUA_BIN` spawns one,
+    /// `COORWORKER_CUA_EXTERNAL` adopts one. The value `None` is the parity
     /// build: no extension, no routes, no child.
     pub async fn from_env() -> Option<Self> {
-        let binary = std::env::var_os("COORWORKER_CUA_BIN")?;
+        Self::from_env_with(true).await
+    }
+
+    /// The service-mode entry point. A process spawned from session 0 cannot
+    /// reach the interactive desktop, so only `COORWORKER_CUA_EXTERNAL` is
+    /// honoured and `COORWORKER_CUA_BIN` alone yields no extension.
+    pub async fn from_env_external_only() -> Option<Self> {
+        Self::from_env_with(false).await
+    }
+
+    async fn from_env_with(allow_spawn: bool) -> Option<Self> {
+        let external = std::env::var_os("COORWORKER_CUA_EXTERNAL").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        });
+        let binary = std::env::var_os("COORWORKER_CUA_BIN").map(PathBuf::from);
+        let launch = resolve_launch(binary, external, allow_spawn)?;
         let listen = match std::env::var("COORWORKER_CUA_LISTEN") {
             Ok(value) => match value.parse() {
                 Ok(listen) => listen,
@@ -187,7 +239,10 @@ impl CuaExtension {
         };
         let proxy_token = std::env::var_os("COORWORKER_CUA_PROXY_TOKEN")
             .map(|value| value.to_string_lossy().into_owned().into_bytes());
-        Some(Self::build(PathBuf::from(binary), listen, proxy_token).await)
+        Some(match launch {
+            Launch::Spawn(binary) => Self::build(binary, listen, proxy_token).await,
+            Launch::External => Self::adopt(listen, proxy_token).await,
+        })
     }
 
     /// An extension that is registered but cannot start. Keeping it visible
@@ -206,6 +261,27 @@ impl CuaExtension {
     pub fn mcp_url(&self) -> &str {
         &self.state.mcp_url
     }
+}
+
+/// The state shared by both modes. An empty proxy token means "not
+/// configured": the route stays absent rather than open with nothing to check.
+fn shared_state(
+    listen: SocketAddr,
+    proxy_token: Option<Vec<u8>>,
+    status: WorkerStatus,
+) -> Arc<CuaState> {
+    let proxy = proxy_token
+        .filter(|token| !token.is_empty())
+        .map(|token| Proxy { token });
+    let worker_token = std::env::var_os("CUA_ENV_TOKEN")
+        .map(|value| value.to_string_lossy().into_owned().into_bytes())
+        .filter(|token| !token.is_empty());
+    Arc::new(CuaState {
+        status: Mutex::new(status),
+        mcp_url: format!("http://{listen}/mcp"),
+        proxy,
+        worker_token,
+    })
 }
 
 async fn launch(binary: &Path, listen: SocketAddr) -> Result<Child, String> {
@@ -235,6 +311,64 @@ async fn launch(binary: &Path, listen: SocketAddr) -> Result<Child, String> {
             }
         }
     }
+}
+
+/// Watches an adopted worker. Only the snapshot changes; the worker's process
+/// belongs to someone else, so there is nothing here to restart.
+async fn watch(listen: SocketAddr, state: Arc<CuaState>) {
+    loop {
+        tokio::time::sleep(PROBE_INTERVAL).await;
+        let detail = probe(listen).await;
+        update(&state.status, |status| match &detail {
+            None => {
+                status.running = true;
+                status.detail = None;
+            }
+            Some(detail) => {
+                status.running = false;
+                status.detail = Some(detail.clone());
+            }
+        });
+    }
+}
+
+/// `None` when the worker answers `GET /health` with `204`; otherwise the
+/// reason. An adopted worker is judged by the same contract a caller sees, so
+/// a port that accepts but no longer serves is not reported healthy.
+async fn probe(listen: SocketAddr) -> Option<String> {
+    match tokio::time::timeout(PROBE_TIMEOUT, probe_once(listen)).await {
+        Ok(Ok(())) => None,
+        Ok(Err(detail)) => Some(detail),
+        Err(_) => Some(format!(
+            "cua worker at {listen} did not answer in {} ms",
+            PROBE_TIMEOUT.as_millis()
+        )),
+    }
+}
+
+async fn probe_once(listen: SocketAddr) -> Result<(), String> {
+    let stream = tokio::net::TcpStream::connect(listen)
+        .await
+        .map_err(|error| format!("cua worker unreachable at {listen}: {error}"))?;
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|error| format!("cua worker handshake at {listen}: {error}"))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = hyper::Request::builder()
+        .method("GET")
+        .uri(format!("http://{listen}/health"))
+        .body(Full::new(Bytes::new()))
+        .map_err(|error| format!("cannot build the worker probe: {error}"))?;
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|error| format!("cua worker probe failed at {listen}: {error}"))?;
+    if response.status() != StatusCode::NO_CONTENT {
+        return Err(format!("cua worker /health answered {}", response.status()));
+    }
+    Ok(())
 }
 
 /// Owns the worker process for the life of the daemon and replaces it when it
@@ -630,6 +764,81 @@ mod tests {
         assert_eq!(backoff(6), Duration::from_secs(16));
         assert_eq!(backoff(7), Duration::from_secs(30));
         assert_eq!(backoff(1_000), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn external_mode_wins_and_service_mode_never_spawns() {
+        let binary = Some(PathBuf::from("/opt/coorworker-cua"));
+        assert!(matches!(
+            resolve_launch(binary.clone(), true, true),
+            Some(Launch::External)
+        ));
+        assert!(matches!(
+            resolve_launch(binary.clone(), true, false),
+            Some(Launch::External)
+        ));
+        assert!(matches!(
+            resolve_launch(binary.clone(), false, true),
+            Some(Launch::Spawn(_))
+        ));
+        assert!(resolve_launch(binary, false, false).is_none());
+        assert!(resolve_launch(None, false, true).is_none());
+        assert!(matches!(
+            resolve_launch(None, true, false),
+            Some(Launch::External)
+        ));
+    }
+
+    /// A stand-in for `coorworker-cua`: answers `GET /health` with `status`.
+    async fn worker_stub(listen: SocketAddr, status: StatusCode) -> tokio::task::JoinHandle<()> {
+        let app = Router::new().route("/health", get(move || async move { status }));
+        let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        })
+    }
+
+    #[tokio::test]
+    async fn an_adopted_worker_is_probed_and_reported() {
+        let listen = free_listen();
+        let extension = CuaExtension::adopt(listen, None).await;
+        let health = extension.health();
+        assert_eq!(health.state, crate::ext::HealthState::Unhealthy);
+        assert!(health.detail.contains("unreachable"), "{}", health.detail);
+
+        // A worker that appears after adoption is picked up by the probe loop
+        // and reported through the same routes a caller uses.
+        let stub = worker_stub(listen, StatusCode::NO_CONTENT).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && extension.health() != Health::healthy() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(extension.health(), Health::healthy());
+
+        let router = Extensions::new(vec![Arc::new(extension)])
+            .unwrap()
+            .mount(Router::new());
+        let response = router
+            .oneshot(Request::get("/cua/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["restarts"], 0, "envd never restarts an adopted worker");
+        stub.abort();
+    }
+
+    #[tokio::test]
+    async fn an_adopted_worker_that_stops_serving_is_unhealthy() {
+        let listen = free_listen();
+        let stub = worker_stub(listen, StatusCode::SERVICE_UNAVAILABLE).await;
+        let extension = CuaExtension::adopt(listen, None).await;
+        let health = extension.health();
+        assert_eq!(health.state, crate::ext::HealthState::Unhealthy);
+        assert!(health.detail.contains("503"), "{}", health.detail);
+        stub.abort();
     }
 
     #[tokio::test]

@@ -87,7 +87,9 @@ extension registered has exactly the same router as the parity daemon.
 The seam is shipped (`src/ext/mod.rs`, `tests/extensions.rs`). The first
 extension is `cua`: a computer-use MCP surface (`/cua/...`, `POST /mcp`)
 served by the separate `coorworker-cua` worker, which rust-envd starts and
-supervises when `COORWORKER_CUA_BIN` is set. When
+supervises when `COORWORKER_CUA_BIN` is set, or adopts and probes when
+`COORWORKER_CUA_EXTERNAL` is set (the Windows service shape, where the worker
+belongs to the interactive session). When
 `COORWORKER_CUA_PROXY_TOKEN` is set as well, envd also mounts `POST /cua/mcp`
 and forwards to the loopback worker, so a remote caller needs no second port.
 The worker is a separate binary

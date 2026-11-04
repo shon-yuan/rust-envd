@@ -325,28 +325,32 @@ async fn serve(
         }
     }
     // A Windows service runs in session 0 and cannot inject into the
-    // interactive desktop; the cua worker must be started from the user's
-    // session until the session bridge (M4) exists. Refuse to pretend.
-    let extensions = if service.is_some() {
-        if std::env::var_os("COORWORKER_CUA_BIN").is_some() {
+    // interactive desktop, so it must not spawn the cua worker. It can still
+    // adopt one the logged-in session started: loopback is shared, and the
+    // extension only probes and proxies.
+    let cua = if service.is_some() {
+        let extension = crate::ext::cua::CuaExtension::from_env_external_only().await;
+        if extension.is_none() && std::env::var_os("COORWORKER_CUA_BIN").is_some() {
             eprintln!(
-                "cua extension disabled in service mode: the worker needs an interactive \
-                 desktop session"
+                "cua extension disabled in service mode: spawning the worker from session 0 \
+                 cannot reach the interactive desktop; set COORWORKER_CUA_EXTERNAL and start \
+                 the worker in the logged-in session"
             );
         }
-        crate::ext::Extensions::empty()
+        extension
     } else {
-        match crate::ext::cua::CuaExtension::from_env().await {
-            Some(extension) => {
-                let extension: std::sync::Arc<dyn crate::ext::Extension> =
-                    std::sync::Arc::new(extension);
-                crate::ext::Extensions::new(vec![extension]).unwrap_or_else(|error| {
-                    eprintln!("cua extension disabled: {error}");
-                    crate::ext::Extensions::empty()
-                })
-            }
-            None => crate::ext::Extensions::empty(),
+        crate::ext::cua::CuaExtension::from_env().await
+    };
+    let extensions = match cua {
+        Some(extension) => {
+            let extension: std::sync::Arc<dyn crate::ext::Extension> =
+                std::sync::Arc::new(extension);
+            crate::ext::Extensions::new(vec![extension]).unwrap_or_else(|error| {
+                eprintln!("cua extension disabled: {error}");
+                crate::ext::Extensions::empty()
+            })
         }
+        None => crate::ext::Extensions::empty(),
     };
     let app = match &runtime {
         Some(runtime) => {
