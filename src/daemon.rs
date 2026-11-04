@@ -545,25 +545,49 @@ impl Daemon {
 }
 
 pub fn app(state: Arc<Daemon>) -> Router {
-    crate::http::layered(http_routes(state.clone()), state)
+    app_with_extensions(state, &crate::ext::Extensions::empty())
+}
+
+/// Mounts extensions on top of the plain envd router.
+///
+/// The merge happens after [`crate::http::layered`], so the envd frontdoor,
+/// authorization and CORS layers do not run for extension requests. An empty
+/// set is a no-op and leaves the S0 router exactly as [`app`] built it.
+pub fn app_with_extensions(state: Arc<Daemon>, extensions: &crate::ext::Extensions) -> Router {
+    extensions.mount(crate::http::layered(http_routes(state.clone()), state))
 }
 
 pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
+    app_with_filesystem_and_extensions(state, &crate::ext::Extensions::empty())
+}
+
+pub fn app_with_filesystem_and_extensions(
+    state: Arc<Daemon>,
+    extensions: &crate::ext::Extensions,
+) -> Router {
     let rpc = crate::filesystem_rpc::router(state.clone());
-    crate::http::layered(
+    extensions.mount(crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
-    )
+    ))
 }
 
 pub fn app_with_execution(state: Arc<Daemon>, runtime: crate::process::ProcessRuntime) -> Router {
+    app_with_execution_and_extensions(state, runtime, &crate::ext::Extensions::empty())
+}
+
+pub fn app_with_execution_and_extensions(
+    state: Arc<Daemon>,
+    runtime: crate::process::ProcessRuntime,
+    extensions: &crate::ext::Extensions,
+) -> Router {
     let runtime: Arc<dyn crate::process_api::ProcessRuntimeApi> = Arc::new(runtime);
     let rpc = crate::rpc::process::router(state.clone(), runtime)
         .merge(crate::filesystem_rpc::router(state.clone()));
-    crate::http::layered(
+    extensions.mount(crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
-    )
+    ))
 }
 
 /// The Linux route table. The shared layers and the two platform-neutral

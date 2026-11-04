@@ -1,0 +1,36 @@
+[package]
+name = "coorworker-cua"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Cua computer-use worker for rust-envd's cua extension"
+
+# A separate package on purpose: it links the desktop stack (X11/AT-SPI on
+# Linux, UI Automation on Windows), which the frozen envd daemon binary must
+# not carry. rust-envd supervises this process; the daemon's dependency graph
+# and its static guest build stay untouched.
+[lib]
+name = "coorworker_cua"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coorworker-cua"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["http1"] }
+cua-driver-core = { path = "../vendor/cua-driver/rust/crates/cua-driver-core" }
+serde_json = "1"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+platform-linux = { path = "../vendor/cua-driver/rust/crates/platform-linux" }
+
+[target.'cfg(windows)'.dependencies]
+platform-windows = { path = "../vendor/cua-driver/rust/crates/platform-windows" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

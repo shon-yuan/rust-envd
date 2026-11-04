@@ -4,7 +4,7 @@
 //! /upgrade endpoint runs (Go main.go run()).
 use coorworker_envd::cli::{parse_args, usage, Args, CliError, COMMIT, VERSION};
 use coorworker_envd::{
-    daemon::{app_with_execution, Daemon},
+    daemon::{app_with_execution_and_extensions, Daemon},
     exec_context::{Account, Defaults, Environment},
     logs::{HttpExporter, LogSink, Logger, ProcessLogger, StdoutSink},
     mmds::HyperTransport,
@@ -419,9 +419,20 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         });
         daemon.set_upgrade_run(run);
     }
+    let extensions = match coorworker_envd::ext::cua::CuaExtension::from_env().await {
+        Some(extension) => {
+            let extension: std::sync::Arc<dyn coorworker_envd::ext::Extension> =
+                std::sync::Arc::new(extension);
+            coorworker_envd::ext::Extensions::new(vec![extension]).unwrap_or_else(|error| {
+                eprintln!("cua extension disabled: {error}");
+                coorworker_envd::ext::Extensions::empty()
+            })
+        }
+        None => coorworker_envd::ext::Extensions::empty(),
+    };
     let result = coorworker_envd::http1::serve(
         listener,
-        app_with_execution(daemon.clone(), runtime),
+        app_with_execution_and_extensions(daemon.clone(), runtime, &extensions),
         // Go envd installs no signal handler: SIGINT/SIGTERM keep the default
         // disposition and terminate the process immediately. A pending
         // shutdown future preserves that (no graceful drain Go does not do).

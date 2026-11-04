@@ -31,7 +31,9 @@ use tokio::sync::watch;
 use windows_sys::Win32::Foundation::ERROR_FAILED_SERVICE_CONTROLLER_CONNECT;
 
 use crate::cli::{parse_args, usage, Args, CliError, COMMIT, VERSION};
-use crate::daemon::{app_with_execution, app_with_filesystem, Daemon};
+use crate::daemon::{
+    app_with_execution_and_extensions, app_with_filesystem_and_extensions, Daemon,
+};
 use crate::exec_context::Defaults;
 use crate::http1::{serve_gated, AcceptGate};
 use crate::platform::port::scan::Scanner;
@@ -322,9 +324,35 @@ async fn serve(
             daemon.set_upgrade_run(install);
         }
     }
+    // A Windows service runs in session 0 and cannot inject into the
+    // interactive desktop; the cua worker must be started from the user's
+    // session until the session bridge (M4) exists. Refuse to pretend.
+    let extensions = if service.is_some() {
+        if std::env::var_os("COORWORKER_CUA_BIN").is_some() {
+            eprintln!(
+                "cua extension disabled in service mode: the worker needs an interactive \
+                 desktop session"
+            );
+        }
+        crate::ext::Extensions::empty()
+    } else {
+        match crate::ext::cua::CuaExtension::from_env().await {
+            Some(extension) => {
+                let extension: std::sync::Arc<dyn crate::ext::Extension> =
+                    std::sync::Arc::new(extension);
+                crate::ext::Extensions::new(vec![extension]).unwrap_or_else(|error| {
+                    eprintln!("cua extension disabled: {error}");
+                    crate::ext::Extensions::empty()
+                })
+            }
+            None => crate::ext::Extensions::empty(),
+        }
+    };
     let app = match &runtime {
-        Some(runtime) => app_with_execution(daemon.clone(), runtime.clone()),
-        None => app_with_filesystem(daemon.clone()),
+        Some(runtime) => {
+            app_with_execution_and_extensions(daemon.clone(), runtime.clone(), &extensions)
+        }
+        None => app_with_filesystem_and_extensions(daemon.clone(), &extensions),
     };
     let shutdown: Pin<Box<dyn Future<Output = ()> + Send>> = match &service {
         Some(handle) => Box::pin(wait_for_stop(handle.subscribe())),

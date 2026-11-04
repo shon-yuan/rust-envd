@@ -18,6 +18,7 @@ pub mod daemon;
 #[cfg(target_os = "linux")]
 pub mod errno_text;
 pub mod exec_context;
+pub mod ext;
 pub mod files_compose;
 pub mod files_http;
 pub mod files_upload;

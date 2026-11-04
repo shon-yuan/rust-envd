@@ -439,7 +439,16 @@ impl Daemon {
 /// Connect procedure is served by the shared process and filesystem routers,
 /// and an unknown procedure gets the Connect router's 404 `unimplemented`.
 pub fn app(state: Arc<Daemon>) -> Router {
-    match state.process_runtime() {
+    app_with_extensions(state, &crate::ext::Extensions::empty())
+}
+
+/// Mounts extensions on top of the plain envd router.
+///
+/// The merge happens after [`crate::http::layered`], so the envd frontdoor,
+/// authorization and CORS layers do not run for extension requests. An empty
+/// set is a no-op and leaves the S0 router exactly as the daemon built it.
+pub fn app_with_extensions(state: Arc<Daemon>, extensions: &crate::ext::Extensions) -> Router {
+    let router = match state.process_runtime() {
         Ok(runtime) => app_with_execution(state, runtime),
         Err(error) => {
             eprintln!(
@@ -448,15 +457,23 @@ pub fn app(state: Arc<Daemon>) -> Router {
             );
             app_with_filesystem(state)
         }
-    }
+    };
+    extensions.mount(router)
 }
 
 pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
+    app_with_filesystem_and_extensions(state, &crate::ext::Extensions::empty())
+}
+
+pub fn app_with_filesystem_and_extensions(
+    state: Arc<Daemon>,
+    extensions: &crate::ext::Extensions,
+) -> Router {
     let rpc = crate::filesystem_rpc::router(state.clone());
-    crate::http::layered(
+    extensions.mount(crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
-    )
+    ))
 }
 
 /// Mounts the shared process Connect adapter in front of the filesystem
@@ -468,12 +485,20 @@ pub fn app_with_execution(
     state: Arc<Daemon>,
     runtime: Arc<dyn crate::process_api::ProcessRuntimeApi>,
 ) -> Router {
+    app_with_execution_and_extensions(state, runtime, &crate::ext::Extensions::empty())
+}
+
+pub fn app_with_execution_and_extensions(
+    state: Arc<Daemon>,
+    runtime: Arc<dyn crate::process_api::ProcessRuntimeApi>,
+    extensions: &crate::ext::Extensions,
+) -> Router {
     let rpc = crate::rpc::process::router(state.clone(), runtime)
         .merge(crate::filesystem_rpc::router(state.clone()));
-    crate::http::layered(
+    extensions.mount(crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
-    )
+    ))
 }
 
 fn http_routes(state: Arc<Daemon>) -> Router {

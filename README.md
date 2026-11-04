@@ -18,6 +18,10 @@ carrying connect-go error-text parity; its changes are recorded in
 `vendor/connectrpc/PATCHES.md`. `vendor/hyper/` is an MIT in-tree fork of
 `hyper` 1.12.0 carrying Go `net/http`'s HTTP/1.1 trailer write path and
 chunked-body limits; its changes are recorded in `vendor/hyper/PATCHES.md`.
+`vendor/cua-driver/` contains MIT-licensed Cua Driver crates used only by the
+optional `coorworker-cua` worker (provenance in
+`vendor/cua-driver/PROVENANCE.md`); the AGPL perception crates and the FSL
+`cua-spacesd` are excluded.
 The distributable notice bundle
 ([`third_party/NOTICES.md`](third_party/NOTICES.md), `third_party/licenses/`)
 and the release manifest procedure are specified in
@@ -70,6 +74,23 @@ The full API matrix, semantics, native evidence log and open decisions are in
 [`docs/windows-port.md`](docs/windows-port.md). Booting Windows under Cloud
 Hypervisor/Hyper-V (the guest image pipeline) is separate open work; the
 daemon itself runs in an existing Windows VM.
+
+## Extensions
+
+The official envd surface above is the compatibility contract and stays
+frozen. Additive surfaces are mounted under their own first path segment with
+their own authentication, after the envd frontdoor/authorization layers, so
+they cannot shadow an envd route or inherit its token. A build with no
+extension registered has exactly the same router as the parity daemon.
+
+The seam is shipped (`src/ext/mod.rs`, `tests/extensions.rs`). The first
+extension is `cua`: a computer-use MCP surface (`/cua/...`, `POST /mcp`)
+served by the separate `coorworker-cua` worker, which rust-envd starts and
+supervises when `COORWORKER_CUA_BIN` is set. The worker is a separate binary
+because the desktop stack cannot be linked into the frozen daemon (X11 on
+Linux, the interactive session on Windows); with no worker configured the
+router is exactly the parity daemon. The contract, configuration, worker
+interface and licensing boundary are in [`docs/extensions.md`](docs/extensions.md).
 
 ## Differences from the Go daemon
 
