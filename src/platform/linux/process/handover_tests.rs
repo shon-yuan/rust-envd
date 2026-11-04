@@ -1,8 +1,12 @@
-use super::{dup_keep, validate_carried_fds};
+use super::{dup_keep, pipe, validate_carried_fds, Entry, ProcessRuntime, HANDOVER_FD_BASE};
+use crate::exec_context::{Account, Defaults, Environment};
 use crate::proto::upgrade::HandoverProc;
 use nix::fcntl::{fcntl, FcntlArg::F_GETFD, FdFlag};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::AtomicI64;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
 fn identity(fd: RawFd) -> (libc::dev_t, libc::ino_t) {
     let stat = nix::sys::stat::fstat(fd).expect("test descriptor must remain open");
@@ -196,4 +200,333 @@ fn validate_carried_fds_accepts_unique_live_descriptors_and_absent_endpoints() {
     assert_eq!(validate_carried_fds(&processes), Ok(()));
 
     assert_test_fds_open(&fds);
+}
+
+#[test]
+fn validate_carried_fds_rejects_closed_batch_tail_without_consuming_valid_prefix() {
+    let fds: [OwnedFd; 4] =
+        std::array::from_fn(|_| std::fs::File::open("/dev/null").unwrap().into());
+    let processes = [
+        carried(101, fds.each_ref().map(AsRawFd::as_raw_fd)),
+        carried(202, [-1, -1, -1, i32::MAX]),
+    ];
+
+    let result = validate_carried_fds(&processes);
+
+    assert!(
+        result.is_err(),
+        "accepted a closed descriptor at the batch tail"
+    );
+    assert_test_fds_open(&fds);
+}
+
+fn private_fd_runtime() -> (tokio::runtime::Runtime, [OwnedFd; 4]) {
+    // Initialize Tokio's process-global signal resources on the shared table
+    // before making a private copy; another test's reactor must see them too.
+    let bootstrap = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    drop(bootstrap);
+    // Only this test thread changes tables. Other parallel tests keep their
+    // original descriptors, including any occupant of a handover slot.
+    // SAFETY: CLONE_FILES takes no pointer arguments and copies the fd table.
+    assert_eq!(
+        unsafe { libc::unshare(libc::CLONE_FILES) },
+        0,
+        "isolate test fd table: {}",
+        std::io::Error::last_os_error()
+    );
+    for fd in HANDOVER_FD_BASE..HANDOVER_FD_BASE + 4 {
+        // These are inherited copies in the private table, before this test
+        // has created any owners or reactor registrations of its own.
+        let _ = nix::unistd::close(fd);
+    }
+    let reserved = std::array::from_fn(|index| {
+        let target = HANDOVER_FD_BASE + index as RawFd;
+        let fresh = fcntl(
+            libc::STDERR_FILENO,
+            nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(target),
+        )
+        .expect("reserve private handover slot");
+        assert_eq!(fresh, target);
+        // SAFETY: fcntl allocated this descriptor in this thread's private table.
+        unsafe { OwnedFd::from_raw_fd(fresh) }
+    });
+    // Reserve the window until the fixture's sources and reactor are ready,
+    // so none of their owners can accidentally occupy the slots under test.
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+    (executor, reserved)
+}
+
+fn export_entry() -> (Arc<Entry>, [OwnedFd; 3]) {
+    let flags = nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC;
+    let (stdout, stdout_peer) = nix::unistd::pipe2(flags).unwrap();
+    let (stderr, stderr_peer) = nix::unistd::pipe2(flags).unwrap();
+    let (stdin_peer, stdin) = nix::unistd::pipe2(flags).unwrap();
+    // SAFETY: File exclusively owns this fresh pipe, and the entry's stdin
+    // mutex serializes removal with all registered I/O.
+    let stdin = unsafe { tokio::io::unix::AsyncFd::register(std::fs::File::from(stdin)) }.unwrap();
+    let (control, _controls) = mpsc::channel(1);
+    let entry = Arc::new(Entry {
+        info: crate::proto::process::ProcessInfo {
+            pid: 101,
+            ..Default::default()
+        },
+        stdin: Mutex::new(Some(pipe::StdinPipe::Adopted(stdin))),
+        pty: Mutex::new(None),
+        is_pty: false,
+        subscribers: Mutex::new(Default::default()),
+        control,
+        stdout_bytes: Arc::new(AtomicI64::new(0)),
+        stderr_bytes: Arc::new(AtomicI64::new(0)),
+        pty_bytes: Arc::new(AtomicI64::new(0)),
+        operation_id: None,
+        stdout_dup: Some(Arc::new(stdout)),
+        stderr_dup: Some(Arc::new(stderr)),
+        deadline_at: Mutex::new(None),
+    });
+    (entry, [stdout_peer, stderr_peer, stdin_peer])
+}
+
+fn fixture_runtime() -> ProcessRuntime {
+    // No spawn or account lookup is needed for registry-only fixtures.
+    ProcessRuntime::new(
+        Account {
+            name: "handover-fixture".into(),
+            home: "/tmp".into(),
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            groups: Vec::new(),
+        },
+        Defaults::default(),
+        Environment::default(),
+        None,
+    )
+    .unwrap()
+}
+
+fn export_runtime(entry: Arc<Entry>) -> ProcessRuntime {
+    let runtime = fixture_runtime();
+    runtime
+        .registry
+        .try_lock()
+        .unwrap()
+        .live
+        .insert(entry.info.pid, entry);
+    runtime
+}
+
+#[test]
+fn export_cancellation_while_waiting_for_deadline_closes_allocated_slots() {
+    let (executor, reserved) = private_fd_runtime();
+    executor.block_on(async {
+        let (entry, _peers) = export_entry();
+        let runtime = export_runtime(entry.clone());
+        let stdin_fd = entry.stdin.lock().await.as_ref().unwrap().raw_fd();
+        let sources = [
+            entry.stdout_dup.as_ref().unwrap().as_ref().as_raw_fd(),
+            entry.stderr_dup.as_ref().unwrap().as_ref().as_raw_fd(),
+            stdin_fd,
+        ];
+        let identities = sources.map(identity);
+        let slots = std::array::from_fn::<_, 3, _>(|index| HANDOVER_FD_BASE + index as RawFd);
+        let _deadline = entry.deadline_at.lock().await;
+        drop(reserved);
+        let mut export = Box::pin(runtime.export_processes());
+
+        assert!(futures_util::poll!(export.as_mut()).is_pending());
+        for (slot, expected) in slots.iter().zip(identities) {
+            assert_eq!(
+                identity(*slot),
+                expected,
+                "export must reach the deadline wait"
+            );
+            assert_eq!(
+                fcntl(*slot, F_GETFD).unwrap() & FdFlag::FD_CLOEXEC.bits(),
+                0
+            );
+        }
+        // Drop the owned future, not just a Pin<&mut _>, to cancel it here.
+        drop(export);
+
+        let remaining = slots.map(|slot| fcntl(slot, F_GETFD));
+        // Clean up observed leaks even on RED, after capturing the evidence.
+        for (slot, state) in slots.into_iter().zip(remaining) {
+            if state.is_ok() {
+                nix::unistd::close(slot).unwrap();
+            }
+        }
+        assert_eq!(
+            remaining,
+            [Err(nix::errno::Errno::EBADF); 3],
+            "cancelled export leaked already allocated handover slots"
+        );
+        assert_eq!(sources.map(identity), identities);
+        assert!(runtime.registry.try_lock().is_ok());
+    });
+}
+
+#[test]
+fn export_keeps_stdin_owner_while_waiting_for_pty_snapshot() {
+    let (executor, reserved) = private_fd_runtime();
+    executor.block_on(async {
+        let (entry, _peers) = export_entry();
+        let runtime = export_runtime(entry.clone());
+        let source = entry.stdin.lock().await.as_ref().unwrap().raw_fd();
+        let before = identity(source);
+        let pty = entry.pty.lock().await;
+        drop(reserved);
+        let mut export = Box::pin(runtime.export_processes());
+
+        // The private registry is unlocked and stdin is available, so this
+        // first poll reads stdin and stops exactly at the held pty mutex.
+        assert!(futures_util::poll!(export.as_mut()).is_pending());
+        let removed = entry.stdin.try_lock().ok().and_then(|mut stdin| stdin.take());
+        let was_removable = removed.is_some();
+        drop(removed);
+        let source_is_open = fcntl(source, F_GETFD).is_ok();
+        // Never resume a vulnerable export after invalidating its source.
+        drop(export);
+        drop(pty);
+
+        assert!(
+            !was_removable,
+            "export released stdin ownership before duplication; source still open: {source_is_open}"
+        );
+        assert!(source_is_open);
+        assert_eq!(identity(source), before);
+        assert!(entry.stdin.try_lock().unwrap().is_some());
+    });
+}
+
+#[test]
+fn readopt_cancellation_closes_current_and_later_transferred_endpoints() {
+    use std::io::Read;
+    use std::os::fd::IntoRawFd;
+
+    let (executor, _reserved) = private_fd_runtime();
+    executor.block_on(async {
+        let runtime = fixture_runtime();
+        let (endpoints, mut peers): (Vec<_>, Vec<_>) = (0..8)
+            .map(|_| {
+                let (endpoint, peer) = UnixStream::pair().unwrap();
+                endpoint.set_nonblocking(true).unwrap();
+                peer.set_nonblocking(true).unwrap();
+                (endpoint, peer)
+            })
+            .unzip();
+        let registry = runtime.registry.lock().await;
+        let (_thaw, thawed) = tokio::sync::watch::channel(());
+        let raw: Vec<_> = endpoints.into_iter().map(IntoRawFd::into_raw_fd).collect();
+        // Reserved identities <= 1 also ensure an unexpected refusal cannot
+        // signal a real process through the unadopted-child cleanup path.
+        let processes = [
+            carried(0, std::array::from_fn(|index| raw[index])),
+            carried(1, std::array::from_fn(|index| raw[index + 4])),
+        ];
+        // SAFETY: every endpoint is open and unique; into_raw_fd transferred
+        // its sole owner, and no caller closes/reuses a transferred number.
+        let mut readopt = Box::pin(unsafe { runtime.readopt_processes(&processes, thawed) });
+
+        // Valid socket registrations complete synchronously. Only insertion
+        // can block here, and the second process remains pending in the batch.
+        assert!(futures_util::poll!(readopt.as_mut()).is_pending());
+        drop(readopt);
+
+        for (index, peer) in peers.iter_mut().enumerate() {
+            let mut byte = [0];
+            assert_eq!(
+                peer.read(&mut byte)
+                    .expect("cancelled handover must reach EOF"),
+                0,
+                "transferred endpoint {index} survived cancellation"
+            );
+        }
+        assert!(registry.live.is_empty());
+    });
+}
+
+#[test]
+fn readopt_registration_failure_releases_endpoints_and_adopts_valid_sibling() {
+    use std::io::Read;
+    use std::os::fd::IntoRawFd;
+
+    let (executor, _reserved) = private_fd_runtime();
+    executor.block_on(async {
+        let runtime = fixture_runtime();
+        let (stdout, mut stdout_peer) = UnixStream::pair().unwrap();
+        let (stdin, mut stdin_peer) = UnixStream::pair().unwrap();
+        let (tty, mut tty_peer) = UnixStream::pair().unwrap();
+        for socket in [&stdout, &stdout_peer, &stdin, &stdin_peer, &tty, &tty_peer] {
+            socket.set_nonblocking(true).unwrap();
+        }
+        let stderr = std::fs::File::open("/dev/null").unwrap();
+        let (_thaw, thawed) = tokio::sync::watch::channel(());
+        let processes = [
+            // stdout can enter epoll; /dev/null deterministically fails the
+            // subsequent stderr registration with EPERM. PID 0 is never killed.
+            carried(
+                0,
+                [
+                    stdout.into_raw_fd(),
+                    stderr.into_raw_fd(),
+                    stdin.into_raw_fd(),
+                    tty.into_raw_fd(),
+                ],
+            ),
+            carried(1, [-1; 4]),
+        ];
+
+        // SAFETY: the four open descriptors have distinct numbers and were
+        // surrendered above. The sibling has no transferred descriptors.
+        let result = unsafe { runtime.readopt_processes(&processes, thawed).await };
+
+        assert_eq!(result, (1, 1));
+        for peer in [&mut stdout_peer, &mut stdin_peer, &mut tty_peer] {
+            let mut byte = [0];
+            assert_eq!(
+                peer.read(&mut byte)
+                    .expect("failed adoption must release its endpoints"),
+                0
+            );
+        }
+        let registry = runtime.registry.lock().await;
+        assert!(!registry.live.contains_key(&0));
+        assert!(registry.live.contains_key(&1));
+    });
+}
+
+#[test]
+fn terminal_handover_descriptor_keeps_master_alive_after_close() {
+    let (executor, _reserved) = private_fd_runtime();
+    executor.block_on(async {
+        // A private /dev/ptmx pair needs neither a child process nor a desktop.
+        let pair = nix::pty::openpty(None, None).unwrap();
+        let _slave = pair.slave;
+        let terminal = super::pty::Terminal::from_master(pair.master).unwrap();
+        let snapshot: Arc<tokio::io::unix::AsyncFd<std::fs::File>> = terminal
+            .handover_descriptor()
+            .expect("open terminal must provide an owned handover snapshot");
+        let fd = snapshot.get_ref().as_raw_fd();
+        let before = identity(fd);
+
+        terminal.close();
+
+        assert!(terminal.handover_descriptor().is_none());
+        assert_eq!(identity(snapshot.get_ref().as_raw_fd()), before);
+        assert!(
+            fcntl(fd, F_GETFD).is_ok(),
+            "snapshot must keep the master open"
+        );
+        drop(snapshot);
+        assert_eq!(
+            fcntl(fd, F_GETFD),
+            Err(nix::errno::Errno::EBADF),
+            "closed terminal's last snapshot must release the master"
+        );
+    });
 }
