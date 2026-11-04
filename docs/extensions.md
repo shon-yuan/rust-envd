@@ -89,11 +89,12 @@ and the router is identical to S0.
 
 `/cua/health` returns `200` with `{"status":"healthy"}` while the worker
 process is alive, and `503` with the reason in `detail` after it exits or
-fails to start. `/cua/info` publishes `mcp_url`, `transport` and `protocol`
-and never the token: a discovery document that leaked it would hand every
-guest process control of the desktop. Both routes are extension-owned —
-they are mounted after `http::layered` and do not use the envd `/init`
-access token.
+fails to start. `/cua/info` publishes `name` (`cua`), `mcp_url`, `transport`,
+`protocol` and `auth` (`bearer` when the worker has a `CUA_ENV_TOKEN`,
+otherwise `none`) and never the token: a discovery document that leaked it
+would hand every guest process control of the desktop. Both routes are
+extension-owned — they are mounted after `http::layered` and do not use the
+envd `/init` access token.
 
 A worker that dies does not fail the daemon: S0 keeps serving and the
 extension stays visible as unhealthy.

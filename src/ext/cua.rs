@@ -265,9 +265,14 @@ async fn info(State(state): State<Arc<CuaState>>) -> Response {
     // The token is never echoed: a discovery document that leaks it would
     // hand every guest process control of the desktop.
     let mut body = json!({
+        "name": "cua",
         "mcp_url": state.mcp_url,
         "transport": "mcp-jsonrpc-http",
         "protocol": "legacy",
+        // Whether callers must present a bearer token. This reveals only the
+        // requirement, never the value, and reflects CUA_ENV_TOKEN (the
+        // credential this extension supervises and injects).
+        "auth": if state.worker_token.is_some() { "bearer" } else { "none" },
     });
     if state.proxy.is_some() {
         // Relative on purpose: envd does not know the address a caller reached
@@ -716,10 +721,33 @@ mod tests {
             .unwrap();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["name"], "cua");
+        assert_eq!(body["auth"], "none");
         assert_eq!(body["proxy_path"], "/cua/mcp");
         assert_eq!(body["proxy_auth"], "bearer");
         assert!(
             !body.to_string().contains("proxy-secret"),
+            "the discovery document must not carry the token"
+        );
+    }
+
+    #[tokio::test]
+    async fn info_reports_that_the_worker_requires_a_token() {
+        let (url, _seen) = fake_mcp_worker().await;
+        let router = Extensions::new(vec![Arc::new(
+            proxied(url, b"proxy-secret", Some(b"worker-secret")).await,
+        )])
+        .unwrap()
+        .mount(Router::new());
+        let response = router
+            .oneshot(Request::get("/cua/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["auth"], "bearer");
+        assert!(
+            !body.to_string().contains("worker-secret"),
             "the discovery document must not carry the token"
         );
     }
