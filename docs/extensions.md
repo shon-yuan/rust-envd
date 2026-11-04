@@ -78,6 +78,7 @@ guest / host
     ext::cua  ── spawns, watches ──►  coorworker-cua
       GET /cua/health                   POST /mcp   (MCP JSON-RPC)
       GET /cua/info                     GET  /mcp   → 405
+      GET /cua/metrics
       POST /cua/mcp   (optional proxy)
 ```
 
@@ -102,6 +103,11 @@ exponential backoff (0.5 s doubling to 30 s; a worker that stayed up for
 accepts on its loopback port. A worker that never comes up does not fail the
 daemon: S0 keeps serving and the extension stays visible as unhealthy with
 the reason in `detail`.
+
+`/cua/metrics` exposes Prometheus text with `coorworker_envd_cua_worker_up`
+(1/0) and `coorworker_envd_cua_worker_restarts_total`. It is extension-owned
+and deliberately separate from S2 `/metrics`, whose JSON wire format is the
+oracle's and stays byte-identical.
 
 ### Remote access without a second port
 
@@ -194,17 +200,23 @@ SPDX texts in `scripts/license-overrides/`.
 ### Evidence
 
 - Worker contract tests: 9 passed (`cua-worker/`, `cargo test --lib --bins`).
-- rust-envd suite: 852 passed (24 ignored by features), including
+- rust-envd suite: 853 passed (24 ignored by features), including
   `tests/extensions.rs` (no-shadow, merge over the Connect fallback,
   empty-set identity) and the supervisor/proxy tests in `src/ext/cua.rs`
-  (12 in that module: health and failure reporting, restart count and
-  replacement after exit, backoff bounds, route absent without a token, 401
-  for missing/wrong tokens, forwarding with worker-token injection and
-  status pass-through, 502 unreachable, 503 dead worker, discovery fields).
+  (13 in that module: health and failure reporting, restart count and
+  replacement after exit, backoff bounds, Prometheus exposition, route
+  absent without a token, 401 for missing/wrong tokens, forwarding with
+  worker-token injection and status pass-through, 502 unreachable, 503 dead
+  worker, discovery fields).
 - Supervision: a child that exits is replaced within the first backoff step
   and reported healthy once the replacement is installed
   (`supervisor_replaces_a_worker_that_exits`, with a fake relauncher so no
   real worker binary is needed).
+- Metrics run (Xvfb `:98`, envd dev `127.0.0.1:49987`, real worker on
+  `3212`): `/cua/metrics` returned `..._worker_up 1` and
+  `..._restarts_total 0`. After `kill -9` it reported `..._worker_up 0` with
+  `..._restarts_total 1`, then `..._worker_up 1` again with a new worker
+  PID. S2 `/metrics` still returned the oracle's JSON document unchanged.
 - End-to-end run on Xvfb `:99` (before supervision existed, M5): daemon →
   spawned worker → `/cua/health` `200`; MCP `initialize` (`cua-driver
   0.38.0`), `tools/list` (63 tools), `tools/call get_desktop_state` returned

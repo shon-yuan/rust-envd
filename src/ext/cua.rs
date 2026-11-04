@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -319,7 +319,8 @@ impl Extension for CuaExtension {
     fn router(&self) -> Router {
         let mut router = Router::new()
             .route("/health", get(health))
-            .route("/info", get(info));
+            .route("/info", get(info))
+            .route("/metrics", get(metrics));
         // Mounted only when a proxy token was configured. An enabled route
         // without a credential would put a desktop behind envd's door.
         if self.state.proxy.is_some() {
@@ -386,6 +387,33 @@ async fn info(State(state): State<Arc<CuaState>>) -> Response {
         body["proxy_auth"] = json!("bearer");
     }
     Json(body).into_response()
+}
+
+/// Prometheus text exposition for the extension. Kept on the extension's own
+/// path: the S2 `/metrics` document is the oracle's JSON wire format and stays
+/// byte-identical, so extension counters never enter it.
+async fn metrics(State(state): State<Arc<CuaState>>) -> Response {
+    let (running, restarts) = match state.status.lock() {
+        Ok(status) => (status.running, status.restarts),
+        Err(_) => (false, 0),
+    };
+    let body = format!(
+        "# HELP coorworker_envd_cua_worker_up 1 when the supervised cua worker is running.\n\
+         # TYPE coorworker_envd_cua_worker_up gauge\n\
+         coorworker_envd_cua_worker_up {}\n\
+         # HELP coorworker_envd_cua_worker_restarts_total Worker exits replaced by the supervisor since envd started.\n\
+         # TYPE coorworker_envd_cua_worker_restarts_total counter\n\
+         coorworker_envd_cua_worker_restarts_total {restarts}\n",
+        if running { 1 } else { 0 },
+    );
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// Streams one MCP request to the loopback worker.
@@ -631,6 +659,53 @@ mod tests {
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body["restarts"], 3);
         assert!(body["detail"].as_str().unwrap().contains("restarting"));
+    }
+
+    #[tokio::test]
+    async fn metrics_report_worker_state_and_restarts() {
+        fn router_with(status: WorkerStatus) -> Router {
+            Extensions::new(vec![Arc::new(CuaExtension {
+                state: Arc::new(CuaState {
+                    status: Mutex::new(status),
+                    mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
+                    proxy: None,
+                    worker_token: None,
+                }),
+            })])
+            .unwrap()
+            .mount(Router::new())
+        }
+        let response = router_with(WorkerStatus {
+            running: true,
+            detail: None,
+            restarts: 2,
+        })
+        .oneshot(Request::get("/cua/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE].to_str().unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.starts_with("# HELP"), "{body}");
+        assert!(body.contains("coorworker_envd_cua_worker_up 1"), "{body}");
+        assert!(
+            body.contains("coorworker_envd_cua_worker_restarts_total 2"),
+            "{body}"
+        );
+
+        let response = router_with(WorkerStatus::stopped("worker exited"))
+            .oneshot(Request::get("/cua/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("coorworker_envd_cua_worker_up 0"),
+            "{body:?}"
+        );
     }
 
     #[tokio::test]
