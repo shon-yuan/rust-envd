@@ -259,6 +259,37 @@ CI builds the worker with the MSVC toolchain and runs its contract tests on
 tests use a static tool provider: real UI Automation actions still require a
 logged-in desktop session and are not exercised there.
 
+### Linux window enumeration
+
+Native Wayland enumeration is opt-in: set `CUA_DRIVER_RS_ENABLE_WAYLAND=1`,
+`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and the current
+`HYPRLAND_INSTANCE_SIGNATURE` for a Hyprland session. A stale signature is
+an IPC failure. Without the opt-in the worker uses its existing X11 path;
+rootless XWayland with no X11 clients can correctly return zero windows.
+
+The local Hyprland patch accepts both legacy numeric workspace IDs and
+0.57 stable workspace addresses, including named and special workspaces.
+Addresses take precedence when present, while display names do not establish
+identity. Empty workspaces are excluded from visibility matching, and a
+mapped window without a workspace identity is an error. Full compositor
+window IDs, PID/geometry validation and hidden/DPMS visibility rules are
+preserved. See `vendor/cua-driver/PROVENANCE.md` for the pinned upstream and
+local patch list.
+
+For explicit `tools/call list_windows`, recognized Hyprland/niri enumeration
+failures and blocking-task failures return MCP `result.isError: true` with a
+structured error code. They must not be interpreted as an empty desktop or
+trigger a fallback into another window-ID namespace. An actual successful
+empty enumeration still returns `structuredContent.windows: []`. Other
+internal callers retain their best-effort interface, and the generic
+Wayland/X11 fallback policy is unchanged. This does not claim that every
+backend failure or every tool now uses the stricter policy.
+
+This change covers enumeration only. It does not add rotated multi-monitor
+capture/input support; screen-size and action admission retain their existing
+checks. Desktop interaction and Windows desktop support require separate
+acceptance evidence.
+
 ### Licensing
 
 Only the MIT crates are vendored (`vendor/cua-driver/`, provenance in
@@ -274,7 +305,23 @@ SPDX texts in `scripts/license-overrides/`.
 
 ### Evidence
 
-- Worker contract tests: 9 passed (`cua-worker/`, `cargo test --lib --bins`).
+- Worker contract tests: 9 passed, plus 5 Linux worker/MCP integration
+  regressions (`cargo test --manifest-path cua-worker/Cargo.toml --lib --bins
+  --tests`). Before the patch, the integration target compiled and ran with
+  2 passing controls and 3 failures; the same target passes all 5 afterward.
+  Private Hyprland/Wayland sockets exercise legacy IDs, 0.57 numbered/named/
+  special addresses, full-width window IDs, geometry, PID/on-screen filters,
+  hidden/unmapped windows, genuine empty results and IPC/JSON/identity errors,
+  without a host desktop connection or inherited credentials.
+- Read-only Hyprland 0.57 acceptance (2026-11-04): before the patch,
+  compositor IPC reported 6 mapped clients while worker MCP `list_windows`
+  returned a successful empty list; an invalid session signature also
+  returned empty success. After the patch the worker returned 6 windows,
+  with all 6 stable compositor addresses, PIDs, positions and sizes matching
+  the before/after IPC snapshots. The invalid signature returned
+  `isError: true`, code `tool_invocation_failed`. The probe called only
+  `list_windows`; it did not capture, send input or launch desktop apps.
+  This is enumeration evidence, not rotated-display or action acceptance.
 - rust-envd suite: 864 passed, 0 failed (24 ignored by features), including
   `tests/extensions.rs` (no-shadow, merge over the Connect fallback,
   empty-set identity) and the supervisor/proxy tests in `src/ext/cua.rs`

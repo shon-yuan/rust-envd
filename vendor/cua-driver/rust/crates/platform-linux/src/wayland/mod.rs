@@ -4042,59 +4042,59 @@ fn apply_pid_filter(mut windows: Vec<WindowInfo>, filter_pid: Option<u32>) -> Ve
     windows
 }
 
-/// Window-enumeration dispatcher: native Wayland when available, else X11.
+/// Best-effort enumeration for callers whose contract cannot return errors.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
+    try_list_windows_dispatch(filter_pid).unwrap_or_else(|error| {
+        tracing::warn!("Window enumeration unavailable: {error:#}");
+        Vec::new()
+    })
+}
+
+/// Window enumeration with authoritative Hyprland/niri errors preserved.
+/// Other compositor and X11 fallback policies retain their best-effort contract.
+pub fn try_list_windows_dispatch(filter_pid: Option<u32>) -> anyhow::Result<Vec<WindowInfo>> {
+    use anyhow::Context;
+
     if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
         if hyprland::is_session() {
             // Hyprland IPC already attests PID and full native identity. A
             // foreign-toplevel title join only makes that identity weaker.
-            return match hyprland::list_windows() {
-                Ok(windows) => listed_windows(apply_pid_filter(
-                    windows
-                        .into_iter()
-                        .map(|w| WindowInfo {
-                            xid: w.address,
-                            pid: Some(w.pid),
-                            app_name: w.app_id,
-                            title: w.title,
-                            is_on_screen: w.visible,
-                            z_index: None,
-                            x: w.x,
-                            y: w.y,
-                            width: w.width,
-                            height: w.height,
-                        })
-                        .collect(),
-                    filter_pid,
-                )),
-                Err(error) => {
-                    tracing::warn!("Hyprland window enumeration unavailable: {error:#}");
-                    Vec::new()
-                }
-            };
+            let windows =
+                hyprland::list_windows().context("Hyprland window enumeration unavailable")?;
+            return Ok(listed_windows(apply_pid_filter(
+                windows
+                    .into_iter()
+                    .map(|w| WindowInfo {
+                        xid: w.address,
+                        pid: Some(w.pid),
+                        app_name: w.app_id,
+                        title: w.title,
+                        is_on_screen: w.visible,
+                        z_index: None,
+                        x: w.x,
+                        y: w.y,
+                        width: w.width,
+                        height: w.height,
+                    })
+                    .collect(),
+                filter_pid,
+            )));
         }
         if niri::is_session() {
-            // niri IPC attests PIDs and its own window ids. Once niri is
-            // recognised, an IPC failure must not fall back to the
-            // foreign-toplevel title join, which loses that id namespace.
-            return match niri::list_windows() {
-                Ok(windows) => listed_windows(apply_pid_filter(
-                    windows.into_iter().map(niri_window_info).collect(),
-                    filter_pid,
-                )),
-                Err(error) => {
-                    tracing::warn!("niri window enumeration unavailable: {error:#}");
-                    Vec::new()
-                }
-            };
+            // Preserve niri's identity namespace even when its IPC fails.
+            let windows = niri::list_windows().context("niri window enumeration unavailable")?;
+            return Ok(listed_windows(apply_pid_filter(
+                windows.into_iter().map(niri_window_info).collect(),
+                filter_pid,
+            )));
         }
         // A verified GNOME helper already supplies exact IDs and ownership.
         // Do not probe unrelated compositor protocols for every preview frame.
         if let Some(ws) = shell_helper::list_windows(filter_pid) {
-            return listed_windows(ws);
+            return Ok(listed_windows(ws));
         }
         if let Some(ws) = kwin_helper::list_window_infos() {
-            return listed_windows(apply_pid_filter(ws, filter_pid));
+            return Ok(listed_windows(apply_pid_filter(ws, filter_pid)));
         }
         // Prefer the richer wlroots protocol when no trusted KWin helper is available.
         // only consulted when wlroots yields no windows (including when its
@@ -4116,26 +4116,26 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             Ok(ws) if !ws.is_empty() => {
                 if let Some(pid) = filter_pid {
                     if let Some(filtered) = native_windows_for_pid(ws, pid) {
-                        return listed_windows(filtered);
+                        return Ok(listed_windows(filtered));
                     }
                 } else {
-                    return listed_windows(ws);
+                    return Ok(listed_windows(ws));
                 }
                 // A compositor window without pid metadata cannot satisfy a
                 // pid-scoped request. Continue to the AT-SPI registry.
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return listed_windows(ws);
+                    return Ok(listed_windows(ws));
                 }
             }
             Ok(_) => {
                 if let Some(ws) = shell_helper::list_windows(filter_pid).filter(|ws| !ws.is_empty())
                 {
-                    return listed_windows(ws);
+                    return Ok(listed_windows(ws));
                 }
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return listed_windows(ws);
+                    return Ok(listed_windows(ws));
                 }
             }
             Err(e) => {
@@ -4144,12 +4144,12 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
                     tracing::debug!(
                         "native Wayland protocols unavailable ({e}); using compositor helper"
                     );
-                    return listed_windows(ws);
+                    return Ok(listed_windows(ws));
                 }
                 tracing::warn!("native Wayland list_windows failed: {e}; trying AT-SPI registry");
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return listed_windows(ws);
+                    return Ok(listed_windows(ws));
                 }
             }
         }
@@ -4177,7 +4177,7 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             merge_atspi_windows(&mut ws, &seen, wayland_atspi_windows(filter_pid));
         }
     }
-    listed_windows(ws)
+    Ok(listed_windows(ws))
 }
 
 fn merge_atspi_windows(

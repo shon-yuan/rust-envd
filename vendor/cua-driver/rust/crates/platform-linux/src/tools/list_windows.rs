@@ -36,10 +36,17 @@ impl Tool for ListWindowsTool {
         use cua_driver_core::tool_args::ArgsExt;
         let filter_pid = args.opt_u64("pid").map(|v| v as u32);
         let on_screen_only = args.bool_or("on_screen_only", false);
-        let mut windows =
-            tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(filter_pid))
-                .await
-                .unwrap_or_default();
+        let mut windows = match tokio::task::spawn_blocking(move || {
+            crate::wayland::try_list_windows_dispatch(filter_pid)
+        })
+        .await
+        {
+            Ok(Ok(windows)) => windows,
+            Ok(Err(error)) => return ToolResult::error(format!("{error:#}")),
+            Err(error) => {
+                return ToolResult::error(format!("Window enumeration task failed: {error}"))
+            }
+        };
         // Exited applications can remain visible in AT-SPI/X11 as zombies;
         // never return those stale targets to callers.
         windows.retain(|window| window.pid.is_none_or(crate::proc_fs::is_process_live));

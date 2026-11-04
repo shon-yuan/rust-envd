@@ -7,8 +7,8 @@ License: MIT (`LICENSE` in this directory, copied verbatim from the upstream
 repository root). Every vendored crate carries the upstream
 `license.workspace = true` declaration (MIT).
 
-Vendored crates, byte-for-byte except for `rust/Cargo.toml` (members list
-pruned; see below):
+Vendored crates, copied from the pinned commit with the local changes listed
+below:
 
 - `crates/cua-driver-core`
 - `crates/cua-driver-contract`
@@ -31,8 +31,37 @@ Deliberately not vendored:
 - `libs/cua-spacesd`: FSL-1.1-MIT (source-available with a competing-use
   restriction), not MIT. It must not be merged into this repository.
 
-`rust/Cargo.toml` is the upstream workspace manifest with `members` reduced to
-the vendored set. `rust/Cargo.lock` is upstream's lock, unmodified.
+## Local changes
 
-Update procedure: re-copy the same seven crate directories and the two
-manifests from a reviewed upstream commit, then re-apply the `members` edit.
+- `rust/Cargo.toml`: workspace `members` reduced to the vendored set.
+  `rust/Cargo.lock` remains upstream's lock, unmodified.
+- `rust/crates/platform-linux/src/wayland/hyprland.rs`: deserialize Hyprland
+  0.57 workspace addresses, retaining legacy numeric IDs. Addresses take
+  precedence; display names never identify workspaces. Explicit empty
+  workspaces do not contribute to visibility; missing required identity is
+  an error. Existing window identity, PID, geometry, hidden and DPMS rules
+  remain in place.
+- `rust/crates/platform-linux/src/wayland/mod.rs`: add a fallible window
+  dispatcher for authoritative Hyprland/niri IPC errors. Keep the existing
+  best-effort dispatcher for other callers and the existing fallback order
+  for other compositors and X11.
+- `rust/crates/platform-linux/src/tools/list_windows.rs`: use the fallible
+  dispatcher and return MCP tool errors for enumeration or blocking-task
+  failure. A successful empty enumeration still returns an empty list.
+
+The workspace compatibility change follows the JSON emitted by Hyprland
+`v0.57.0` (`0aa6745f705f2c4b0a5004eb019ef76e5bbdb426`,
+`src/ipc/s1/Commands.cpp`); no Hyprland implementation code is copied.
+Cua main at `fc5363878a94d84f1e5ea8fcad045c0b9ada4b59` still had the
+pinned Hyprland parser, so these are local patches, not an upstream upgrade.
+Their worker-level regressions live in `cua-worker/tests/wayland_windows.rs`
+and run against isolated IPC fixtures through the real worker MCP endpoint.
+
+Update procedure: re-copy the same seven crate directories, `rust/Skills/`
+and the two manifests from a reviewed upstream commit. Re-apply the members
+edit and the three Linux patches above unless the upstream update already
+implements them; review that comparison explicitly. Run the worker tests
+including `--tests`, worker lint/build and both notice-bundle checks. Keep
+this provenance and the extension documentation aligned with the resulting
+patch set; do not regenerate the upstream lock merely to run the trimmed
+vendor workspace's tests.

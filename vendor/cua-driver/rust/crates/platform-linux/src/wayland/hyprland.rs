@@ -21,9 +21,41 @@ const QUERY_MAX_ATTEMPTS: usize = 2;
 const MAX_REPLY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOGICAL_PIXELS: u64 = 64 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-struct Workspace {
-    id: i64,
+/// Hyprland 0.57 supplies stable workspace addresses; older versions use IDs.
+/// Keep the namespaces distinct and never use the mutable display name.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash)]
+#[serde(try_from = "WorkspaceRecord")]
+pub enum Workspace {
+    Address(String),
+    LegacyId(i64),
+    Empty,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceRecord {
+    address: Option<String>,
+    id: Option<i64>,
+}
+
+impl TryFrom<WorkspaceRecord> for Workspace {
+    type Error = &'static str;
+
+    fn try_from(record: WorkspaceRecord) -> std::result::Result<Self, Self::Error> {
+        if let Some(address) = record.address {
+            if !address.is_empty() {
+                return Ok(Self::Address(address));
+            }
+            if record.id.is_some_and(|id| id != 0) {
+                return Err("empty Hyprland workspace address with nonzero legacy ID");
+            }
+            return Ok(Self::Empty);
+        }
+        match record.id {
+            Some(0) => Ok(Self::Empty),
+            Some(id) => Ok(Self::LegacyId(id)),
+            None => Err("missing Hyprland workspace identity (address or legacy id)"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -197,7 +229,7 @@ pub struct Window {
     pub y: i32,
     pub width: u32,
     pub height: u32,
-    pub workspace: i64,
+    pub workspace: Workspace,
     pub visible: bool,
     /// `Some(true)` for XWayland, `Some(false)` for native Wayland, `None`
     /// when the compositor did not report the flag.
@@ -378,7 +410,7 @@ fn read_reply(stream: &mut UnixStream, command: &[u8], timeout: Duration) -> Res
     Ok(reply)
 }
 
-fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<Vec<Window>> {
+fn windows_from_clients(clients: Vec<Client>, active: &HashSet<Workspace>) -> Result<Vec<Window>> {
     let mut seen = HashSet::new();
     let mut windows = Vec::new();
     for c in clients.into_iter().filter(|c| c.mapped) {
@@ -396,6 +428,10 @@ fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<V
         if pid == 0 || !valid_dimensions(width, height) {
             continue;
         }
+        if c.workspace == Workspace::Empty {
+            bail!("mapped Hyprland client has no workspace identity");
+        }
+        let visible = !c.hidden && active.contains(&c.workspace);
         windows.push(Window {
             address,
             pid,
@@ -405,8 +441,8 @@ fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<V
             y: c.at[1],
             width,
             height,
-            workspace: c.workspace.id,
-            visible: !c.hidden && active.contains(&c.workspace.id),
+            workspace: c.workspace,
+            visible,
             xwayland: c.xwayland,
             hidden: c.hidden,
             focus_order: c.focus_history,
@@ -757,8 +793,8 @@ pub fn list_windows() -> Result<Vec<Window>> {
     let active = monitors
         .into_iter()
         .filter(|m| m.dpms_status || !any_powered)
-        .flat_map(|m| [m.active_workspace.id, m.special_workspace.id])
-        .filter(|id| *id != 0)
+        .flat_map(|m| [m.active_workspace, m.special_workspace])
+        .filter(|workspace| *workspace != Workspace::Empty)
         .collect();
     windows_from_clients(query("j/clients")?, &active)
 }
@@ -918,7 +954,7 @@ mod tests {
             y: 38,
             width: 800,
             height: 600,
-            workspace: 1,
+            workspace: Workspace::LegacyId(1),
             visible: true,
             xwayland: Some(false),
             hidden: false,
@@ -944,7 +980,7 @@ mod tests {
 
     #[test]
     fn client_xwayland_flag_is_tri_state() {
-        let active = HashSet::from([1]);
+        let active = HashSet::from([Workspace::LegacyId(1)]);
         let with = |flag: Option<bool>| {
             let mut c = client("0x10", 42, [800, 600]);
             c.xwayland = flag;
@@ -1273,7 +1309,7 @@ mod tests {
 
     #[test]
     fn unrepresentable_client_does_not_hide_valid_siblings() {
-        let active = HashSet::from([1]);
+        let active = HashSet::from([Workspace::LegacyId(1)]);
         let windows = windows_from_clients(
             vec![
                 client("0x10", 42, [800, 600]),
@@ -1295,7 +1331,7 @@ mod tests {
 
     #[test]
     fn null_and_duplicate_client_addresses_still_fail() {
-        let active = HashSet::from([1]);
+        let active = HashSet::from([Workspace::LegacyId(1)]);
         let null_address =
             windows_from_clients(vec![client("0x0", 42, [800, 600])], &active).unwrap_err();
         assert_eq!(
