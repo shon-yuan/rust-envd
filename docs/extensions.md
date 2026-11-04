@@ -278,7 +278,7 @@ SPDX texts in `scripts/license-overrides/`.
 - rust-envd suite: 864 passed, 0 failed (24 ignored by features), including
   `tests/extensions.rs` (no-shadow, merge over the Connect fallback,
   empty-set identity) and the supervisor/proxy tests in `src/ext/cua.rs`
-  (25 in that module: health and failure reporting, restart count and
+  (26 in that module: health and failure reporting, restart count and
   replacement after exit, backoff bounds and jitter, restart-budget
   exhaustion, `COORWORKER_CUA_MAX_RESTARTS` parsing, Prometheus exposition,
   tool-metric label cap and `other` overflow, `tools/call` extraction from
@@ -315,6 +315,15 @@ SPDX texts in `scripts/license-overrides/`.
   attempts: …`; `/cua/metrics` reported
   `..._worker_budget_exhausted 1`; six seconds later the launch count was
   still three and the daemon had no children. S0 `/health` stayed `204`.
+- Ready-then-crash budget regression: a successful relaunch must retain the
+  failure count until a stable run, rather than resetting it at readiness.
+  `ready_workers_that_crash_still_exhaust_the_restart_budget` failed by
+  timing out before the fix and passes afterward. A real daemon run with a
+  worker that binds its loopback listener for 0.5 s and then exits `1` on
+  every launch reached healthy, launched exactly three times with budget
+  `3`, then stopped with `restarts: 3` and `budget_exhausted: true`. After
+  another three seconds the launch count was unchanged, there were no child
+  processes, and S0 `/health` still returned `204`.
 - Proxy tool-metric run (Xvfb `:98`, spawned worker on `3216`, envd dev on
   `49989` with `COORWORKER_CUA_PROXY_TOKEN`): MCP `initialize` and
   `tools/call` for `list_windows` (one real window) and `get_screen_size`

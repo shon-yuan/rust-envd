@@ -599,7 +599,8 @@ async fn supervise<F, Fut>(
                 }
                 match relaunch(binary.to_path_buf(), listen).await {
                     Ok(worker) => {
-                        attempts = 0;
+                        // Readiness is not stability: retain failures until
+                        // a worker survives STABLE_AFTER and then exits.
                         update(&state.status, |status| {
                             status.running = true;
                             status.detail = None;
@@ -1810,7 +1811,11 @@ mod tests {
         assert!(!status.running);
         assert!(status.budget_exhausted);
         assert_eq!(status.restarts, 3);
-        assert!(status.detail.as_deref().unwrap().contains("after 3 attempts"));
+        assert!(status
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("after 3 attempts"));
     }
 
     #[tokio::test]
