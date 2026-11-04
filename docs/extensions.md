@@ -379,16 +379,14 @@ acceptance is pending. The current static build attempt failed because
 was verified separately. CI now defines base/desktop and static build lanes;
 that configuration alone is not a successful CI run.
 
-The local `cargo audit --no-fetch` result is **not clean**: 3 vulnerabilities,
-7 unmaintained warnings and 11 unsound warnings. The optional desktop graph
-uses the existing worker's zstd 0.13.4 and zstd-safe 7.4.0. Source review found
-no uses of the affected borrowed-context constructors (RUSTSEC-2026-0391),
-seekable feature/API (RUSTSEC-2026-0398), or write-decoder output path
-(RUSTSEC-2026-0403). Theme decompression is reachable through authenticated
-MCP and uses a fresh read decoder; this is a specific API reachability
-assessment, not a clean dependency audit. The preexisting Tokio 1.53.2
-RUSTSEC-2026-0386 warning remains unresolved; Linux uses `AsyncFd`, so it is
-not classified as unreachable. Other warnings were not exhaustively assessed.
+The follow-up [dependency security maintenance](dependency-security.md) updates
+the root to Tokio 1.53.3 and both consumer graphs to zstd 0.14.3 /
+zstd-safe 8.2.0. The standalone worker retains its already-fixed Tokio 1.54.1.
+Both local `cargo audit --no-fetch` runs now exit 0 with zero vulnerabilities
+and zero unsound warnings. Seven unmaintained-dependency warnings remain in
+each graph; they have not been hidden or classified as fixed. The earlier CUA
+acceptance audit failed with three vulnerabilities and the Tokio warning;
+the maintenance record preserves that baseline and the ownership migration.
 
 ### Earlier worker and enumeration evidence
 

@@ -220,26 +220,34 @@ fn validate_carried_fds_rejects_closed_batch_tail_without_consuming_valid_prefix
     assert_test_fds_open(&fds);
 }
 
-fn private_fd_runtime() -> (tokio::runtime::Runtime, [OwnedFd; 4]) {
-    // Initialize Tokio's process-global signal resources on the shared table
-    // before making a private copy; another test's reactor must see them too.
-    let bootstrap = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .build()
-        .unwrap();
-    drop(bootstrap);
-    // Only this test thread changes tables. Other parallel tests keep their
-    // original descriptors, including any occupant of a handover slot.
-    // SAFETY: CLONE_FILES takes no pointer arguments and copies the fd table.
-    assert_eq!(
-        unsafe { libc::unshare(libc::CLONE_FILES) },
-        0,
-        "isolate test fd table: {}",
-        std::io::Error::last_os_error()
+// Return true only inside this test's own process. Fixed slots and Tokio's
+// process-global signal descriptors must never share a table with other tests.
+fn in_isolated_process(name: &str) -> bool {
+    const CHILD: &str = "ENVD_HANDOVER_ISOLATED_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return true;
+    }
+    let qualified = format!("{}::{name}", module_path!());
+    let (_, test_name) = qualified.split_once("::").unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, name)
+        .output()
+        .expect("start isolated handover test");
+    assert!(
+        output.status.success(),
+        "isolated handover test failed: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
+    false
+}
+
+fn private_fd_runtime() -> (tokio::runtime::Runtime, [OwnedFd; 4]) {
     for fd in HANDOVER_FD_BASE..HANDOVER_FD_BASE + 4 {
-        // These are inherited copies in the private table, before this test
-        // has created any owners or reactor registrations of its own.
+        // This single-test child has not initialized Tokio or created any
+        // owners in the handover window. Closing inherited copies is local.
         let _ = nix::unistd::close(fd);
     }
     let reserved = std::array::from_fn(|index| {
@@ -322,6 +330,10 @@ fn export_runtime(entry: Arc<Entry>) -> ProcessRuntime {
 
 #[test]
 fn export_cancellation_while_waiting_for_deadline_closes_allocated_slots() {
+    if !in_isolated_process("export_cancellation_while_waiting_for_deadline_closes_allocated_slots")
+    {
+        return;
+    }
     let (executor, reserved) = private_fd_runtime();
     executor.block_on(async {
         let (entry, _peers) = export_entry();
@@ -372,6 +384,9 @@ fn export_cancellation_while_waiting_for_deadline_closes_allocated_slots() {
 
 #[test]
 fn export_keeps_stdin_owner_while_waiting_for_pty_snapshot() {
+    if !in_isolated_process("export_keeps_stdin_owner_while_waiting_for_pty_snapshot") {
+        return;
+    }
     let (executor, reserved) = private_fd_runtime();
     executor.block_on(async {
         let (entry, _peers) = export_entry();
@@ -405,6 +420,9 @@ fn export_keeps_stdin_owner_while_waiting_for_pty_snapshot() {
 
 #[test]
 fn readopt_cancellation_closes_current_and_later_transferred_endpoints() {
+    if !in_isolated_process("readopt_cancellation_closes_current_and_later_transferred_endpoints") {
+        return;
+    }
     use std::io::Read;
     use std::os::fd::IntoRawFd;
 
@@ -452,6 +470,11 @@ fn readopt_cancellation_closes_current_and_later_transferred_endpoints() {
 
 #[test]
 fn readopt_registration_failure_releases_endpoints_and_adopts_valid_sibling() {
+    if !in_isolated_process(
+        "readopt_registration_failure_releases_endpoints_and_adopts_valid_sibling",
+    ) {
+        return;
+    }
     use std::io::Read;
     use std::os::fd::IntoRawFd;
 
@@ -502,6 +525,9 @@ fn readopt_registration_failure_releases_endpoints_and_adopts_valid_sibling() {
 
 #[test]
 fn terminal_handover_descriptor_keeps_master_alive_after_close() {
+    if !in_isolated_process("terminal_handover_descriptor_keeps_master_alive_after_close") {
+        return;
+    }
     let (executor, _reserved) = private_fd_runtime();
     executor.block_on(async {
         // A private /dev/ptmx pair needs neither a child process nor a desktop.

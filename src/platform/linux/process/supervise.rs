@@ -440,7 +440,9 @@ async fn wait_adopted(pid: u32) -> std::io::Result<std::process::ExitStatus> {
         // SAFETY: pidfd_open handed us a fresh descriptor this block solely
         // owns; AsyncFd closes it on drop.
         let owned = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
-        let async_fd = tokio::io::unix::AsyncFd::new(owned)?;
+        // SAFETY: this registration owns the pidfd exclusively. Completion or
+        // cancellation drops it before its OwnedFd closes the descriptor.
+        let async_fd = unsafe { tokio::io::unix::AsyncFd::register(owned)? };
         // The pidfd reports readable exactly once — when the process exits.
         let _ = async_fd.readable().await?;
         drop(async_fd);

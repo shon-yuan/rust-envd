@@ -533,8 +533,8 @@ Full license texts are copied verbatim under `licenses/<crate>-<version>/`. Copy
 | zerovec-derive                    | 0.11.7                        | Unicode-3.0                                         | LICENSE |
 | zlib-rs                           | 0.6.8                         | Zlib                                                | LICENSE |
 | zmij                              | 1.0.23                        | MIT                                                 | LICENSE-MIT |
-| zstd                              | 0.13.4                        | BSD-3-Clause                                        | LICENSE |
-| zstd-safe                         | 7.4.0                         | BSD-3-Clause                                        | LICENSE |
+| zstd                              | 0.14.3                        | BSD-3-Clause                                        | LICENSE |
+| zstd-safe                         | 8.2.0                         | BSD-3-Clause                                        | LICENSE |
 | zstd-sys                          | 2.1.2+zstd.1.5.7              | BSD-3-Clause                                        | LICENSE, LICENSE.BSD-3-Clause |
 | zune-core                         | 0.5.1                         | MIT OR Apache-2.0 OR Zlib                           | LICENSE-APACHE, LICENSE-MIT, LICENSE-ZLIB |
 | zune-jpeg                         | 0.5.15                        | MIT OR Apache-2.0 OR Zlib                           | LICENSE-APACHE, LICENSE-MIT, LICENSE-ZLIB |
@@ -3606,15 +3606,15 @@ Full license texts are copied verbatim under `licenses/<crate>-<version>/`. Copy
 - Copyright: none embedded in the license file(s); see full text
 - Repository: https://github.com/dtolnay/zmij
 
-#### zstd 0.13.4 — BSD-3-Clause
+#### zstd 0.14.3 — BSD-3-Clause
 
-- Files: licenses/zstd-0.13.4/LICENSE
+- Files: licenses/zstd-0.14.3/LICENSE
 - Copyright (LICENSE): Copyright (c) 2026, Alexandre Bury
 - Repository: https://github.com/gyscos/zstd-rs
 
-#### zstd-safe 7.4.0 — BSD-3-Clause
+#### zstd-safe 8.2.0 — BSD-3-Clause
 
-- Files: licenses/zstd-safe-7.4.0/LICENSE
+- Files: licenses/zstd-safe-8.2.0/LICENSE
 - Copyright (LICENSE): Copyright (c) 2026, Alexandre Bury
 - Repository: https://github.com/gyscos/zstd-rs
 

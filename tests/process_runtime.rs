@@ -1568,9 +1568,12 @@ async fn handover_readopt_carries_a_plain_child_across_the_swap_body() {
     let rt = runtime();
     let (thawed_tx, thawed) = tokio::sync::watch::channel(());
     thawed_tx.send(()).unwrap();
-    let (adopted, failed) = rt
-        .readopt_processes(&[carried_plain_proc(pid)], thawed)
-        .await;
+    // SAFETY: the isolated child duplicated each endpoint into a unique slot;
+    // no other owner or registration retains the slot numbers.
+    let (adopted, failed) = unsafe {
+        rt.readopt_processes(&[carried_plain_proc(pid)], thawed)
+            .await
+    };
     assert_eq!((adopted, failed), (1, 0), "readopt must adopt the child");
     assert!(rt.list().await.iter().any(|info| info.pid == pid));
 
@@ -1623,9 +1626,12 @@ async fn handover_readopt_end_event_reports_the_signal_verbatim_body() {
     let rt = runtime();
     let (thawed_tx, thawed) = tokio::sync::watch::channel(());
     thawed_tx.send(()).unwrap();
-    let (adopted, failed) = rt
-        .readopt_processes(&[carried_plain_proc(pid)], thawed)
-        .await;
+    // SAFETY: the isolated child duplicated each endpoint into a unique slot;
+    // no other owner or registration retains the slot numbers.
+    let (adopted, failed) = unsafe {
+        rt.readopt_processes(&[carried_plain_proc(pid)], thawed)
+            .await
+    };
     assert_eq!((adopted, failed), (1, 0));
     let mut stream = rt.connect(&pid_selector(pid)).await.unwrap();
     assert_eq!(start_pid(&mut stream).await, pid);
@@ -1699,7 +1705,8 @@ async fn handover_readopt_pty_rebuilds_the_master_and_pumps_the_terminal_body() 
     let rt = runtime();
     let (thawed_tx, thawed) = tokio::sync::watch::channel(());
     thawed_tx.send(()).unwrap();
-    let (adopted, failed) = rt.readopt_processes(&[carried], thawed).await;
+    // SAFETY: this isolated child exclusively transfers its duplicated PTY slot.
+    let (adopted, failed) = unsafe { rt.readopt_processes(&[carried], thawed).await };
     assert_eq!((adopted, failed), (1, 0));
 
     let mut stream = rt.connect(&pid_selector(pid)).await.unwrap();
@@ -1746,7 +1753,10 @@ async fn handover_readopt_relocates_a_real_export_slot_window_body() {
 
     let rt2 = runtime();
     let (_thawed_tx, thawed) = tokio::sync::watch::channel(());
-    let (adopted, failed) = rt2.readopt_processes(&procs, thawed).await;
+    // Emulate exec: transfer the slots instead of retaining a stale closing guard.
+    std::mem::forget(guard);
+    // SAFETY: the guard was disarmed; only readopt owns these exported slots.
+    let (adopted, failed) = unsafe { rt2.readopt_processes(&procs, thawed).await };
     assert_eq!((adopted, failed), (1, 0));
     // The relocated slots are freed: a second handover could dup3 onto them.
     let slots = [procs[0].stdout_fd, procs[0].stderr_fd, procs[0].stdin_fd];
@@ -1775,7 +1785,6 @@ async fn handover_readopt_relocates_a_real_export_slot_window_body() {
         nix::unistd::Pid::from_raw(pid as i32),
         nix::sys::signal::Signal::SIGKILL,
     );
-    drop(guard);
 }
 
 async fn handover_chained_export_carries_readopted_stdio_body() {
@@ -1791,11 +1800,11 @@ async fn handover_chained_export_carries_readopted_stdio_body() {
     let rt2 = runtime();
     let (thawed_tx, thawed) = tokio::sync::watch::channel(());
     thawed_tx.send(()).unwrap();
-    let (adopted, failed) = rt2.readopt_processes(&procs, thawed).await;
-    assert_eq!((adopted, failed), (1, 0));
-    // readopt consumed the slot window; the old guard must not close numbers
-    // the next export is about to reuse.
+    // Emulate exec: transfer the slots instead of retaining a stale closing guard.
     std::mem::forget(guard1);
+    // SAFETY: the guard was disarmed; only readopt owns these exported slots.
+    let (adopted, failed) = unsafe { rt2.readopt_processes(&procs, thawed).await };
+    assert_eq!((adopted, failed), (1, 0));
 
     // A second handover out of a re-adopted runtime: Go's HandoverFds reads
     // the live handler files, so the endpoints must still be carried even

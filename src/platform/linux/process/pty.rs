@@ -61,8 +61,11 @@ impl Terminal {
                     // `open /dev/pts/N: <errno text>`.
                     super::spawn::path_text_error("open", &slave_path, error)
                 })?;
+            // SAFETY: File exclusively owns the fresh master. Active operations
+            // retain the same Arc registration; close never replaces its fd.
+            let master = unsafe { AsyncFd::register(master)? };
             let terminal = Arc::new(Self {
-                fd: std::sync::Mutex::new(Some(Arc::new(AsyncFd::new(master)?))),
+                fd: std::sync::Mutex::new(Some(Arc::new(master))),
                 closed: tokio::sync::watch::channel(false).0,
                 writing: Mutex::new(()),
             });
@@ -95,14 +98,13 @@ impl Terminal {
             .ok_or_else(|| io::ErrorKind::BrokenPipe.into())
     }
 
-    /// The master descriptor a chained upgrade relocates (Go `HandoverFds`
-    /// reads `p.tty` the same way). Absent once closed or fully detached.
-    pub(super) fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+    /// Keep the master registration alive until a handover duplicates it.
+    /// Absent once closed or fully detached; a returned snapshot survives close.
+    pub(super) fn handover_descriptor(&self) -> Option<Arc<AsyncFd<std::fs::File>>> {
         self.fd
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .map(|fd| fd.get_ref().as_raw_fd())
+            .clone()
     }
 
     /// Rebuild the terminal around a master descriptor inherited across the
@@ -110,8 +112,11 @@ impl Terminal {
     /// open-file-description with the outgoing master, so nonblocking and the
     /// kernel terminal state (winsize, termios) ride along unchanged.
     pub(super) fn from_master(fd: std::os::fd::OwnedFd) -> io::Result<Arc<Self>> {
+        // SAFETY: the transferred master remains owned by File for the full
+        // registration lifetime. Active operations retain the same Arc.
+        let fd = unsafe { AsyncFd::register(std::fs::File::from(fd))? };
         Ok(Arc::new(Self {
-            fd: std::sync::Mutex::new(Some(Arc::new(AsyncFd::new(std::fs::File::from(fd))?))),
+            fd: std::sync::Mutex::new(Some(Arc::new(fd))),
             closed: tokio::sync::watch::channel(false).0,
             writing: Mutex::new(()),
         }))

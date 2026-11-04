@@ -2,7 +2,7 @@
 //!
 //! The caller owns execution admission. Cgroup admission is supplied through
 //! the daemon wiring. Live-upgrade adoption works like the oracle's
-//! (upgrade.go:156-250 out, readopt.go in): the outgoing envd dup3's each
+//! (upgrade.go:156-250 out, readopt.go in): the outgoing envd duplicates each
 //! live child's daemon-side pipe ends onto fixed handover slots with CLOEXEC
 //! cleared, the blob carries the descriptor numbers plus each process's
 //! config, and the incoming envd relocates them off the slots and rebuilds
@@ -566,7 +566,7 @@ impl ProcessRuntime {
 
     /// The outgoing handover's process table (upgrade.go:218-250): each live
     /// child carries its pid, tag, config, remaining kill deadline and the
-    /// daemon-side descriptors dup3'd onto the fixed slot window
+    /// daemon-side descriptors duplicated onto the fixed slot window
     /// (`fdBase + i*5`) with CLOEXEC cleared, so they ride the execve. The
     /// snapshot takes the registry lock; the spawn barrier — the freeze hold
     /// `do_upgrade` already holds — keeps concurrent Start admissions out of
@@ -584,7 +584,9 @@ impl ProcessRuntime {
         let mut pids: Vec<u32> = registry.live.keys().copied().collect();
         pids.sort_unstable();
         let mut carried = Vec::with_capacity(pids.len());
-        let mut relocated: Vec<RawFd> = Vec::new();
+        // Own slots from their first allocation, including while a later
+        // mutex wait is pending: cancellation must close the partial export.
+        let mut relocated = HandoverFdGuard(Vec::new());
         for (index, pid) in pids.iter().enumerate() {
             let entry = &registry.live[pid];
             let slot = HANDOVER_FD_BASE + (index as RawFd) * 5;
@@ -598,19 +600,24 @@ impl ProcessRuntime {
                 .as_ref()
                 .map(|fd| fd.as_ref().as_raw_fd())
                 .unwrap_or(-1);
-            let stdin = entry
-                .stdin
-                .lock()
-                .await
+            // Supervision can remove stdin without taking the registry lock.
+            // Keep its owner locked until every synchronous duplication ends.
+            let stdin_owner = entry.stdin.lock().await;
+            let stdin = stdin_owner
                 .as_ref()
                 .map(pipe::StdinPipe::raw_fd)
                 .unwrap_or(-1);
-            let tty = entry
+            // Terminal::close may run independently of the entry's PTY mutex.
+            // A strong registration reference keeps its descriptor alive.
+            let tty_owner = entry
                 .pty
                 .lock()
                 .await
                 .as_ref()
-                .and_then(|terminal| terminal.raw_fd())
+                .and_then(|terminal| terminal.handover_descriptor());
+            let tty = tty_owner
+                .as_ref()
+                .map(|fd| fd.get_ref().as_raw_fd())
                 .unwrap_or(-1);
             let mut carried_proc = crate::proto::upgrade::HandoverProc {
                 pid: *pid,
@@ -628,28 +635,19 @@ impl ProcessRuntime {
             let endpoints = [stdout, stderr, stdin, tty];
             for (which, old) in endpoints.iter().enumerate() {
                 let target = slot + which as RawFd;
-                match dup_keep(*old, target) {
-                    Ok(fd) => {
-                        match which {
-                            0 => carried_proc.stdout_fd = fd,
-                            1 => carried_proc.stderr_fd = fd,
-                            2 => carried_proc.stdin_fd = fd,
-                            _ => carried_proc.tty_fd = fd,
-                        }
-                        if fd >= 0 {
-                            relocated.push(fd);
-                        }
-                    }
-                    Err(error) => {
-                        // Close the slots already relocated so a retry sees
-                        // the clean target window (upgrade.go:228-237).
-                        for fd in relocated {
-                            let _ = nix::unistd::close(fd);
-                        }
-                        return Err(error);
-                    }
+                let fd = dup_keep(*old, target)?;
+                match which {
+                    0 => carried_proc.stdout_fd = fd,
+                    1 => carried_proc.stderr_fd = fd,
+                    2 => carried_proc.stdin_fd = fd,
+                    _ => carried_proc.tty_fd = fd,
+                }
+                if fd >= 0 {
+                    relocated.0.push(fd);
                 }
             }
+            drop(stdin_owner);
+            drop(tty_owner);
             // Carry the remaining timeout; a deadline already in the past is
             // clamped to 1ms (kill ASAP) (upgrade.go:244-250).
             if let Some(at) = entry.deadline_at.lock().await.as_ref() {
@@ -661,7 +659,7 @@ impl ProcessRuntime {
             }
             carried.push(carried_proc);
         }
-        Ok((carried, HandoverFdGuard(relocated)))
+        Ok((carried, relocated))
     }
 
     /// The incoming handover's re-adoption loop (readopt.go `ResumeFromHandover`
@@ -670,16 +668,34 @@ impl ProcessRuntime {
     /// it and start the adopted supervision (readers, pid-specific reaper,
     /// thaw-gated kill timer). Returns (adopted, failed); a failure is
     /// logged, not fatal — the workload keeps the rest of its handover.
+    /// Invalid/aliased batches are rejected without consuming any descriptor.
+    ///
+    /// # Safety
+    /// Present descriptors must be open, uniquely numbered inherited endpoints.
+    /// After validation, exclusive ownership transfers to this operation: no
+    /// caller owner or registration may close, replace, or reuse those numbers.
+    /// Once polled, all accepted endpoints enter owned storage before awaiting,
+    /// so cancellation drops pending endpoints as well as active registrations.
     #[allow(dead_code)] // Unused only where the test harness compiles this file directly.
-    pub async fn readopt_processes(
+    pub async unsafe fn readopt_processes(
         &self,
         processes: &[crate::proto::upgrade::HandoverProc],
         thawed: watch::Receiver<()>,
     ) -> (usize, usize) {
+        if let Err(error) = validate_carried_fds(processes) {
+            eprintln!("handover: invalid descriptors: {error}");
+            return (0, processes.len());
+        }
+        // Take the complete batch into RAII storage before the first await.
+        let endpoints: Vec<_> = processes.iter().map(relocate_carried_fds).collect();
         let mut adopted = 0;
         let mut failed = 0;
-        for proc in processes {
-            match self.readopt_one(proc, thawed.clone()).await {
+        for (proc, endpoints) in processes.iter().zip(endpoints) {
+            let result = match endpoints {
+                Ok(endpoints) => self.readopt_one(proc, endpoints, thawed.clone()).await,
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(()) => adopted += 1,
                 Err(error) => {
                     eprintln!("handover: readopt pid {}: {error}", proc.pid);
@@ -696,34 +712,20 @@ impl ProcessRuntime {
     async fn readopt_one(
         &self,
         proc: &crate::proto::upgrade::HandoverProc,
+        endpoints: [Option<std::os::fd::OwnedFd>; 4],
         thawed: watch::Receiver<()>,
     ) -> Result<(), String> {
-        let relocate =
-            |slot: i32| -> Option<std::os::fd::OwnedFd> { pipe::relocate_carried_fd(slot).ok() };
+        let [stdout_fd, stderr_fd, stdin_fd, tty_fd] = endpoints;
         let is_pty = proc.cg_type == "pty";
-        // A PTY child's I/O is the master; its carried stdout/stderr (absent
-        // from the outgoing side) are dropped rather than wrapped. Non-PTY
-        // endpoints are relocated first and stay owned by the entry, so the
-        // next handover can carry them (Go `HandoverFds` reports the
-        // readopted handler's live files).
         let (terminal, stdout_owned, stderr_owned) = if is_pty {
-            let tty = relocate(proc.tty_fd)
-                .ok_or_else(|| format!("tty descriptor absent for pty pid {}", proc.pid))?;
+            let tty =
+                tty_fd.ok_or_else(|| format!("tty descriptor absent for pty pid {}", proc.pid))?;
             let terminal = pty::Terminal::from_master(tty)
                 .map_err(|error| format!("adopted master for pid {}: {error}", proc.pid))?;
             (Some(terminal), None, None)
         } else {
-            (
-                None,
-                relocate(proc.stdout_fd).map(Arc::new),
-                relocate(proc.stderr_fd).map(Arc::new),
-            )
+            (None, stdout_fd.map(Arc::new), stderr_fd.map(Arc::new))
         };
-        // Relocate every carried descriptor before any fallible registration:
-        // on failure the owned values below drop and close every slot this
-        // process owned, so no CLOEXEC-cleared handover fd survives into the
-        // next export (which keys slots by sorted-pid index).
-        let stdin_fd = relocate(proc.stdin_fd);
         // The pump registers the entry's own descriptor: Go's `Readopt` keeps
         // `args.Stdout` and both the handler and the pump share that one
         // `*os.File`, so a chained export reports the same endpoint. A failed
@@ -733,7 +735,9 @@ impl ProcessRuntime {
             let Some(fd) = fd else {
                 return Ok(None);
             };
-            tokio::io::unix::AsyncFd::new(pipe::SharedFd(fd.clone()))
+            // SAFETY: SharedFd retains a strong reference to the relocated
+            // OwnedFd. No owner closes/replaces its number while registered.
+            unsafe { tokio::io::unix::AsyncFd::register(pipe::SharedFd(fd.clone())) }
                 .map(pipe::FdReader)
                 .map(Some)
                 .map_err(|error| format!("adopted reader for pid {}: {error}", proc.pid))
@@ -743,7 +747,9 @@ impl ProcessRuntime {
         let stdin = match stdin_fd {
             None => None,
             Some(fd) => Some(pipe::StdinPipe::Adopted(
-                tokio::io::unix::AsyncFd::new(std::fs::File::from(fd))
+                // SAFETY: File takes exclusive ownership of the relocated fd;
+                // the stdin mutex serializes I/O with removal of its owner.
+                unsafe { tokio::io::unix::AsyncFd::register(std::fs::File::from(fd)) }
                     .map_err(|error| format!("adopted stdin for pid {}: {error}", proc.pid))?,
             )),
         };
@@ -794,23 +800,62 @@ impl ProcessRuntime {
     }
 }
 
-/// Go upgrade.go:58-77 (`dupKeep`): relocate `old` onto `target` with CLOEXEC
-/// cleared so the descriptor survives the execve. Returns -1 when `old` is
-/// absent, and errors if `target` is already open: dup3 silently closes the
-/// occupant, so a collision must abort the upgrade rather than corrupt a
-/// live descriptor.
-fn dup_keep(old: RawFd, target: RawFd) -> Result<RawFd, String> {
+/// Validate the whole raw batch before consuming any inherited endpoint.
+fn validate_carried_fds(processes: &[crate::proto::upgrade::HandoverProc]) -> Result<(), String> {
     use nix::fcntl::{fcntl, FcntlArg::F_GETFD};
-    use nix::unistd::dup3;
+    let mut seen = std::collections::HashSet::new();
+    for proc in processes {
+        for fd in [proc.stdout_fd, proc.stderr_fd, proc.stdin_fd, proc.tty_fd] {
+            if fd < 0 {
+                continue;
+            }
+            if !seen.insert(fd) {
+                return Err(format!("handover descriptor {fd} appears more than once"));
+            }
+            fcntl(fd, F_GETFD).map_err(|error| format!("handover descriptor {fd}: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn relocate_carried_fds(
+    proc: &crate::proto::upgrade::HandoverProc,
+) -> Result<[Option<std::os::fd::OwnedFd>; 4], String> {
+    // Evaluate every endpoint before propagating an error: all successful
+    // relocations then close through RAII even when another endpoint fails.
+    let [stdout, stderr, stdin, tty] = [proc.stdout_fd, proc.stderr_fd, proc.stdin_fd, proc.tty_fd]
+        .map(|slot| {
+            if slot < 0 {
+                return Ok(None);
+            }
+            pipe::relocate_carried_fd(slot).map(Some).map_err(|error| {
+                // Validation and the transfer contract establish exclusive
+                // ownership. A failed duplication still leaves this slot ours.
+                let _ = nix::unistd::close(slot);
+                format!("relocate descriptor {slot} for pid {}: {error}", proc.pid)
+            })
+        });
+    Ok([stdout?, stderr?, stdin?, tty?])
+}
+
+/// Allocate the fixed handover slot without ever overwriting an occupant.
+/// F_DUPFD atomically selects a free descriptor at or above target; a
+/// different result means the requested slot was occupied, so abort safely.
+fn dup_keep(old: RawFd, target: RawFd) -> Result<RawFd, String> {
+    use nix::fcntl::{fcntl, FcntlArg::F_DUPFD};
     if old < 0 {
         return Ok(-1);
     }
-    if fcntl(target, F_GETFD).is_ok() {
+    // Preserve the existing handover error label while allocating safely.
+    let fresh =
+        fcntl(old, F_DUPFD(target)).map_err(|error| format!("dup3 {old}->{target}: {error}"))?;
+    // SAFETY: F_DUPFD allocated a fresh descriptor, owned only by this scope.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fresh) };
+    if fresh != target {
         return Err(format!("handover fd target {target} already in use"));
     }
-    dup3(old, target, nix::fcntl::OFlag::empty())
-        .map(|_| target)
-        .map_err(|error| format!("dup3 {old}->{target}: {error}"))
+    use std::os::fd::IntoRawFd;
+    Ok(owned.into_raw_fd())
 }
 
 async fn write_input(entry: &Entry, input: &pb::ProcessInput) -> Result<(), RuntimeError> {

@@ -27,6 +27,9 @@ The distributable notice bundle
 the worker's separate bundle is under `third_party/cua-worker/`) and the
 release manifest procedure are specified in
 [`third_party/PACKAGING.md`](third_party/PACKAGING.md).
+Dependency security updates, remaining maintenance warnings and the Linux
+handover ownership migration are recorded in
+[`docs/dependency-security.md`](docs/dependency-security.md).
 
 ## Platforms
 
