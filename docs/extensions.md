@@ -322,7 +322,7 @@ SPDX texts in `scripts/license-overrides/`.
   `isError: true`, code `tool_invocation_failed`. The probe called only
   `list_windows`; it did not capture, send input or launch desktop apps.
   This is enumeration evidence, not rotated-display or action acceptance.
-- rust-envd suite: 864 passed, 0 failed (24 ignored by features), including
+- rust-envd suite: 866 passed, 0 failed (24 ignored by features), including
   `tests/extensions.rs` (no-shadow, merge over the Connect fallback,
   empty-set identity) and the supervisor/proxy tests in `src/ext/cua.rs`
   (26 in that module: health and failure reporting, restart count and
