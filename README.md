@@ -105,14 +105,21 @@ x64/x86 Spectre-mitigated libraries matching the selected toolset; see the
 The default build keeps desktop dependencies disabled and supports static musl
 packaging. Embedded mode serves `POST /cua/mcp` on envd's own listener, with no
 worker child or extra port. CUA stays closed until an envd token is installed;
-rotation and reset affect subsequent requests. S0 still uses `X-Access-Token`.
+rotation and authorized reset affect subsequent requests. Native Windows
+DPAPI provisioning supports rotation, but empty metadata cannot authorize a live
+reset; `/init {}` returns 401 and preserves the token. See the
+[native CUA acceptance](docs/windows-cua-acceptance.md#native-live-reset-limitation).
+S0 still uses `X-Access-Token`.
 
 Windows service launches, service handover successors, session zero, and
 unknown sessions cannot initialize embedded desktop execution. Use
 `shared-external` there: start `coorworker-cua` in the logged-in session and
 supply matching local transport credentials via `CUA_ENV_TOKEN` (or the
 helper's `--token-file`). The external client needs only the envd credential;
-the envd credential is never sent to the helper.
+the envd credential is never sent to the helper. The
+[native Windows CUA acceptance](docs/windows-cua-acceptance.md) establishes
+embedded capture/input/window operations and actual SCM/helper lifecycle,
+recovery and credential boundaries in a disposable Windows 11 copy.
 
 Legacy `COORWORKER_CUA_BIN`, `COORWORKER_CUA_EXTERNAL`, proxy tokens, restart
 budgets, and observed recoveries retain their existing behavior. Shared modes

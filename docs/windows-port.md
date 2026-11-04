@@ -17,8 +17,12 @@ The 314-test count above records the original port acceptance. The subsequent
 [dependency maintenance regression](windows-dependency-regression.md) at
 `c3cb81a` passed 321 native library tests plus 5 base or 9 desktop integration
 tests, 16 worker tests and another official SDK 27/27 run. It also verifies
-actual Session 0 embedded refusal. Interactive desktop operations and actual
-SCM lifecycle acceptance remain outside that follow-up.
+actual Session 0 embedded refusal. The separate
+[native CUA acceptance](windows-cua-acceptance.md) establishes embedded
+capture/click/type/window operations and actual SCM/helper start, stop,
+recovery and service restart in a disposable Windows 11 copy at the same
+source revision. Native DPAPI rotation works; empty metadata cannot authorize
+live credential reset, which returns 401 and preserves the current token.
 
 ## CUA desktop execution modes
 

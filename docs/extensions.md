@@ -85,6 +85,13 @@ holding the configuration lock. S0 continues accepting `X-Access-Token` and
 keeps its original fresh-boot policy and exclusions. Neither header substitutes
 for the other.
 
+On the native Windows DPAPI provisioning path, rotation is established but
+live reset is not: empty metadata is treated as unprovisioned and cannot
+provide the empty-token hash required to authorize `/init {}`. The request
+returns 401 and preserves the installed token. Synthetic-provider reset tests
+do not establish this native capability; see the
+[native acceptance limitation](windows-cua-acceptance.md#native-live-reset-limitation).
+
 ```sh
 cargo build --locked -j4 --features cua-desktop
 COORWORKER_CUA_MODE=embedded target/debug/coorworker-envd --development
@@ -373,11 +380,17 @@ limits/timeouts, and Windows service/session policy. Final Linux daemon suites
 passed: base 881 tests and desktop 885 tests, each with 0 failures and 24
 ignored tests. Shared-module coverage was 278/283 lines (98.23%) and 37/37
 functions (100%); this is not whole-project or branch coverage. Strict Clippy,
-formatting and the Windows base MSVC crosscheck passed locally. Native Windows desktop/service
-acceptance is pending. The current static build attempt failed because
-`x86_64-linux-musl-gcc` was unavailable; the desktop-free base dependency graph
-was verified separately. CI now defines base/desktop and static build lanes;
-that configuration alone is not a successful CI run.
+formatting and the Windows base MSVC crosscheck passed locally. That integration
+campaign did not include native Windows desktop/service acceptance, and its
+static build attempt lacked `x86_64-linux-musl-gcc`. The later
+[Linux maintenance regression](dependency-regression.md) includes a successful
+fresh static musl build and base 905 / desktop 909 tests. The
+[Windows maintenance regression](windows-dependency-regression.md) includes
+native base/desktop/worker gates and SDK 27/27. The separate
+[Windows CUA campaign](windows-cua-acceptance.md) adds real embedded graphics,
+window operations and SCM/helper lifecycle/recovery at the maintenance source
+revision; native credential live reset remains unsupported by the DPAPI
+provisioning path. CI configuration alone is not evidence of a successful run.
 
 The follow-up [dependency security maintenance](dependency-security.md) updates
 the root to Tokio 1.53.3 and both consumer graphs to zstd 0.14.3 /

@@ -10,6 +10,7 @@
 | [Dependency security](../docs/dependency-security.md) | Targeted advisory fixes, ownership migration and remaining warnings |
 | [Dependency runtime regression](../docs/dependency-regression.md) | Fresh musl build, isolated Go/Rust comparison, CUA and upgrade evidence |
 | [Windows dependency regression](../docs/windows-dependency-regression.md) | Native base/desktop/worker builds and tests, SDK and Session 0 refusal |
+| [Windows CUA acceptance](../docs/windows-cua-acceptance.md) | Isolated native embedded graphics/window actions, SCM/helper recovery, credential boundaries and reset limitation |
 | [Cua Driver provenance](../vendor/cua-driver/PROVENANCE.md) | Pinned vendor source, local changes and update procedure |
 
 Check the current manifests and lockfiles before making dependency claims. Historical evidence applies only to the recorded revision and scope.

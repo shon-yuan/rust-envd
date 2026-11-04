@@ -136,7 +136,10 @@ acceptance for the recorded revision. It does not establish interactive
 Session 1 capture, clicking, typing or application launch; actual SCM
 registration/start/stop; or service-to-user-session helper operation. No
 real desktop input or capture was performed. Session 0 refusal is not a
-substitute for those acceptance scenarios.
+substitute for those acceptance scenarios. Those scenarios subsequently passed
+in the separate [native CUA acceptance](windows-cua-acceptance.md) campaign
+using the same artifacts in a disposable VM copy. Its native DPAPI live-reset
+limitation remains explicit.
 
 There is no Windows Go oracle, so no Windows differential claim is made.
 No fresh Windows Clippy, coverage, release-profile build, guest image
