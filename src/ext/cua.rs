@@ -10,9 +10,11 @@
 //!
 //! Enabled with `COORWORKER_CUA_BIN`; the listen address defaults to
 //! `127.0.0.1:3211` and can be set with `COORWORKER_CUA_LISTEN`. The
-//! supervisor replaces a worker that exits (exponential backoff, reset after a
-//! stable run). A worker that fails to start leaves the extension unhealthy
-//! and visible, and never affects the envd surface.
+//! supervisor replaces a worker that exits (exponential backoff with bounded
+//! jitter, reset after a stable run) and stops relaunching after
+//! `COORWORKER_CUA_MAX_RESTARTS` consecutive failures. A worker that fails to
+//! start leaves the extension unhealthy and visible, and never affects the
+//! envd surface.
 //!
 //! With `COORWORKER_CUA_EXTERNAL` the extension instead **adopts** a worker it
 //! does not own: it probes `GET /health` on the same address and reports the
@@ -20,11 +22,13 @@
 //! shape — the worker belongs to the logged-in session, envd stays in session
 //! 0 — and it also fits any deployment that starts the worker itself.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
@@ -52,6 +56,14 @@ const READY_POLL: Duration = Duration::from_millis(50);
 const RESTART_BASE: Duration = Duration::from_millis(500);
 const RESTART_MAX: Duration = Duration::from_secs(30);
 const STABLE_AFTER: Duration = Duration::from_secs(60);
+/// Consecutive failed launches/exits after which the supervisor stops
+/// relaunching. Zero (or `COORWORKER_CUA_MAX_RESTARTS=0`) keeps the old
+/// infinite retry. A stable run clears the count, so this bounds a crash loop,
+/// not a worker that restarts occasionally.
+const MAX_RESTART_ATTEMPTS_DEFAULT: u32 = 8;
+/// Distinct tool names kept in the proxy metrics. Past this, every unknown
+/// name is attributed to `other`, so a hostile body cannot grow the label set.
+const TOOL_METRIC_NAMES: usize = 64;
 /// How often an adopted worker is probed. The worker answers `/health`
 /// without touching the desktop, so two seconds is cheap and keeps a
 /// `/cua/health` caller from reading a stale state for long.
@@ -74,6 +86,13 @@ struct WorkerStatus {
     detail: Option<String>,
     /// How many times a running worker has exited and been replaced.
     restarts: u32,
+    /// Adopted mode: how many times a worker envd does not own was seen to be
+    /// healthy again after it had been healthy and then stopped answering.
+    /// Never mixed with [`WorkerStatus::restarts`].
+    observed_restarts: u32,
+    /// Spawn mode: the supervisor gave up after its failure budget. Recovery
+    /// is manual (restart envd or fix the worker); nothing retries behind it.
+    budget_exhausted: bool,
 }
 
 impl WorkerStatus {
@@ -82,6 +101,8 @@ impl WorkerStatus {
             running: true,
             detail: None,
             restarts: 0,
+            observed_restarts: 0,
+            budget_exhausted: false,
         }
     }
 
@@ -90,6 +111,8 @@ impl WorkerStatus {
             running: false,
             detail: Some(detail.into()),
             restarts: 0,
+            observed_restarts: 0,
+            budget_exhausted: false,
         }
     }
 
@@ -105,6 +128,89 @@ impl WorkerStatus {
     }
 }
 
+/// Counters for calls the optional proxy forwards. Only `/cua/mcp` traffic is
+/// counted: a caller that reaches the worker directly, or the ToolHost WS
+/// relay, is invisible here and the docs say so.
+#[derive(Default)]
+struct ToolMetrics {
+    counts: BTreeMap<(String, bool), u64>,
+    names: BTreeSet<String>,
+    latency: Duration,
+}
+
+impl ToolMetrics {
+    fn record(&mut self, calls: &[String], ok: bool, elapsed: Duration) {
+        self.latency += elapsed;
+        for call in calls {
+            let name = if self.names.contains(call) || self.names.len() < TOOL_METRIC_NAMES {
+                self.names.insert(call.clone());
+                call.clone()
+            } else {
+                "other".to_owned()
+            };
+            *self.counts.entry((name, ok)).or_insert(0) += 1;
+        }
+    }
+
+    fn exposition(&self) -> String {
+        let mut body = String::from(
+            "# HELP coorworker_envd_cua_tool_calls_total Tool calls forwarded through /cua/mcp, by tool and outcome. Direct worker access and the ToolHost relay are not counted.\n\
+             # TYPE coorworker_envd_cua_tool_calls_total counter\n",
+        );
+        for ((tool, ok), count) in &self.counts {
+            body.push_str(&format!(
+                "coorworker_envd_cua_tool_calls_total{{tool=\"{}\",status=\"{}\"}} {count}\n",
+                metric_label(tool),
+                if *ok { "ok" } else { "error" }
+            ));
+        }
+        body.push_str(&format!(
+            "# HELP coorworker_envd_cua_tool_latency_seconds_sum Cumulative time spent forwarding tool calls through /cua/mcp.\n\
+             # TYPE coorworker_envd_cua_tool_latency_seconds_sum counter\n\
+             coorworker_envd_cua_tool_latency_seconds_sum {:.6}\n",
+            self.latency.as_secs_f64()
+        ));
+        body
+    }
+}
+
+/// Prometheus label values escape backslash, quote and newline. Tool names come
+/// from a caller's JSON, so they are untrusted text even after the name cap.
+fn metric_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Tool names in a proxied JSON-RPC body. A batch is walked item by item; a
+/// body that is not JSON, or a method other than `tools/call`, counts nothing.
+fn proxied_tool_calls(body: &[u8]) -> Vec<String> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let items: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    items
+        .into_iter()
+        .filter(|item| item.get("method").and_then(|m| m.as_str()) == Some("tools/call"))
+        .filter_map(|item| {
+            item.get("params")
+                .and_then(|params| params.get("name"))
+                .and_then(|name| name.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 /// The guest-facing credential. Separate from anything the worker uses: the
 /// proxy is what a remote caller can reach, the worker stays on loopback.
 struct Proxy {
@@ -118,6 +224,9 @@ struct CuaState {
     proxy: Option<Proxy>,
     /// The token the worker requires (`CUA_ENV_TOKEN`), injected on forward.
     worker_token: Option<Vec<u8>>,
+    /// Proxy-forwarded call counters. Present even when the proxy is absent so
+    /// every constructor has one shape; it then stays empty.
+    tool_metrics: Mutex<ToolMetrics>,
 }
 
 /// How the extension gets its worker.
@@ -142,6 +251,23 @@ fn resolve_launch(binary: Option<PathBuf>, external: bool, allow_spawn: bool) ->
     }
 }
 
+/// `COORWORKER_CUA_MAX_RESTARTS`: consecutive failed launches/exits before the
+/// supervisor gives up. Unset uses the default; `0` restores unlimited retry.
+fn parse_max_attempts(value: Option<std::ffi::OsString>) -> Result<u32, String> {
+    match value {
+        None => Ok(MAX_RESTART_ATTEMPTS_DEFAULT),
+        Some(value) => {
+            let text = value.to_string_lossy();
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(MAX_RESTART_ATTEMPTS_DEFAULT);
+            }
+            text.parse::<u32>()
+                .map_err(|error| format!("invalid COORWORKER_CUA_MAX_RESTARTS {text:?}: {error}"))
+        }
+    }
+}
+
 /// Supervises one `coorworker-cua` process, or watches one it does not own.
 pub struct CuaExtension {
     state: Arc<CuaState>,
@@ -152,7 +278,7 @@ impl CuaExtension {
     /// five seconds. A worker that cannot start is reported through
     /// [`Extension::health`] instead of aborting the daemon.
     pub async fn spawn(binary: PathBuf, listen: SocketAddr) -> Self {
-        Self::build(binary, listen, None).await
+        Self::build(binary, listen, None, MAX_RESTART_ATTEMPTS_DEFAULT).await
     }
 
     /// Spawns the worker and additionally exposes it as `POST /cua/mcp`.
@@ -162,10 +288,21 @@ impl CuaExtension {
     /// inherits — and is injected on every forwarded request, so the caller
     /// never needs it.
     pub async fn spawn_proxied(binary: PathBuf, listen: SocketAddr, proxy_token: Vec<u8>) -> Self {
-        Self::build(binary, listen, Some(proxy_token)).await
+        Self::build(
+            binary,
+            listen,
+            Some(proxy_token),
+            MAX_RESTART_ATTEMPTS_DEFAULT,
+        )
+        .await
     }
 
-    async fn build(binary: PathBuf, listen: SocketAddr, proxy_token: Option<Vec<u8>>) -> Self {
+    async fn build(
+        binary: PathBuf,
+        listen: SocketAddr,
+        proxy_token: Option<Vec<u8>>,
+        max_attempts: u32,
+    ) -> Self {
         // The first launch stays synchronous (and waits for the listener) so a
         // caller that spawns the extension knows whether it came up. After
         // that the supervisor owns the process and replaces it when it exits.
@@ -182,6 +319,7 @@ impl CuaExtension {
                 watched,
                 child,
                 attempts,
+                max_attempts,
                 |binary, listen| async move { launch(&binary, listen).await },
             )
             .await;
@@ -239,8 +377,13 @@ impl CuaExtension {
         };
         let proxy_token = std::env::var_os("COORWORKER_CUA_PROXY_TOKEN")
             .map(|value| value.to_string_lossy().into_owned().into_bytes());
+        let max_attempts = match parse_max_attempts(std::env::var_os("COORWORKER_CUA_MAX_RESTARTS"))
+        {
+            Ok(value) => value,
+            Err(error) => return Some(Self::unavailable(error)),
+        };
         Some(match launch {
-            Launch::Spawn(binary) => Self::build(binary, listen, proxy_token).await,
+            Launch::Spawn(binary) => Self::build(binary, listen, proxy_token, max_attempts).await,
             Launch::External => Self::adopt(listen, proxy_token).await,
         })
     }
@@ -254,6 +397,7 @@ impl CuaExtension {
                 mcp_url: format!("http://{DEFAULT_LISTEN}/mcp"),
                 proxy: None,
                 worker_token: None,
+                tool_metrics: Mutex::new(ToolMetrics::default()),
             }),
         }
     }
@@ -281,6 +425,7 @@ fn shared_state(
         mcp_url: format!("http://{listen}/mcp"),
         proxy,
         worker_token,
+        tool_metrics: Mutex::new(ToolMetrics::default()),
     })
 }
 
@@ -316,19 +461,41 @@ async fn launch(binary: &Path, listen: SocketAddr) -> Result<Child, String> {
 /// Watches an adopted worker. Only the snapshot changes; the worker's process
 /// belongs to someone else, so there is nothing here to restart.
 async fn watch(listen: SocketAddr, state: Arc<CuaState>) {
+    // A worker that was healthy at adoption and later comes back is a restart
+    // envd observed but did not perform; one that was never up is a start.
+    let mut ever_healthy = match state.status.lock() {
+        Ok(status) => status.running,
+        Err(poisoned) => poisoned.into_inner().running,
+    };
     loop {
         tokio::time::sleep(PROBE_INTERVAL).await;
         let detail = probe(listen).await;
-        update(&state.status, |status| match &detail {
-            None => {
-                status.running = true;
-                status.detail = None;
-            }
-            Some(detail) => {
-                status.running = false;
-                status.detail = Some(detail.clone());
-            }
+        let healthy = detail.is_none();
+        // Pass the prior history: the first healthy sighting after adoption is
+        // a start, not a recovery.
+        update(&state.status, |status| {
+            observe(status, ever_healthy, detail)
         });
+        ever_healthy |= healthy;
+    }
+}
+
+/// Apply one adoption probe. A worker that was healthy before and is healthy
+/// again after an unhealthy observation counts one observed restart; a worker
+/// seen healthy for the first time is a start, not a restart.
+fn observe(status: &mut WorkerStatus, ever_healthy: bool, detail: Option<String>) {
+    match detail {
+        Some(detail) => {
+            status.running = false;
+            status.detail = Some(detail);
+        }
+        None => {
+            if ever_healthy && !status.running {
+                status.observed_restarts = status.observed_restarts.saturating_add(1);
+            }
+            status.running = true;
+            status.detail = None;
+        }
     }
 }
 
@@ -383,6 +550,7 @@ async fn supervise<F, Fut>(
     state: Arc<CuaState>,
     mut child: Option<Child>,
     mut attempts: u32,
+    max_attempts: u32,
     relaunch: F,
 ) where
     F: Fn(PathBuf, SocketAddr) -> Fut,
@@ -396,41 +564,89 @@ async fn supervise<F, Fut>(
                     Ok(status) => format!("worker exited with {status}"),
                     Err(error) => format!("cannot read worker status: {error}"),
                 };
+                // A worker that had been up for a while earns a fresh budget
+                // and a quick retry; a crash loop backs off and is bounded.
+                attempts = attempts_after_exit(started.elapsed() >= STABLE_AFTER, attempts);
+                let exhausted = budget_spent(attempts, max_attempts);
                 update(&state.status, |status| {
                     status.running = false;
-                    status.detail = Some(format!("{exit}; restarting"));
                     status.restarts = status.restarts.saturating_add(1);
+                    status.budget_exhausted = exhausted;
+                    status.detail = Some(if exhausted {
+                        format!("restart budget exhausted after {attempts} attempts: {exit}")
+                    } else {
+                        format!("{exit}; restarting")
+                    });
                 });
-                // A worker that had been up for a while earns a quick retry; a
-                // crash loop backs off.
-                attempts = if started.elapsed() >= STABLE_AFTER {
-                    1
-                } else {
-                    attempts.saturating_add(1)
-                };
+                if exhausted {
+                    return;
+                }
                 tokio::time::sleep(backoff(attempts)).await;
             }
-            None => match relaunch(binary.to_path_buf(), listen).await {
-                Ok(worker) => {
-                    attempts = 0;
+            None => {
+                if budget_spent(attempts, max_attempts) {
                     update(&state.status, |status| {
-                        status.running = true;
-                        status.detail = None;
+                        let reason = status
+                            .detail
+                            .clone()
+                            .unwrap_or_else(|| "worker is not running".to_owned());
+                        status.budget_exhausted = true;
+                        status.detail = Some(format!(
+                            "restart budget exhausted after {attempts} attempts: {reason}"
+                        ));
                     });
-                    child = Some(worker);
+                    return;
                 }
-                Err(error) => {
-                    attempts = attempts.saturating_add(1);
-                    update(&state.status, |status| {
-                        status.running = false;
-                        status.detail =
-                            Some(format!("cannot restart {}: {error}", binary.display()));
-                    });
-                    tokio::time::sleep(backoff(attempts)).await;
+                match relaunch(binary.to_path_buf(), listen).await {
+                    Ok(worker) => {
+                        attempts = 0;
+                        update(&state.status, |status| {
+                            status.running = true;
+                            status.detail = None;
+                            status.budget_exhausted = false;
+                        });
+                        child = Some(worker);
+                    }
+                    Err(error) => {
+                        attempts = attempts.saturating_add(1);
+                        let exhausted = budget_spent(attempts, max_attempts);
+                        update(&state.status, |status| {
+                            status.running = false;
+                            status.budget_exhausted = exhausted;
+                            status.detail = Some(if exhausted {
+                                format!(
+                                    "restart budget exhausted after {attempts} attempts: cannot restart {}: {error}",
+                                    binary.display()
+                                )
+                            } else {
+                                format!("cannot restart {}: {error}", binary.display())
+                            });
+                        });
+                        if exhausted {
+                            return;
+                        }
+                        tokio::time::sleep(backoff(attempts)).await;
+                    }
                 }
-            },
+            }
         }
     }
+}
+
+/// Consecutive failures carried into the next cycle. A stable run clears the
+/// budget; an immediate exit consumes one attempt.
+fn attempts_after_exit(stable: bool, attempts: u32) -> u32 {
+    if stable {
+        0
+    } else {
+        attempts.saturating_add(1)
+    }
+}
+
+/// Whether the supervisor must stop. Zero means unlimited (the pre-budget
+/// behaviour, opt-in through the environment).
+fn budget_spent(attempts: u32, max_attempts: u32) -> bool {
+    max_attempts != 0 && attempts >= max_attempts
 }
 
 fn update(status: &Mutex<WorkerStatus>, change: impl FnOnce(&mut WorkerStatus)) {
@@ -441,8 +657,38 @@ fn update(status: &Mutex<WorkerStatus>, change: impl FnOnce(&mut WorkerStatus)) 
 }
 
 fn backoff(attempts: u32) -> Duration {
+    backoff_with(attempts, jitter_unit())
+}
+
+/// Bounded jitter: each step waits between half and 1.5× its nominal delay,
+/// then the 30 s cap applies. `unit` is in `[0, 1]`; tests pass a fixed value
+/// instead of drawing from [`jitter_unit`].
+fn backoff_with(attempts: u32, unit: f64) -> Duration {
     let doublings = attempts.saturating_sub(1).min(6);
-    (RESTART_BASE * (1 << doublings)).min(RESTART_MAX)
+    let nominal = RESTART_BASE * (1u32 << doublings);
+    nominal.mul_f64(0.5 + unit.clamp(0.0, 1.0)).min(RESTART_MAX)
+}
+
+/// xorshift64 state for restart jitter. Not cryptographic: it only spreads
+/// simultaneous envd starts so they do not retry in lockstep.
+static JITTER: AtomicU64 = AtomicU64::new(0);
+
+fn jitter_unit() -> f64 {
+    let mut seed = JITTER.load(Ordering::Relaxed);
+    if seed == 0 {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        seed = (nanos ^ (u64::from(std::process::id()) << 32)) | 1;
+    }
+    let mut x = seed;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    JITTER.store(x, Ordering::Relaxed);
+    // 53 bits is exactly the f64 mantissa, so the result is in [0, 1).
+    (x >> 11) as f64 / (1u64 << 53) as f64
 }
 
 impl Extension for CuaExtension {
@@ -475,9 +721,14 @@ impl Extension for CuaExtension {
 }
 
 async fn health(State(state): State<Arc<CuaState>>) -> Response {
-    let (health, restarts) = match state.status.lock() {
-        Ok(status) => (status.health(), status.restarts),
-        Err(_) => (Health::unhealthy("worker state is poisoned"), 0),
+    let (health, restarts, observed_restarts, budget_exhausted) = match state.status.lock() {
+        Ok(status) => (
+            status.health(),
+            status.restarts,
+            status.observed_restarts,
+            status.budget_exhausted,
+        ),
+        Err(_) => (Health::unhealthy("worker state is poisoned"), 0, 0, false),
     };
     let status = match health.state {
         super::HealthState::Healthy => StatusCode::OK,
@@ -495,6 +746,8 @@ async fn health(State(state): State<Arc<CuaState>>) -> Response {
             },
             "detail": health.detail,
             "restarts": restarts,
+            "observed_restarts": observed_restarts,
+            "budget_exhausted": budget_exhausted,
             "mcp": state.mcp_url,
         })),
     )
@@ -527,18 +780,34 @@ async fn info(State(state): State<Arc<CuaState>>) -> Response {
 /// path: the S2 `/metrics` document is the oracle's JSON wire format and stays
 /// byte-identical, so extension counters never enter it.
 async fn metrics(State(state): State<Arc<CuaState>>) -> Response {
-    let (running, restarts) = match state.status.lock() {
-        Ok(status) => (status.running, status.restarts),
-        Err(_) => (false, 0),
+    let (running, restarts, observed_restarts, budget_exhausted) = match state.status.lock() {
+        Ok(status) => (
+            status.running,
+            status.restarts,
+            status.observed_restarts,
+            status.budget_exhausted,
+        ),
+        Err(_) => (false, 0, 0, false),
+    };
+    let tool_metrics = match state.tool_metrics.lock() {
+        Ok(metrics) => metrics.exposition(),
+        Err(poisoned) => poisoned.into_inner().exposition(),
     };
     let body = format!(
         "# HELP coorworker_envd_cua_worker_up 1 when the supervised cua worker is running.\n\
          # TYPE coorworker_envd_cua_worker_up gauge\n\
          coorworker_envd_cua_worker_up {}\n\
-         # HELP coorworker_envd_cua_worker_restarts_total Worker exits replaced by the supervisor since envd started.\n\
+         # HELP coorworker_envd_cua_worker_restarts_total Worker exits replaced by the supervisor since envd started. Stays 0 for an adopted worker envd does not own.\n\
          # TYPE coorworker_envd_cua_worker_restarts_total counter\n\
-         coorworker_envd_cua_worker_restarts_total {restarts}\n",
+         coorworker_envd_cua_worker_restarts_total {restarts}\n\
+         # HELP coorworker_envd_cua_worker_observed_restarts_total Healthy-to-unhealthy-to-healthy recoveries observed while adopting a worker envd does not own.\n\
+         # TYPE coorworker_envd_cua_worker_observed_restarts_total counter\n\
+         coorworker_envd_cua_worker_observed_restarts_total {observed_restarts}\n\
+         # HELP coorworker_envd_cua_worker_budget_exhausted 1 when the supervisor stopped relaunching after its failure budget.\n\
+         # TYPE coorworker_envd_cua_worker_budget_exhausted gauge\n\
+         coorworker_envd_cua_worker_budget_exhausted {}\n{tool_metrics}",
         if running { 1 } else { 0 },
+        if budget_exhausted { 1 } else { 0 },
     );
     (
         [(
@@ -585,9 +854,24 @@ async fn proxy(State(state): State<Arc<CuaState>>, headers: HeaderMap, body: Byt
         return error(StatusCode::SERVICE_UNAVAILABLE, "cua worker is not running");
     }
 
+    // Only `tools/call` requests are counted; discovery and protocol traffic
+    // would otherwise pad the series with names that are not tools.
+    let calls = proxied_tool_calls(&body);
+    let started = Instant::now();
+    let record = |ok: bool| {
+        if calls.is_empty() {
+            return;
+        }
+        let elapsed = started.elapsed();
+        match state.tool_metrics.lock() {
+            Ok(mut metrics) => metrics.record(&calls, ok, elapsed),
+            Err(poisoned) => poisoned.into_inner().record(&calls, ok, elapsed),
+        }
+    };
     let exchange = forward(&state, &headers, body);
     match tokio::time::timeout(PROXY_TIMEOUT, exchange).await {
         Ok(Ok(forwarded)) => {
+            record(forwarded_ok(&forwarded.status, &forwarded.body));
             let mut response = Response::new(axum::body::Body::from(forwarded.body));
             *response.status_mut() = forwarded.status;
             if let Some(content_type) = forwarded.content_type {
@@ -599,12 +883,41 @@ async fn proxy(State(state): State<Arc<CuaState>>, headers: HeaderMap, body: Byt
             }
             response
         }
-        Ok(Err(message)) => error(StatusCode::BAD_GATEWAY, message),
-        Err(_) => error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "cua worker did not answer in time",
-        ),
+        Ok(Err(message)) => {
+            record(false);
+            error(StatusCode::BAD_GATEWAY, message)
+        }
+        Err(_) => {
+            record(false);
+            error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "cua worker did not answer in time",
+            )
+        }
     }
+}
+
+/// A forwarded call counts as `ok` only when the HTTP status is 2xx and no
+/// JSON-RPC item carries an error or `result.isError: true`.
+fn forwarded_ok(status: &StatusCode, body: &[u8]) -> bool {
+    if !status.is_success() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let items: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    items.iter().all(|item| {
+        item.get("error").is_none()
+            && item
+                .get("result")
+                .and_then(|result| result.get("isError"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+    })
 }
 
 struct Forwarded {
@@ -697,11 +1010,21 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    /// A loopback address owned by this test process. Ports handed out are
+    /// never returned twice: the kernel can re-issue a port the moment it is
+    /// released, which made two concurrent tests race for the same stub
+    /// address (`AddrInUse` on the second bind).
     fn free_listen() -> SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        address
+        static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+        for _ in 0..64 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            if HANDED_OUT.lock().unwrap().insert(address.port()) {
+                return address;
+            }
+        }
+        panic!("no unused loopback port after 64 attempts");
     }
 
     #[tokio::test]
@@ -712,6 +1035,7 @@ mod tests {
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                 proxy: None,
                 worker_token: None,
+                tool_metrics: Mutex::new(ToolMetrics::default()),
             }),
         };
         assert_eq!(extension.health(), Health::healthy());
@@ -747,6 +1071,7 @@ mod tests {
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                 proxy: None,
                 worker_token: None,
+                tool_metrics: Mutex::new(ToolMetrics::default()),
             }),
         };
         assert_eq!(
@@ -756,14 +1081,126 @@ mod tests {
     }
 
     #[test]
-    fn restart_backoff_doubles_and_caps() {
-        assert_eq!(backoff(0), Duration::from_millis(500));
-        assert_eq!(backoff(1), Duration::from_millis(500));
-        assert_eq!(backoff(2), Duration::from_secs(1));
-        assert_eq!(backoff(3), Duration::from_secs(2));
-        assert_eq!(backoff(6), Duration::from_secs(16));
-        assert_eq!(backoff(7), Duration::from_secs(30));
-        assert_eq!(backoff(1_000), Duration::from_secs(30));
+    fn restart_backoff_is_bounded_and_caps() {
+        // Nominal steps double: 0.5, 0.5, 1, 2, 4, 8, 16 s below the cap.
+        let nominal = [
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+            Duration::from_secs(8),
+            Duration::from_secs(16),
+        ];
+        for (attempt, step) in nominal.iter().enumerate() {
+            // Jitter stays within [0.5x, 1.5x] of the nominal step.
+            assert_eq!(backoff_with(attempt as u32, 0.5), *step);
+            assert_eq!(backoff_with(attempt as u32, 0.0), *step / 2);
+            assert_eq!(backoff_with(attempt as u32, 1.0), *step * 3 / 2);
+        }
+        // Attempt 7's nominal step is 32 s; the 30 s cap applies after jitter.
+        assert_eq!(backoff_with(7, 0.0), Duration::from_secs(16));
+        assert_eq!(backoff_with(7, 0.5), Duration::from_secs(30));
+        assert_eq!(backoff_with(7, 1.0), Duration::from_secs(30));
+        assert_eq!(backoff_with(1_000, 0.0), Duration::from_secs(16));
+        // Values outside [0,1] clamp instead of producing a negative delay.
+        assert_eq!(backoff_with(1, -3.0), Duration::from_millis(250));
+        assert_eq!(backoff_with(1, 9.0), Duration::from_millis(750));
+    }
+
+    #[test]
+    fn the_restart_budget_counts_consecutive_failures_and_resets_after_stability() {
+        assert_eq!(attempts_after_exit(false, 0), 1);
+        assert_eq!(attempts_after_exit(false, 7), 8);
+        assert_eq!(attempts_after_exit(true, 41), 0, "a stable run resets");
+        assert!(!budget_spent(7, 8));
+        assert!(budget_spent(8, 8));
+        assert!(!budget_spent(1_000, 0), "0 means unlimited");
+        assert!(budget_spent(1, 1));
+    }
+
+    #[test]
+    fn max_restarts_environment_values_are_parsed_strictly() {
+        use std::ffi::OsString;
+        assert_eq!(
+            parse_max_attempts(None).unwrap(),
+            MAX_RESTART_ATTEMPTS_DEFAULT
+        );
+        assert_eq!(parse_max_attempts(Some(OsString::from(""))).unwrap(), 8);
+        assert_eq!(parse_max_attempts(Some(OsString::from(" 3 "))).unwrap(), 3);
+        assert_eq!(parse_max_attempts(Some(OsString::from("0"))).unwrap(), 0);
+        assert!(parse_max_attempts(Some(OsString::from("many"))).is_err());
+        assert!(parse_max_attempts(Some(OsString::from("-1"))).is_err());
+    }
+
+    #[test]
+    fn tool_metrics_cap_names_and_attribute_overflow() {
+        let mut metrics = ToolMetrics::default();
+        for index in 0..TOOL_METRIC_NAMES {
+            metrics.record(
+                &[format!("tool_{index:02}")],
+                true,
+                Duration::from_millis(10),
+            );
+        }
+        metrics.record(&["tool_00".to_owned()], false, Duration::from_millis(5));
+        metrics.record(&["newcomer".to_owned()], true, Duration::from_millis(1));
+        metrics.record(&["another".to_owned()], true, Duration::from_millis(1));
+
+        assert!(metrics.names.contains("tool_00"));
+        assert!(!metrics.names.contains("newcomer"));
+        assert_eq!(
+            metrics.counts.get(&(String::from("other"), true)),
+            Some(&2),
+            "unknown names collapse after the cap"
+        );
+        assert_eq!(
+            metrics.counts.get(&(String::from("tool_00"), false)),
+            Some(&1)
+        );
+        assert_eq!(metrics.names.len(), TOOL_METRIC_NAMES);
+
+        let text = metrics.exposition();
+        assert!(
+            text.contains("coorworker_envd_cua_tool_calls_total{tool=\"tool_00\",status=\"ok\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("coorworker_envd_cua_tool_calls_total{tool=\"other\",status=\"ok\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("coorworker_envd_cua_tool_latency_seconds_sum 0.647000"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn proxied_tool_calls_reads_single_and_batch_requests() {
+        let single = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"launch_app","arguments":{}}}"#;
+        assert_eq!(proxied_tool_calls(single), vec!["launch_app".to_owned()]);
+        let batch = br#"[{"jsonrpc":"2.0","id":1,"method":"initialize"},
+                        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"click"}},
+                        {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"click"}}]"#;
+        assert_eq!(
+            proxied_tool_calls(batch),
+            vec!["click".to_owned(), "click".to_owned()]
+        );
+        assert!(proxied_tool_calls(br#"{"method":"tools/list"}"#).is_empty());
+        assert!(proxied_tool_calls(b"bad").is_empty());
+        assert!(proxied_tool_calls(br#"{"method":"tools/call","params":{}}"#).is_empty());
+    }
+
+    #[test]
+    fn forwarded_ok_reads_status_and_json_rpc_errors() {
+        let ok = br#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#;
+        assert!(forwarded_ok(&StatusCode::OK, ok));
+        let rpc_error = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"no"}}"#;
+        assert!(!forwarded_ok(&StatusCode::OK, rpc_error));
+        let tool_error = br#"{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[]}}"#;
+        assert!(!forwarded_ok(&StatusCode::OK, tool_error));
+        assert!(!forwarded_ok(&StatusCode::BAD_REQUEST, ok));
+        assert!(!forwarded_ok(&StatusCode::OK, b"not json"));
     }
 
     #[test]
@@ -849,10 +1286,12 @@ mod tests {
                     running: false,
                     detail: Some("worker exited with exit status: 1; restarting".to_owned()),
                     restarts: 3,
+                    ..WorkerStatus::running()
                 }),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                 proxy: None,
                 worker_token: None,
+                tool_metrics: Mutex::new(ToolMetrics::default()),
             }),
         };
         let router = Extensions::new(vec![Arc::new(extension)])
@@ -867,7 +1306,39 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["status"], "unhealthy");
         assert_eq!(body["restarts"], 3);
+        assert_eq!(body["observed_restarts"], 0);
+        assert_eq!(body["budget_exhausted"], false);
         assert!(body["detail"].as_str().unwrap().contains("restarting"));
+    }
+
+    #[tokio::test]
+    async fn health_reports_an_exhausted_restart_budget() {
+        let extension = CuaExtension {
+            state: Arc::new(CuaState {
+                status: Mutex::new(WorkerStatus {
+                    running: false,
+                    detail: Some("restart budget exhausted after 8 attempts: exit 1".to_owned()),
+                    budget_exhausted: true,
+                    ..WorkerStatus::running()
+                }),
+                mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
+                proxy: None,
+                worker_token: None,
+                tool_metrics: Mutex::new(ToolMetrics::default()),
+            }),
+        };
+        let router = Extensions::new(vec![Arc::new(extension)])
+            .unwrap()
+            .mount(Router::new());
+        let response = router
+            .oneshot(Request::get("/cua/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["budget_exhausted"], true);
+        assert!(body["detail"].as_str().unwrap().contains("exhausted"));
     }
 
     #[tokio::test]
@@ -879,6 +1350,7 @@ mod tests {
                     mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                     proxy: None,
                     worker_token: None,
+                    tool_metrics: Mutex::new(ToolMetrics::default()),
                 }),
             })])
             .unwrap()
@@ -888,6 +1360,7 @@ mod tests {
             running: true,
             detail: None,
             restarts: 2,
+            ..WorkerStatus::running()
         })
         .oneshot(Request::get("/cua/metrics").body(Body::empty()).unwrap())
         .await
@@ -903,6 +1376,14 @@ mod tests {
         assert!(body.contains("coorworker_envd_cua_worker_up 1"), "{body}");
         assert!(
             body.contains("coorworker_envd_cua_worker_restarts_total 2"),
+            "{body}"
+        );
+        assert!(
+            body.contains("coorworker_envd_cua_worker_observed_restarts_total 0"),
+            "{body}"
+        );
+        assert!(
+            body.contains("coorworker_envd_cua_worker_budget_exhausted 0"),
             "{body}"
         );
 
@@ -926,6 +1407,7 @@ mod tests {
             mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
             proxy: None,
             worker_token: None,
+            tool_metrics: Mutex::new(ToolMetrics::default()),
         });
         let exits = Command::new("sh")
             .arg("-c")
@@ -943,6 +1425,7 @@ mod tests {
                     "127.0.0.1:1".parse().unwrap(),
                     state,
                     Some(exits),
+                    0,
                     0,
                     move |_, _| {
                         let counted = Arc::clone(&counted);
@@ -1031,6 +1514,7 @@ mod tests {
                     token: proxy.to_vec(),
                 }),
                 worker_token: worker_token.map(<[u8]>::to_vec),
+                tool_metrics: Mutex::new(ToolMetrics::default()),
             }),
         }
     }
@@ -1052,6 +1536,7 @@ mod tests {
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                 proxy: None,
                 worker_token: None,
+                tool_metrics: Mutex::new(ToolMetrics::default()),
             }),
         };
         let router = Extensions::new(vec![Arc::new(plain)])
@@ -1162,6 +1647,7 @@ mod tests {
                     token: b"proxy-secret".to_vec(),
                 }),
                 worker_token: None,
+                tool_metrics: Mutex::new(ToolMetrics::default()),
             }),
         };
         let router = Extensions::new(vec![Arc::new(extension)])
@@ -1194,6 +1680,142 @@ mod tests {
             !body.to_string().contains("proxy-secret"),
             "the discovery document must not carry the token"
         );
+    }
+
+    #[test]
+    fn adoption_counts_recoveries_but_not_the_first_appearance() {
+        let mut status = WorkerStatus::stopped("unreachable");
+        // First sighting after an unhealthy adoption is a start.
+        observe(&mut status, false, None);
+        assert!(status.running);
+        assert_eq!(status.observed_restarts, 0);
+
+        observe(&mut status, true, Some("unreachable".to_owned()));
+        assert!(!status.running);
+        assert_eq!(status.observed_restarts, 0);
+        observe(&mut status, true, None);
+        assert!(status.running);
+        assert_eq!(status.observed_restarts, 1, "one observed recovery");
+
+        observe(&mut status, true, Some("503".to_owned()));
+        observe(&mut status, false, Some("503".to_owned()));
+        observe(&mut status, true, None);
+        assert_eq!(status.observed_restarts, 2);
+        // Adoption never fabricates a supervisor restart count.
+        assert_eq!(status.restarts, 0);
+    }
+
+    #[tokio::test]
+    async fn supervisor_stops_after_the_restart_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let state = Arc::new(CuaState {
+            status: Mutex::new(WorkerStatus::stopped("cannot spawn /missing")),
+            mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
+            proxy: None,
+            worker_token: None,
+            tool_metrics: Mutex::new(ToolMetrics::default()),
+        });
+        let launches = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&launches);
+        let worker = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                supervise(
+                    &PathBuf::from("/fake/coorworker-cua"),
+                    "127.0.0.1:1".parse().unwrap(),
+                    state,
+                    None,
+                    // The first launch already failed before supervision began.
+                    1,
+                    3,
+                    move |_, _| {
+                        let counted = Arc::clone(&counted);
+                        async move {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            Err("still broken".to_owned())
+                        }
+                    },
+                )
+                .await;
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if state.status.lock().unwrap().budget_exhausted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (exhausted, running, detail) = {
+            let status = state.status.lock().unwrap();
+            (
+                status.budget_exhausted,
+                status.running,
+                status.detail.clone().unwrap_or_default(),
+            )
+        };
+        assert!(exhausted, "supervisor must give up");
+        assert!(!running);
+        assert!(
+            detail.contains("restart budget exhausted after 3 attempts"),
+            "{detail}"
+        );
+        // Initial failure + two relaunches, and nothing behind them.
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn the_proxy_counts_tool_calls_and_latency_only_for_calls() {
+        let (url, _seen) = fake_mcp_worker().await;
+        let router = Extensions::new(vec![Arc::new(proxied(url, b"proxy-secret", None).await)])
+            .unwrap()
+            .mount(Router::new());
+
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"launch_app","arguments":{}}}"#;
+        let response = router
+            .clone()
+            .oneshot(mcp_request(Some("proxy-secret"), call))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Discovery traffic is not a tool call.
+        let discovery = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let response = router
+            .clone()
+            .oneshot(mcp_request(Some("proxy-secret"), discovery))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // A rejected token never reaches the worker and never counts.
+        let response = router
+            .clone()
+            .oneshot(mcp_request(Some("wrong"), call))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router
+            .oneshot(Request::get("/cua/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(
+                "coorworker_envd_cua_tool_calls_total{tool=\"launch_app\",status=\"ok\"} 1"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("coorworker_envd_cua_tool_latency_seconds_sum 0."),
+            "{body}"
+        );
+        assert!(!body.contains("tools/list"), "{body}");
+        assert!(!body.contains("tool=\"other\""), "{body}");
     }
 
     #[tokio::test]

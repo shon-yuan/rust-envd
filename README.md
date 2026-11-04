@@ -92,7 +92,11 @@ supervises when `COORWORKER_CUA_BIN` is set, or adopts and probes when
 belongs to the interactive session). When
 `COORWORKER_CUA_PROXY_TOKEN` is set as well, envd also mounts `POST /cua/mcp`
 and forwards to the loopback worker, so a remote caller needs no second port.
-The worker is a separate binary
+The supervisor retries a crashing worker with jittered exponential backoff and
+stops after `COORWORKER_CUA_MAX_RESTARTS` consecutive failures (default 8,
+`0` = unlimited); adopted workers report observed recoveries instead of
+inventing restart counts. `/cua/metrics` also carries proxy-only tool-call
+counters. The worker is a separate binary
 because the desktop stack cannot be linked into the frozen daemon (X11 on
 Linux, the interactive session on Windows); with no worker configured the
 router is exactly the parity daemon. The contract, configuration, worker

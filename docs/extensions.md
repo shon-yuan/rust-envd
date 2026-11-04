@@ -91,7 +91,10 @@ and the router is identical to S0.
 
 `/cua/health` returns `200` with `{"status":"healthy"}` (plus the
 `restarts` count) while the worker process is alive, and `503` with the
-reason in `detail` after it exits or fails to start. `/cua/info` publishes
+reason in `detail` after it exits or fails to start. The document also carries
+`observed_restarts` and `budget_exhausted`. In spawn mode `observed_restarts`
+is always `0`; `budget_exhausted` turns `true` only when the supervisor gave
+up. `/cua/info` publishes
 `name` (`cua`), `mcp_url`, `transport`, `protocol` and `auth` (`bearer` when
 the worker has a `CUA_ENV_TOKEN`, otherwise `none`) and never the token: a
 discovery document that leaked it would hand every guest process control of
@@ -99,11 +102,21 @@ the desktop. Both routes are extension-owned — they are mounted after
 `http::layered` and do not use the envd `/init` access token.
 
 A worker that exits is replaced. The supervisor relaunches it with
-exponential backoff (0.5 s doubling to 30 s; a worker that stayed up for
-60 s resets the sequence) and only reports healthy once the new process
-accepts on its loopback port. A worker that never comes up does not fail the
-daemon: S0 keeps serving and the extension stays visible as unhealthy with
-the reason in `detail`.
+exponential backoff (0.5 s doubling to a 30 s cap, each step jittered between
+half and 1.5× its nominal delay; a worker that stayed up for 60 s resets the
+sequence) and only reports healthy once the new process accepts on its
+loopback port. A worker that never comes up does not fail the daemon: S0 keeps
+serving and the extension stays visible as unhealthy with the reason in
+`detail`.
+
+After `COORWORKER_CUA_MAX_RESTARTS` consecutive failed launches or immediate
+exits (default 8; `0` restores unlimited retry) the supervisor stops
+relaunching and records `budget_exhausted: true` with detail
+`restart budget exhausted after N attempts: …`. `/cua/health` stays `503` and
+`coorworker_envd_cua_worker_budget_exhausted` becomes `1`; nothing retries in
+the background. Recovery is manual: fix or replace the worker binary and
+restart envd. The budget counts a crash loop, not occasional restarts — one
+stable run clears it.
 
 ### Adopted workers
 
@@ -116,13 +129,45 @@ exactly as in spawn mode; a worker that disappears turns the extension
 unhealthy with the connection error in `detail`, and one that comes back is
 picked up again. `restarts` stays `0` in this mode: envd never replaces a
 process it does not own, and `coorworker_envd_cua_worker_restarts_total`
-must not be read as a restart count for it. `COORWORKER_CUA_EXTERNAL` wins
-when both variables are set.
+must not be read as a restart count for it. Instead,
+`observed_restarts` (and `coorworker_envd_cua_worker_observed_restarts_total`)
+counts healthy→unhealthy→healthy recoveries the 2 s probe actually saw: a
+worker that is absent at adoption and later appears is a start (0), not a
+restart. `COORWORKER_CUA_EXTERNAL` wins when both variables are set.
 
-`/cua/metrics` exposes Prometheus text with `coorworker_envd_cua_worker_up`
-(1/0) and `coorworker_envd_cua_worker_restarts_total`. It is extension-owned
-and deliberately separate from S2 `/metrics`, whose JSON wire format is the
-oracle's and stays byte-identical.
+`/cua/metrics` exposes Prometheus text:
+
+| Series | Meaning |
+| --- | --- |
+| `coorworker_envd_cua_worker_up` | `1` while the worker answers; `0` otherwise. |
+| `coorworker_envd_cua_worker_restarts_total` | Exits the supervisor replaced. Spawn mode only; always `0` for an adopted worker. |
+| `coorworker_envd_cua_worker_observed_restarts_total` | Recoveries observed while adopting. Never mixed with the supervisor counter. |
+| `coorworker_envd_cua_worker_budget_exhausted` | `1` once the spawn supervisor gave up. |
+| `coorworker_envd_cua_tool_calls_total{tool,status}` | `tools/call` requests forwarded through `POST /cua/mcp`, by tool and `ok`/`error`. |
+| `coorworker_envd_cua_tool_latency_seconds_sum` | Cumulative time spent forwarding those calls. |
+
+The tool series cover only the optional envd proxy. A caller that reaches the
+worker directly, and the ToolHost WS relay, are not counted; do not read them
+as global desktop-tool usage. At most 64 distinct tool names are kept and
+every later name is attributed to `tool="other"`, so a caller cannot grow the
+label set without bound. These counters are extension-owned and deliberately
+separate from S2 `/metrics`, whose JSON wire format is the oracle's and stays
+byte-identical.
+
+A scrape sample:
+
+```yaml
+scrape_configs:
+  - job_name: coorworker-envd-cua
+    metrics_path: /cua/metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["127.0.0.1:49983"]
+```
+
+`/cua/health` and `/cua/metrics` are unauthenticated like the existing
+extension precedent and must stay on a loopback or otherwise trusted
+listener; `/cua/mcp` is the only route with a credential.
 
 ### Remote access without a second port
 
@@ -170,6 +215,7 @@ this worker.
 | `COORWORKER_CUA_LISTEN` | Worker listen address; default `127.0.0.1:3211`. |
 | `COORWORKER_CUA_EXTERNAL` | Non-empty and not `0`/`false`: adopt the worker at `COORWORKER_CUA_LISTEN` instead of spawning one. Wins over `COORWORKER_CUA_BIN`. |
 | `COORWORKER_CUA_PROXY_TOKEN` | Enables `POST /cua/mcp` and is the bearer token callers present. Empty means disabled. |
+| `COORWORKER_CUA_MAX_RESTARTS` | Consecutive failed launches/exits before the supervisor stops; default `8`, `0` means unlimited. Invalid values leave the extension visible but unavailable with the parse error. |
 | `--listen` | Worker flag for the same address (the extension passes it). |
 | `--token-file` / `CUA_ENV_TOKEN` | Bearer token for `/mcp`. Accepted as `Authorization: Bearer …` or `X-Cua-Env-Authorization`. When set in envd's environment the worker inherits it and the proxy injects it on forwards. |
 
@@ -229,15 +275,18 @@ SPDX texts in `scripts/license-overrides/`.
 ### Evidence
 
 - Worker contract tests: 9 passed (`cua-worker/`, `cargo test --lib --bins`).
-- rust-envd suite: 856 passed (24 ignored by features), including
+- rust-envd suite: 864 passed, 0 failed (24 ignored by features), including
   `tests/extensions.rs` (no-shadow, merge over the Connect fallback,
   empty-set identity) and the supervisor/proxy tests in `src/ext/cua.rs`
-  (16 in that module: health and failure reporting, restart count and
-  replacement after exit, backoff bounds, Prometheus exposition, route
-  absent without a token, 401 for missing/wrong tokens, forwarding with
-  worker-token injection and status pass-through, 502 unreachable, 503 dead
-  worker, discovery fields, launch resolution, adopted-worker probing and
-  recovery).
+  (25 in that module: health and failure reporting, restart count and
+  replacement after exit, backoff bounds and jitter, restart-budget
+  exhaustion, `COORWORKER_CUA_MAX_RESTARTS` parsing, Prometheus exposition,
+  tool-metric label cap and `other` overflow, `tools/call` extraction from
+  single and batch JSON-RPC, forwarded-outcome classification, route absent
+  without a token, 401 for missing/wrong tokens, forwarding with worker-token
+  injection and status pass-through, proxy tool counts and latency, 502
+  unreachable, 503 dead worker, discovery fields, launch resolution,
+  adopted-worker probing, recovery and `observed_restarts`).
 - Supervision: a child that exits is replaced within the first backoff step
   and reported healthy once the replacement is installed
   (`supervisor_replaces_a_worker_that_exits`, with a fake relauncher so no
@@ -259,6 +308,32 @@ SPDX texts in `scripts/license-overrides/`.
   restart it. Starting the worker again returned the extension to healthy
   with `worker_up 1`, still `restarts_total 0`. Verification processes and
   the temporary directory were removed.
+- Failure-budget run (Xvfb `:98`, a stub binary that exits `1` on every
+  launch, `COORWORKER_CUA_MAX_RESTARTS=3`): the launcher ran exactly three
+  times and stopped. `/cua/health` stayed `503` with
+  `budget_exhausted: true` and detail `restart budget exhausted after 3
+  attempts: …`; `/cua/metrics` reported
+  `..._worker_budget_exhausted 1`; six seconds later the launch count was
+  still three and the daemon had no children. S0 `/health` stayed `204`.
+- Proxy tool-metric run (Xvfb `:98`, spawned worker on `3216`, envd dev on
+  `49989` with `COORWORKER_CUA_PROXY_TOKEN`): MCP `initialize` and
+  `tools/call` for `list_windows` (one real window) and `get_screen_size`
+  went through `POST /cua/mcp`. `/cua/metrics` then reported
+  `..._tool_calls_total{tool="list_windows",status="ok"} 1`,
+  `..._tool_calls_total{tool="get_screen_size",status="ok"} 1` and
+  `..._tool_latency_seconds_sum 0.118216`. S2 `/metrics` still returned the
+  oracle's JSON document (`content-type: application/json`, same keys) and
+  S0 `/health` stayed `204`.
+- Adoption recovery run (Xvfb `:98`, worker started by hand on `3217`, envd
+  dev on `49990` with `COORWORKER_CUA_EXTERNAL=1`, no
+  `COORWORKER_CUA_BIN`): healthy with `observed_restarts 0`, `restarts 0`.
+  `kill -9` turned `/cua/health` into `503` (`Connection refused (os error
+  111)`) with `worker_up 0` and left the counters at `0/0`; restarting the
+  worker on the same port returned the extension to healthy with
+  `observed_restarts 1` and `restarts_total` still `0`. The envd process
+  never had a child. A second run with the worker absent at adoption showed
+  it appearing as healthy with `observed_restarts` still `0` — a start, not
+  a recovery.
 - End-to-end run on Xvfb `:99` (before supervision existed, M5): daemon →
   spawned worker → `/cua/health` `200`; MCP `initialize` (`cua-driver
   0.38.0`), `tools/list` (63 tools), `tools/call get_desktop_state` returned
