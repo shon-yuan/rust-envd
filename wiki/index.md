@@ -3,6 +3,7 @@
 | Document | Scope |
 | --- | --- |
 | [README](../README.md) | Supported platforms, pinned protocol baseline and builds |
+| [中文 README](../README.zh-CN.md) | Simplified Chinese translation of the README |
 | [Acceptance notes](../docs/acceptance-notes.md) | Linux protocol acceptance and evidence limits |
 | [Extensions](../docs/extensions.md) | CUA modes, shared credential admission, worker lifecycle and acceptance |
 | [Windows port](../docs/windows-port.md) | Native backend, service/session boundaries and validation |

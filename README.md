@@ -1,5 +1,7 @@
 # rust-envd
 
+English | [简体中文](README.zh-CN.md)
+
 A Rust implementation of the [e2b](https://github.com/e2b-dev/runtime) envd
 sandbox daemon, functionally aligned with the pinned upstream release
 `0.10.2` (commit `51083a83cc0903185d992725ea6bb33683814b29`): process
