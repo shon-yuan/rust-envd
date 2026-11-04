@@ -64,3 +64,10 @@ jobs:
         run: choco install protoc -y --no-progress
       - name: Run the Windows backend and endpoint contract tests
         run: cargo test --locked -j4 --lib
+      - name: Build and test the cua worker
+        # The worker selects platform-windows on this host; its worker
+        # contract tests are platform-independent, so this closes the
+        # "Windows worker unverified" gap without a desktop session.
+        run: |
+          cargo build --locked -j4 --manifest-path cua-worker/Cargo.toml --bin coorworker-cua
+          cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins

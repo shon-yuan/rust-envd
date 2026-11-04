@@ -168,6 +168,11 @@ session-0 service cannot reach the interactive desktop. Running the worker
 next to the logged-in user is the supported shape; a service-to-session
 bridge is separate work.
 
+CI builds the worker with the MSVC toolchain and runs its contract tests on
+`windows-latest`, so the Windows code path compiles and serves MCP. Those
+tests use a static tool provider: real UI Automation actions still require a
+logged-in desktop session and are not exercised there.
+
 ### Licensing
 
 Only the MIT crates are vendored (`vendor/cua-driver/`, provenance in
