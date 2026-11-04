@@ -64,9 +64,11 @@ executable:
 cargo build --locked --bin coorworker-envd
 ```
 
-Evidence: the library suite runs natively on a Windows 11 guest (314 passed,
-0 failed), and the official E2B Python SDK 2.62.1 drives a live guest through
-its own codec, generated clients and `CommandHandle` (27/27; the agent repo's
+Evidence: the [dependency maintenance regression](docs/windows-dependency-regression.md)
+runs natively on Windows 11 at commit `c3cb81a`: 321 library tests plus 5 base
+or 9 desktop integration tests, and 16 standalone-worker tests passed. The
+official E2B Python SDK 2.62.1 drives a live guest through its own codec,
+generated clients and `CommandHandle` (27/27; the agent repo's
 `scripts/tests/envd-parity/sdk_conformance.py`). There is no Windows oracle,
 so Windows behaviour is contract evidence only — no differential claim is
 made. Declared deviations: freeze is thread suspension rather than cgroup v2;
@@ -97,6 +99,9 @@ CUA supports these deployment modes:
 | `shared-external` | Deployment-managed user-session helper | Current envd `/init` token as Bearer |
 
 Build the desktop executable with `cargo build --locked -j4 --features cua-desktop`.
+Native Windows desktop and standalone-worker builds also require the MSVC v143
+x64/x86 Spectre-mitigated libraries matching the selected toolset; see the
+[build prerequisites](third_party/PACKAGING.md#canonical-build).
 The default build keeps desktop dependencies disabled and supports static musl
 packaging. Embedded mode serves `POST /cua/mcp` on envd's own listener, with no
 worker child or extra port. CUA stays closed until an envd token is installed;

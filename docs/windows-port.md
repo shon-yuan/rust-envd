@@ -13,6 +13,13 @@ This document scopes goal D: **a Windows guest sandbox that serves the complete
 existing envd API**, while the Linux daemon keeps its byte-level parity with the
 pinned Go oracle.
 
+The 314-test count above records the original port acceptance. The subsequent
+[dependency maintenance regression](windows-dependency-regression.md) at
+`c3cb81a` passed 321 native library tests plus 5 base or 9 desktop integration
+tests, 16 worker tests and another official SDK 27/27 run. It also verifies
+actual Session 0 embedded refusal. Interactive desktop operations and actual
+SCM lifecycle acceptance remain outside that follow-up.
+
 ## CUA desktop execution modes
 
 CUA is an additive interface, separate from the S0 contract evidence above.

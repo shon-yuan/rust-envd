@@ -62,9 +62,20 @@ cargo build --locked -j4 --release --features cua-desktop
 cargo build --locked -j4 --release --features cua-desktop --target x86_64-pc-windows-msvc
 ```
 
-The static guest build above remains the base variant. Distribution notices
-are deliberately a superset and do not enable desktop dependencies in a base
-build. The standalone worker is built from its own package and lockfile:
+The static guest build above remains the base variant. Native Windows MSVC
+desktop builds and the standalone worker additionally require the MSVC v143
+x64/x86 Spectre-mitigated libraries for the active toolset, installed into the
+selected Visual Studio instance. The component ID is
+`Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre`, or the matching
+version-specific component such as
+`Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64.Spectre` for MSVC 14.44.
+The desktop dependency's `msvc_spectre_libs` build script checks for these libraries.
+Component names and unattended installation parameters are documented in the
+[Microsoft component catalog](https://learn.microsoft.com/en-us/visualstudio/install/workload-component-id-vs-build-tools?view=vs-2022)
+and [installer command reference](https://learn.microsoft.com/en-us/visualstudio/install/use-command-line-parameters-to-install-visual-studio?view=vs-2022).
+
+Distribution notices are deliberately a superset and do not enable desktop
+dependencies in a base build. The standalone worker is built from its own package and lockfile:
 
 ```sh
 (cd cua-worker && cargo build --locked -j4 --release --bin coorworker-cua)
