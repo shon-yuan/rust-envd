@@ -78,6 +78,7 @@ guest / host
     ext::cua  ── spawns, watches ──►  coorworker-cua
       GET /cua/health                   POST /mcp   (MCP JSON-RPC)
       GET /cua/info                     GET  /mcp   → 405
+      POST /cua/mcp   (optional proxy)
 ```
 
 The extension is enabled only when the worker binary is configured. With no
@@ -96,6 +97,30 @@ access token.
 
 A worker that dies does not fail the daemon: S0 keeps serving and the
 extension stays visible as unhealthy.
+
+### Remote access without a second port
+
+The worker listens on loopback only, so a caller outside the guest cannot
+reach it. Configuring `COORWORKER_CUA_PROXY_TOKEN` mounts `POST /cua/mcp` on
+the envd surface instead: envd checks that bearer token (constant-time; an
+empty value means "not configured" and the route is absent) and forwards one
+JSON-RPC request to the worker. The deployment then needs no extra port
+beyond the one envd already exposes.
+
+- The proxy token and the worker's `CUA_ENV_TOKEN` are different credentials.
+  The caller only ever learns the proxy token; envd injects the worker token,
+  so the caller's `Authorization` header never reaches the worker.
+- Only `mcp-protocol-version` and `mcp-session-id` are forwarded besides the
+  body. Requests are capped at 1 MiB and worker responses at 32 MiB; the
+  proxy waits 30 s. Errors are extension-owned: `401` wrong or missing token,
+  `503` worker not running, `502` worker unreachable, `504` timeout. The
+  worker's own HTTP status is passed through unchanged (a JSON-RPC `400`
+  stays `400`).
+- `/cua/info` adds `proxy_path` (`/cua/mcp`) and `proxy_auth` (`bearer`) when
+  the proxy is mounted. It is relative because envd does not know the address
+  a caller reached it on, and the token is never echoed.
+- This route is extension-owned like the rest: it is mounted after
+  `http::layered` and does not accept the envd `/init` access token.
 
 ### Worker interface
 
@@ -117,8 +142,9 @@ this worker.
 | --- | --- |
 | `COORWORKER_CUA_BIN` | Path to the worker binary. Unset disables the extension. |
 | `COORWORKER_CUA_LISTEN` | Worker listen address; default `127.0.0.1:3211`. |
+| `COORWORKER_CUA_PROXY_TOKEN` | Enables `POST /cua/mcp` and is the bearer token callers present. Empty means disabled. |
 | `--listen` | Worker flag for the same address (the extension passes it). |
-| `--token-file` / `CUA_ENV_TOKEN` | Bearer token for `/mcp`. Accepted as `Authorization: Bearer …` or `X-Cua-Env-Authorization`. |
+| `--token-file` / `CUA_ENV_TOKEN` | Bearer token for `/mcp`. Accepted as `Authorization: Bearer …` or `X-Cua-Env-Authorization`. When set in envd's environment the worker inherits it and the proxy injects it on forwards. |
 
 The worker refuses to bind a non-loopback address without a token. On
 loopback with no token, auth is disabled and the worker says so on startup.
@@ -158,13 +184,26 @@ SPDX texts in `scripts/license-overrides/`.
 ### Evidence
 
 - Worker contract tests: 9 passed (`cua-worker/`, `cargo test --lib --bins`).
-- rust-envd suite: 843 passed, including `tests/extensions.rs` (no-shadow,
-  merge over the Connect fallback, empty-set identity) and the supervisor
-  tests in `src/ext/cua.rs`.
+- rust-envd suite: 848 passed (24 ignored by features), including
+  `tests/extensions.rs` (no-shadow, merge over the Connect fallback,
+  empty-set identity) and the supervisor/proxy tests in `src/ext/cua.rs`
+  (8 in that module: health and failure reporting, route absent without a
+  token, 401 for missing/wrong tokens, forwarding with worker-token
+  injection and status pass-through, 502 unreachable, 503 dead worker,
+  discovery fields).
 - End-to-end run on Xvfb `:99`: daemon → spawned worker → `/cua/health`
   `200`; MCP `initialize` (`cua-driver 0.38.0`), `tools/list` (63 tools),
   `tools/call get_desktop_state` returned a valid 1024×768 PNG; killing the
   worker turned `/cua/health` into `503` while S0 `/health` stayed `204`.
+- Proxy run on the same display with `COORWORKER_CUA_PROXY_TOKEN` set:
+  `/cua/info` published `proxy_path`/`proxy_auth`; an unauthenticated
+  `POST /cua/mcp` returned `401`; with the token, `initialize` (protocol
+  `2025-06-18`), `tools/list` (63 tools, 44,350 description bytes) and
+  `tools/call get_desktop_state` (valid 1024×768 PNG, `image/png`) all went
+  through envd; killing the worker made `POST /cua/mcp` and `/cua/health`
+  `503` while S0 `/health` stayed `204`. A 233-byte PNG is the blank Xvfb
+  screen, not a truncation: the IHDR says 1024×768 and the signature is
+  valid.
 - Downstream client conformance: the coorworker AgentHost's MCP client
   (official Go SDK v1.8.0, Streamable HTTP, session-less, `Authorization:
   Bearer`) completes `initialize`, lists all 63 tools and calls
