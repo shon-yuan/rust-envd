@@ -9,12 +9,13 @@
 //! should dial.
 //!
 //! Enabled with `COORWORKER_CUA_BIN`; the listen address defaults to
-//! `127.0.0.1:3211` and can be set with `COORWORKER_CUA_LISTEN`. A worker that
-//! fails to start leaves the extension unhealthy and visible, and never
-//! affects the envd surface.
+//! `127.0.0.1:3211` and can be set with `COORWORKER_CUA_LISTEN`. The
+//! supervisor replaces a worker that exits (exponential backoff, reset after a
+//! stable run). A worker that fails to start leaves the extension unhealthy
+//! and visible, and never affects the envd surface.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,6 +40,12 @@ use super::{Extension, Health};
 const DEFAULT_LISTEN: &str = "127.0.0.1:3211";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_POLL: Duration = Duration::from_millis(50);
+/// Restart backoff: 0.5 s, doubling, capped at 30 s. A worker that stayed up
+/// for [`STABLE_AFTER`] resets the sequence, so a crash loop backs off while a
+/// rare restart returns to service quickly.
+const RESTART_BASE: Duration = Duration::from_millis(500);
+const RESTART_MAX: Duration = Duration::from_secs(30);
+const STABLE_AFTER: Duration = Duration::from_secs(60);
 
 /// The path the optional proxy adds under the extension prefix.
 const PROXY_PATH: &str = "/mcp";
@@ -48,24 +55,42 @@ const PROXY_REQUEST_LIMIT: usize = 1 << 20;
 const PROXY_RESPONSE_LIMIT: usize = 32 << 20;
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 
-struct Worker {
-    child: Option<Child>,
-    error: Option<String>,
+/// Liveness of the supervised process. The supervisor owns the child; every
+/// reader only asks this snapshot, so a restart never blocks a health check.
+struct WorkerStatus {
+    running: bool,
+    /// Why the worker is not running, or how it stopped.
+    detail: Option<String>,
+    /// How many times a running worker has exited and been replaced.
+    restarts: u32,
 }
 
-impl Worker {
-    fn health(&mut self) -> Health {
-        if let Some(error) = &self.error {
-            return Health::unhealthy(error.clone());
+impl WorkerStatus {
+    fn running() -> Self {
+        Self {
+            running: true,
+            detail: None,
+            restarts: 0,
         }
-        let Some(child) = self.child.as_mut() else {
-            return Health::unhealthy("worker is not running");
-        };
-        match child.try_wait() {
-            Ok(None) => Health::healthy(),
-            Ok(Some(status)) => Health::unhealthy(format!("worker exited with {status}")),
-            Err(error) => Health::unhealthy(format!("cannot read worker status: {error}")),
+    }
+
+    fn stopped(detail: impl Into<String>) -> Self {
+        Self {
+            running: false,
+            detail: Some(detail.into()),
+            restarts: 0,
         }
+    }
+
+    fn health(&self) -> Health {
+        if self.running {
+            return Health::healthy();
+        }
+        Health::unhealthy(
+            self.detail
+                .clone()
+                .unwrap_or_else(|| "worker is not running".to_owned()),
+        )
     }
 }
 
@@ -76,7 +101,7 @@ struct Proxy {
 }
 
 struct CuaState {
-    worker: Mutex<Worker>,
+    status: Mutex<WorkerStatus>,
     mcp_url: String,
     /// `None` means `/cua/mcp` is not mounted at all, not that it is open.
     proxy: Option<Proxy>,
@@ -109,15 +134,12 @@ impl CuaExtension {
 
     async fn build(binary: PathBuf, listen: SocketAddr, proxy_token: Option<Vec<u8>>) -> Self {
         let mcp_url = format!("http://{listen}/mcp");
-        let worker = match launch(&binary, listen).await {
-            Ok(child) => Worker {
-                child: Some(child),
-                error: None,
-            },
-            Err(error) => Worker {
-                child: None,
-                error: Some(error),
-            },
+        // The first launch stays synchronous (and waits for the listener) so a
+        // caller that spawns the extension knows whether it came up. After
+        // that the supervisor owns the process and replaces it when it exits.
+        let (status, child, attempts) = match launch(&binary, listen).await {
+            Ok(child) => (WorkerStatus::running(), Some(child), 0),
+            Err(error) => (WorkerStatus::stopped(error), None, 1),
         };
         // An empty token would enable the route with nothing to check against;
         // treat it as "not configured" instead.
@@ -127,14 +149,25 @@ impl CuaExtension {
         let worker_token = std::env::var_os("CUA_ENV_TOKEN")
             .map(|value| value.to_string_lossy().into_owned().into_bytes())
             .filter(|token| !token.is_empty());
-        Self {
-            state: Arc::new(CuaState {
-                worker: Mutex::new(worker),
-                mcp_url,
-                proxy,
-                worker_token,
-            }),
-        }
+        let state = Arc::new(CuaState {
+            status: Mutex::new(status),
+            mcp_url,
+            proxy,
+            worker_token,
+        });
+        let status = Arc::clone(&state);
+        tokio::spawn(async move {
+            supervise(
+                &binary,
+                listen,
+                status,
+                child,
+                attempts,
+                |binary, listen| async move { launch(&binary, listen).await },
+            )
+            .await;
+        });
+        Self { state }
     }
 
     /// `Some` when `COORWORKER_CUA_BIN` is set. The value `None` is the parity
@@ -162,10 +195,7 @@ impl CuaExtension {
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             state: Arc::new(CuaState {
-                worker: Mutex::new(Worker {
-                    child: None,
-                    error: Some(reason.into()),
-                }),
+                status: Mutex::new(WorkerStatus::stopped(reason)),
                 mcp_url: format!("http://{DEFAULT_LISTEN}/mcp"),
                 proxy: None,
                 worker_token: None,
@@ -178,7 +208,7 @@ impl CuaExtension {
     }
 }
 
-async fn launch(binary: &PathBuf, listen: SocketAddr) -> Result<Child, String> {
+async fn launch(binary: &Path, listen: SocketAddr) -> Result<Child, String> {
     let mut child = Command::new(binary)
         .arg("--listen")
         .arg(listen.to_string())
@@ -207,6 +237,80 @@ async fn launch(binary: &PathBuf, listen: SocketAddr) -> Result<Child, String> {
     }
 }
 
+/// Owns the worker process for the life of the daemon and replaces it when it
+/// exits. Readiness is re-checked by [`launch`] on every attempt, so a restart
+/// only reports healthy once the new process actually accepts on its port.
+///
+/// `relaunch` is a parameter so tests can drive the loop without a real
+/// worker binary; production passes [`launch`].
+async fn supervise<F, Fut>(
+    binary: &Path,
+    listen: SocketAddr,
+    state: Arc<CuaState>,
+    mut child: Option<Child>,
+    mut attempts: u32,
+    relaunch: F,
+) where
+    F: Fn(PathBuf, SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<Child, String>>,
+{
+    loop {
+        match child.take() {
+            Some(mut running) => {
+                let started = Instant::now();
+                let exit = match running.wait().await {
+                    Ok(status) => format!("worker exited with {status}"),
+                    Err(error) => format!("cannot read worker status: {error}"),
+                };
+                update(&state.status, |status| {
+                    status.running = false;
+                    status.detail = Some(format!("{exit}; restarting"));
+                    status.restarts = status.restarts.saturating_add(1);
+                });
+                // A worker that had been up for a while earns a quick retry; a
+                // crash loop backs off.
+                attempts = if started.elapsed() >= STABLE_AFTER {
+                    1
+                } else {
+                    attempts.saturating_add(1)
+                };
+                tokio::time::sleep(backoff(attempts)).await;
+            }
+            None => match relaunch(binary.to_path_buf(), listen).await {
+                Ok(worker) => {
+                    attempts = 0;
+                    update(&state.status, |status| {
+                        status.running = true;
+                        status.detail = None;
+                    });
+                    child = Some(worker);
+                }
+                Err(error) => {
+                    attempts = attempts.saturating_add(1);
+                    update(&state.status, |status| {
+                        status.running = false;
+                        status.detail =
+                            Some(format!("cannot restart {}: {error}", binary.display()));
+                    });
+                    tokio::time::sleep(backoff(attempts)).await;
+                }
+            },
+        }
+    }
+}
+
+fn update(status: &Mutex<WorkerStatus>, change: impl FnOnce(&mut WorkerStatus)) {
+    match status.lock() {
+        Ok(mut status) => change(&mut status),
+        Err(poisoned) => change(&mut poisoned.into_inner()),
+    }
+}
+
+fn backoff(attempts: u32) -> Duration {
+    let doublings = attempts.saturating_sub(1).min(6);
+    (RESTART_BASE * (1 << doublings)).min(RESTART_MAX)
+}
+
 impl Extension for CuaExtension {
     fn name(&self) -> &str {
         "cua"
@@ -228,17 +332,17 @@ impl Extension for CuaExtension {
     }
 
     fn health(&self) -> Health {
-        match self.state.worker.lock() {
-            Ok(mut worker) => worker.health(),
+        match self.state.status.lock() {
+            Ok(status) => status.health(),
             Err(_) => Health::unhealthy("worker state is poisoned"),
         }
     }
 }
 
 async fn health(State(state): State<Arc<CuaState>>) -> Response {
-    let health = match state.worker.lock() {
-        Ok(mut worker) => worker.health(),
-        Err(_) => Health::unhealthy("worker state is poisoned"),
+    let (health, restarts) = match state.status.lock() {
+        Ok(status) => (status.health(), status.restarts),
+        Err(_) => (Health::unhealthy("worker state is poisoned"), 0),
     };
     let status = match health.state {
         super::HealthState::Healthy => StatusCode::OK,
@@ -255,6 +359,7 @@ async fn health(State(state): State<Arc<CuaState>>) -> Response {
                 super::HealthState::Unhealthy => "unhealthy",
             },
             "detail": health.detail,
+            "restarts": restarts,
             "mcp": state.mcp_url,
         })),
     )
@@ -310,8 +415,8 @@ async fn proxy(State(state): State<Arc<CuaState>>, headers: HeaderMap, body: Byt
         return response;
     }
 
-    let healthy = match state.worker.lock() {
-        Ok(mut worker) => worker.health().state == super::HealthState::Healthy,
+    let healthy = match state.status.lock() {
+        Ok(status) => status.health().state == super::HealthState::Healthy,
         Err(_) => false,
     };
     if !healthy {
@@ -437,23 +542,11 @@ mod tests {
         address
     }
 
-    async fn worker_that_stays() -> Child {
-        Command::new("sh")
-            .arg("-c")
-            .arg("sleep 30")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap()
-    }
-
     #[tokio::test]
     async fn a_running_worker_is_healthy_and_discoverable() {
         let extension = CuaExtension {
             state: Arc::new(CuaState {
-                worker: Mutex::new(Worker {
-                    child: Some(worker_that_stays().await),
-                    error: None,
-                }),
+                status: Mutex::new(WorkerStatus::running()),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                 proxy: None,
                 worker_token: None,
@@ -488,10 +581,7 @@ mod tests {
     async fn a_failed_worker_is_unhealthy_not_fatal() {
         let extension = CuaExtension {
             state: Arc::new(CuaState {
-                worker: Mutex::new(Worker {
-                    child: None,
-                    error: Some("cannot spawn /missing".to_owned()),
-                }),
+                status: Mutex::new(WorkerStatus::stopped("cannot spawn /missing")),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                 proxy: None,
                 worker_token: None,
@@ -501,6 +591,106 @@ mod tests {
             extension.health(),
             Health::unhealthy("cannot spawn /missing")
         );
+    }
+
+    #[test]
+    fn restart_backoff_doubles_and_caps() {
+        assert_eq!(backoff(0), Duration::from_millis(500));
+        assert_eq!(backoff(1), Duration::from_millis(500));
+        assert_eq!(backoff(2), Duration::from_secs(1));
+        assert_eq!(backoff(3), Duration::from_secs(2));
+        assert_eq!(backoff(6), Duration::from_secs(16));
+        assert_eq!(backoff(7), Duration::from_secs(30));
+        assert_eq!(backoff(1_000), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_restart_count() {
+        let extension = CuaExtension {
+            state: Arc::new(CuaState {
+                status: Mutex::new(WorkerStatus {
+                    running: false,
+                    detail: Some("worker exited with exit status: 1; restarting".to_owned()),
+                    restarts: 3,
+                }),
+                mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
+                proxy: None,
+                worker_token: None,
+            }),
+        };
+        let router = Extensions::new(vec![Arc::new(extension)])
+            .unwrap()
+            .mount(Router::new());
+        let response = router
+            .oneshot(Request::get("/cua/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["restarts"], 3);
+        assert!(body["detail"].as_str().unwrap().contains("restarting"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_replaces_a_worker_that_exits() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let state = Arc::new(CuaState {
+            status: Mutex::new(WorkerStatus::running()),
+            mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
+            proxy: None,
+            worker_token: None,
+        });
+        let exits = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let launches = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&launches);
+        let worker = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                supervise(
+                    &PathBuf::from("/fake/coorworker-cua"),
+                    "127.0.0.1:1".parse().unwrap(),
+                    state,
+                    Some(exits),
+                    0,
+                    move |_, _| {
+                        let counted = Arc::clone(&counted);
+                        async move {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            Command::new("sleep")
+                                .arg("30")
+                                .kill_on_drop(true)
+                                .spawn()
+                                .map_err(|error| error.to_string())
+                        }
+                    },
+                )
+                .await;
+            })
+        };
+        // The first child exits at once; the replacement follows the first
+        // backoff step (500 ms).
+        for _ in 0..60 {
+            if launches.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (restarts, running) = {
+            let status = state.status.lock().unwrap();
+            (status.restarts, status.running)
+        };
+        worker.abort();
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert!(restarts >= 1, "restarts = {restarts}");
+        assert!(running, "a replacement should be recorded as running");
     }
 
     #[tokio::test]
@@ -551,10 +741,7 @@ mod tests {
     async fn proxied(mcp_url: String, proxy: &[u8], worker_token: Option<&[u8]>) -> CuaExtension {
         CuaExtension {
             state: Arc::new(CuaState {
-                worker: Mutex::new(Worker {
-                    child: Some(worker_that_stays().await),
-                    error: None,
-                }),
+                status: Mutex::new(WorkerStatus::running()),
                 mcp_url,
                 proxy: Some(Proxy {
                     token: proxy.to_vec(),
@@ -577,10 +764,7 @@ mod tests {
         // Without a configured token there is no route at all, not an open one.
         let plain = CuaExtension {
             state: Arc::new(CuaState {
-                worker: Mutex::new(Worker {
-                    child: Some(worker_that_stays().await),
-                    error: None,
-                }),
+                status: Mutex::new(WorkerStatus::running()),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                 proxy: None,
                 worker_token: None,
@@ -688,10 +872,7 @@ mod tests {
     async fn the_proxy_refuses_a_dead_worker() {
         let extension = CuaExtension {
             state: Arc::new(CuaState {
-                worker: Mutex::new(Worker {
-                    child: None,
-                    error: Some("worker exited with exit status: 1".to_owned()),
-                }),
+                status: Mutex::new(WorkerStatus::stopped("worker exited with exit status: 1")),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
                 proxy: Some(Proxy {
                     token: b"proxy-secret".to_vec(),

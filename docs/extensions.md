@@ -87,17 +87,21 @@ and the router is identical to S0.
 
 ### Extension routes
 
-`/cua/health` returns `200` with `{"status":"healthy"}` while the worker
-process is alive, and `503` with the reason in `detail` after it exits or
-fails to start. `/cua/info` publishes `name` (`cua`), `mcp_url`, `transport`,
-`protocol` and `auth` (`bearer` when the worker has a `CUA_ENV_TOKEN`,
-otherwise `none`) and never the token: a discovery document that leaked it
-would hand every guest process control of the desktop. Both routes are
-extension-owned — they are mounted after `http::layered` and do not use the
-envd `/init` access token.
+`/cua/health` returns `200` with `{"status":"healthy"}` (plus the
+`restarts` count) while the worker process is alive, and `503` with the
+reason in `detail` after it exits or fails to start. `/cua/info` publishes
+`name` (`cua`), `mcp_url`, `transport`, `protocol` and `auth` (`bearer` when
+the worker has a `CUA_ENV_TOKEN`, otherwise `none`) and never the token: a
+discovery document that leaked it would hand every guest process control of
+the desktop. Both routes are extension-owned — they are mounted after
+`http::layered` and do not use the envd `/init` access token.
 
-A worker that dies does not fail the daemon: S0 keeps serving and the
-extension stays visible as unhealthy.
+A worker that exits is replaced. The supervisor relaunches it with
+exponential backoff (0.5 s doubling to 30 s; a worker that stayed up for
+60 s resets the sequence) and only reports healthy once the new process
+accepts on its loopback port. A worker that never comes up does not fail the
+daemon: S0 keeps serving and the extension stays visible as unhealthy with
+the reason in `detail`.
 
 ### Remote access without a second port
 
@@ -190,26 +194,32 @@ SPDX texts in `scripts/license-overrides/`.
 ### Evidence
 
 - Worker contract tests: 9 passed (`cua-worker/`, `cargo test --lib --bins`).
-- rust-envd suite: 848 passed (24 ignored by features), including
+- rust-envd suite: 852 passed (24 ignored by features), including
   `tests/extensions.rs` (no-shadow, merge over the Connect fallback,
   empty-set identity) and the supervisor/proxy tests in `src/ext/cua.rs`
-  (8 in that module: health and failure reporting, route absent without a
-  token, 401 for missing/wrong tokens, forwarding with worker-token
-  injection and status pass-through, 502 unreachable, 503 dead worker,
-  discovery fields).
-- End-to-end run on Xvfb `:99`: daemon → spawned worker → `/cua/health`
-  `200`; MCP `initialize` (`cua-driver 0.38.0`), `tools/list` (63 tools),
-  `tools/call get_desktop_state` returned a valid 1024×768 PNG; killing the
-  worker turned `/cua/health` into `503` while S0 `/health` stayed `204`.
+  (12 in that module: health and failure reporting, restart count and
+  replacement after exit, backoff bounds, route absent without a token, 401
+  for missing/wrong tokens, forwarding with worker-token injection and
+  status pass-through, 502 unreachable, 503 dead worker, discovery fields).
+- Supervision: a child that exits is replaced within the first backoff step
+  and reported healthy once the replacement is installed
+  (`supervisor_replaces_a_worker_that_exits`, with a fake relauncher so no
+  real worker binary is needed).
+- End-to-end run on Xvfb `:99` (before supervision existed, M5): daemon →
+  spawned worker → `/cua/health` `200`; MCP `initialize` (`cua-driver
+  0.38.0`), `tools/list` (63 tools), `tools/call get_desktop_state` returned
+  a valid 1024×768 PNG; killing the worker turned `/cua/health` into `503`
+  while S0 `/health` stayed `204`. With the supervisor, that same kill now
+  leads to a relaunch instead of staying unhealthy.
 - Proxy run on the same display with `COORWORKER_CUA_PROXY_TOKEN` set:
   `/cua/info` published `proxy_path`/`proxy_auth`; an unauthenticated
   `POST /cua/mcp` returned `401`; with the token, `initialize` (protocol
   `2025-06-18`), `tools/list` (63 tools, 44,350 description bytes) and
   `tools/call get_desktop_state` (valid 1024×768 PNG, `image/png`) all went
   through envd; killing the worker made `POST /cua/mcp` and `/cua/health`
-  `503` while S0 `/health` stayed `204`. A 233-byte PNG is the blank Xvfb
-  screen, not a truncation: the IHDR says 1024×768 and the signature is
-  valid.
+  `503` while S0 `/health` stayed `204` (M5, before the supervisor). A
+  233-byte PNG is the blank Xvfb screen, not a truncation: the IHDR says
+  1024×768 and the signature is valid.
 - Downstream client conformance: the coorworker AgentHost's MCP client
   (official Go SDK v1.8.0, Streamable HTTP, session-less, `Authorization:
   Bearer`) completes `initialize`, lists all 63 tools and calls
