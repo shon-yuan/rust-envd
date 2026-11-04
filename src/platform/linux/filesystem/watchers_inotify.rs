@@ -70,7 +70,10 @@ impl Backend {
                 "cannot watch path on network filesystem",
             ));
         }
-        let fd = AsyncFd::new(Inotify::init().map_err(failure)?).map_err(failure)?;
+        let inotify = Inotify::init().map_err(failure)?;
+        // SAFETY: the private backend retains Inotify until registration drops.
+        // Adding/removing watches and reading events never replaces its fd.
+        let fd = unsafe { AsyncFd::register(inotify) }.map_err(failure)?;
         let mut backend = Self {
             config: Config {
                 path: path.clone(),

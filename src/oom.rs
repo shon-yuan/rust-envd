@@ -263,9 +263,10 @@ impl LogSource for KernelSource {
         }
         // SAFETY: open returned a fresh owned descriptor, transferred exactly once.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Kmsg {
-            fd: AsyncFd::new(owned)?,
-        })
+        // SAFETY: Kmsg keeps exclusive ownership of the opened descriptor;
+        // retry/cancellation drops the registration before closing its owner.
+        let fd = unsafe { AsyncFd::register(owned)? };
+        Ok(Kmsg { fd })
     }
 }
 impl KernelLog for Kmsg {
@@ -718,8 +719,10 @@ mod tests {
         let (reader, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         reader.set_nonblocking(true).unwrap();
         let owned: OwnedFd = reader.into();
+        // SAFETY: the reader was consumed into OwnedFd; the writer owns a
+        // separate peer. No code closes or replaces the registered reader.
         let mut log = Kmsg {
-            fd: AsyncFd::new(owned).unwrap(),
+            fd: unsafe { AsyncFd::register(owned).unwrap() },
         };
         let mut buffer = [0; 8192];
         assert_eq!(

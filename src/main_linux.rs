@@ -552,8 +552,11 @@ async fn resume_incoming_handover(
             // adoption so each carried kill timer starts counting only when
             // the workload actually runs again (readopt.go's Thawed).
             let thawed = resume_freezer.thawed();
+            // SAFETY: the private resume blob describes exclusively inherited
+            // endpoints from the old image; no owner/registration survived exec.
+            // readopt validates the full batch before transferring any endpoint.
             let (adopted, adopted_failed) =
-                runtime.readopt_processes(&state.processes, thawed).await;
+                unsafe { runtime.readopt_processes(&state.processes, thawed).await };
             // Restore the retention cache (upgrade.go:488-493); restore_retained
             // skips a pid that came back as a live process (upgrade.go:543-545).
             runtime

@@ -34,7 +34,12 @@ Deliberately not vendored:
 ## Local changes
 
 - `rust/Cargo.toml`: workspace `members` reduced to the vendored set.
-  `rust/Cargo.lock` remains upstream's lock, unmodified.
+  `rust/Cargo.lock` remains upstream's lock, unmodified. Raise the local zstd
+  requirement from `0.13` to `0.14.3` for the security fixes in zstd and
+  zstd-safe 8.2.0 (RUSTSEC-2026-0391, -0398, -0403 and related unsoundness
+  advisories). The two consuming lockfiles resolve the fixed versions. zstd
+  0.14 uses BSD-3-Clause; its dependency licenses are in both generated notice
+  bundles. The theme artifact format and loader APIs are unchanged here.
 - `rust/crates/platform-linux/src/wayland/hyprland.rs`: deserialize Hyprland
   0.57 workspace addresses, retaining legacy numeric IDs. Addresses take
   precedence; display names never identify workspaces. Explicit empty
@@ -59,7 +64,7 @@ and run against isolated IPC fixtures through the real worker MCP endpoint.
 
 Update procedure: re-copy the same seven crate directories, `rust/Skills/`
 and the two manifests from a reviewed upstream commit. Re-apply the members
-edit and the three Linux patches above unless the upstream update already
+edit, zstd security requirement and the three Linux patches above unless the upstream update already
 implements them; review that comparison explicitly. Run the worker tests
 including `--tests`, worker lint/build and both notice-bundle checks. Keep
 this provenance and the extension documentation aligned with the resulting

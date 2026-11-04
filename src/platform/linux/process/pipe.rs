@@ -1,7 +1,7 @@
 //! I/O for re-adopted processes over descriptors inherited across the execve
 //! (Go upgrade.go:406-425 `fileOrNil` and the readopt pump loops).
 //!
-//! The outgoing envd dup3'd the live children's pipe ends onto fixed slots
+//! The outgoing envd duplicated the live children's pipe ends onto fixed slots
 //! with CLOEXEC cleared, so the kernel objects rode the fd table across
 //! `execve`. The incoming envd relocates each slot off the handover range
 //! onto a fresh CLOEXEC-set descriptor and wraps it here. Nonblocking rides
@@ -101,28 +101,49 @@ impl StdinPipe {
 /// Relocate a carried descriptor off the handover slot range onto a fresh
 /// fd with CLOEXEC set, closing the slot (upgrade.go:406-425 `fileOrNil`).
 /// This frees the slot for the NEXT upgrade's relocation — a chained upgrade
-/// dup3's back onto the same slots, and a parked slot would abort it — and
+/// duplicates back onto the same slots, and a parked slot would abort it — and
 /// stops the fd from leaking into processes this envd spawns (the next
 /// handover re-clears CLOEXEC on its own relocations).
 ///
-/// A dup failure falls back to the slot as-is: the current re-adoption still
-/// works; only a later chained upgrade might collide (upgrade.go:412-421).
+/// A duplication failure is returned without manufacturing ownership of an
+/// invalid slot. The caller retains responsibility for a slot on error.
 pub(super) fn relocate_carried_fd(slot: RawFd) -> io::Result<OwnedFd> {
     use nix::fcntl::{fcntl, FcntlArg::F_DUPFD_CLOEXEC};
     if slot < 0 {
         return Err(io::ErrorKind::NotFound.into());
     }
-    match fcntl(slot, F_DUPFD_CLOEXEC(0)) {
-        Ok(fresh) => {
-            let _ = nix::unistd::close(slot);
-            // SAFETY: F_DUPFD_CLOEXEC returned a newly allocated descriptor
-            // owned by this process; nothing else closes it.
-            Ok(unsafe { OwnedFd::from_raw_fd(fresh) })
+    let fresh = fcntl(slot, F_DUPFD_CLOEXEC(0)).map_err(io::Error::from)?;
+    let _ = nix::unistd::close(slot);
+    // SAFETY: F_DUPFD_CLOEXEC returned a fresh descriptor; the caller
+    // transferred the inherited slot and no other owner can close this fd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fresh) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relocate_carried_fd;
+
+    #[test]
+    fn relocate_carried_fd_rejects_closed_nonnegative_descriptor() {
+        // This cannot be allocated by another parallel test, unlike a low fd
+        // that this test opens and closes to manufacture EBADF.
+        let result = relocate_carried_fd(i32::MAX);
+        match result {
+            Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EBADF)),
+            Ok(fd) => {
+                // If invalid ownership regresses, avoid OwnedFd::drop aborting
+                // before the failing assertion can report the defect.
+                std::mem::forget(fd);
+                panic!("relocate_carried_fd accepted a closed nonnegative descriptor");
+            }
         }
-        Err(_) => {
-            // SAFETY: the slot is a live inherited descriptor the registry
-            // now solely owns; it is closed when this OwnedFd drops.
-            Ok(unsafe { OwnedFd::from_raw_fd(slot) })
+    }
+
+    #[test]
+    fn relocate_carried_fd_rejects_absent_descriptor() {
+        for absent in [-1, i32::MIN] {
+            let error = relocate_carried_fd(absent).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         }
     }
 }

@@ -27,6 +27,9 @@ The distributable notice bundle
 the worker's separate bundle is under `third_party/cua-worker/`) and the
 release manifest procedure are specified in
 [`third_party/PACKAGING.md`](third_party/PACKAGING.md).
+Dependency security updates, remaining maintenance warnings and the Linux
+handover ownership migration are recorded in
+[`docs/dependency-security.md`](docs/dependency-security.md).
 
 ## Platforms
 
@@ -61,9 +64,11 @@ executable:
 cargo build --locked --bin coorworker-envd
 ```
 
-Evidence: the library suite runs natively on a Windows 11 guest (314 passed,
-0 failed), and the official E2B Python SDK 2.62.1 drives a live guest through
-its own codec, generated clients and `CommandHandle` (27/27; the agent repo's
+Evidence: the [dependency maintenance regression](docs/windows-dependency-regression.md)
+runs natively on Windows 11 at commit `c3cb81a`: 321 library tests plus 5 base
+or 9 desktop integration tests, and 16 standalone-worker tests passed. The
+official E2B Python SDK 2.62.1 drives a live guest through its own codec,
+generated clients and `CommandHandle` (27/27; the agent repo's
 `scripts/tests/envd-parity/sdk_conformance.py`). There is no Windows oracle,
 so Windows behaviour is contract evidence only — no differential claim is
 made. Declared deviations: freeze is thread suspension rather than cgroup v2;
@@ -94,17 +99,27 @@ CUA supports these deployment modes:
 | `shared-external` | Deployment-managed user-session helper | Current envd `/init` token as Bearer |
 
 Build the desktop executable with `cargo build --locked -j4 --features cua-desktop`.
+Native Windows desktop and standalone-worker builds also require the MSVC v143
+x64/x86 Spectre-mitigated libraries matching the selected toolset; see the
+[build prerequisites](third_party/PACKAGING.md#canonical-build).
 The default build keeps desktop dependencies disabled and supports static musl
 packaging. Embedded mode serves `POST /cua/mcp` on envd's own listener, with no
 worker child or extra port. CUA stays closed until an envd token is installed;
-rotation and reset affect subsequent requests. S0 still uses `X-Access-Token`.
+rotation and authorized reset affect subsequent requests. Native Windows
+DPAPI provisioning supports rotation, but empty metadata cannot authorize a live
+reset; `/init {}` returns 401 and preserves the token. See the
+[native CUA acceptance](docs/windows-cua-acceptance.md#native-live-reset-limitation).
+S0 still uses `X-Access-Token`.
 
 Windows service launches, service handover successors, session zero, and
 unknown sessions cannot initialize embedded desktop execution. Use
 `shared-external` there: start `coorworker-cua` in the logged-in session and
 supply matching local transport credentials via `CUA_ENV_TOKEN` (or the
 helper's `--token-file`). The external client needs only the envd credential;
-the envd credential is never sent to the helper.
+the envd credential is never sent to the helper. The
+[native Windows CUA acceptance](docs/windows-cua-acceptance.md) establishes
+embedded capture/input/window operations and actual SCM/helper lifecycle,
+recovery and credential boundaries in a disposable Windows 11 copy.
 
 Legacy `COORWORKER_CUA_BIN`, `COORWORKER_CUA_EXTERNAL`, proxy tokens, restart
 budgets, and observed recoveries retain their existing behavior. Shared modes

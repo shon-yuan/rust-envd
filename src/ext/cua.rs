@@ -1254,26 +1254,39 @@ mod tests {
         ));
     }
 
-    /// A stand-in for `coorworker-cua`: answers `GET /health` with `status`.
-    async fn worker_stub(listen: SocketAddr, status: StatusCode) -> tokio::task::JoinHandle<()> {
-        let app = Router::new().route("/health", get(move || async move { status }));
-        let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        })
-    }
-
     #[tokio::test]
     async fn an_adopted_worker_is_probed_and_reported() {
-        let listen = free_listen();
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Keep the listener for the entire fixture: releasing an ephemeral
+        // port before adoption lets another parallel test claim it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let worker_ready = ready.clone();
+        let app = Router::new().route(
+            "/health",
+            get(move || {
+                let ready = worker_ready.load(Ordering::Relaxed);
+                async move {
+                    if ready {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let stub = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         let extension = CuaExtension::adopt(listen, None).await;
         let health = extension.health();
         assert_eq!(health.state, crate::ext::HealthState::Unhealthy);
-        assert!(health.detail.contains("unreachable"), "{}", health.detail);
+        assert!(health.detail.contains("503"), "{}", health.detail);
 
-        // A worker that appears after adoption is picked up by the probe loop
-        // and reported through the same routes a caller uses.
-        let stub = worker_stub(listen, StatusCode::NO_CONTENT).await;
+        // The adopted worker becomes ready without replacing its listener.
+        ready.store(true, Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline && extension.health() != Health::healthy() {
             tokio::time::sleep(Duration::from_millis(50)).await;
