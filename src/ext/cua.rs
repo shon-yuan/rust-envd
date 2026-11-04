@@ -1769,6 +1769,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_workers_that_crash_still_exhaust_the_restart_budget() {
+        use std::sync::atomic::AtomicU32;
+
+        let state = shared_state(
+            "127.0.0.1:1".parse().unwrap(),
+            None,
+            WorkerStatus::running(),
+        );
+        let launches = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&launches);
+        let crash = || {
+            Command::new("sh")
+                .args(["-c", "exit 1"])
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|error| error.to_string())
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            supervise(
+                Path::new("/fake/coorworker-cua"),
+                "127.0.0.1:1".parse().unwrap(),
+                Arc::clone(&state),
+                Some(crash().unwrap()),
+                0,
+                3,
+                move |_, _| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    // Ok models launch() having passed readiness. The process
+                    // then exits before STABLE_AFTER on every relaunch.
+                    std::future::ready(crash())
+                },
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "ready crash loop must exhaust its budget");
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+        let status = state.status.lock().unwrap();
+        assert!(!status.running);
+        assert!(status.budget_exhausted);
+        assert_eq!(status.restarts, 3);
+        assert!(status.detail.as_deref().unwrap().contains("after 3 attempts"));
+    }
+
+    #[tokio::test]
     async fn the_proxy_counts_tool_calls_and_latency_only_for_calls() {
         let (url, _seen) = fake_mcp_worker().await;
         let router = Extensions::new(vec![Arc::new(proxied(url, b"proxy-secret", None).await)])
