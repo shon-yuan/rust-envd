@@ -41,8 +41,16 @@ REQUIRED_FILES = (
     "vendor/hyper/PATCHES.md",
     "Cargo.toml",
     "Cargo.lock",
+    # The optional cua worker is a separate package with its own lockfile and
+    # notice bundle; a release that ships it carries both.
+    "third_party/cua-worker/NOTICES.md",
+    "cua-worker/Cargo.toml",
+    "cua-worker/Cargo.lock",
+    "vendor/cua-driver/LICENSE",
+    "vendor/cua-driver/PROVENANCE.md",
 )
 LICENSES_DIR = "third_party/licenses"
+WORKER_LICENSES_DIR = "third_party/cua-worker/licenses"
 MANIFEST_SCHEMA = 1
 
 
@@ -114,8 +122,9 @@ def main() -> int:
         fail(f"--binary is not a file: {binary}")
 
     missing = [name for name in REQUIRED_FILES if not (REPO / name).is_file()]
-    if not (REPO / LICENSES_DIR).is_dir():
-        missing.append(LICENSES_DIR + "/")
+    for directory in (LICENSES_DIR, WORKER_LICENSES_DIR):
+        if not (REPO / directory).is_dir():
+            missing.append(directory + "/")
     if missing:
         fail("missing covered file(s): " + ", ".join(missing))
 
@@ -161,6 +170,7 @@ def main() -> int:
         "binary": file_record(binary),
         "covered_files": [file_record(REPO / name) for name in REQUIRED_FILES],
         "license_tree": tree_record(REPO / LICENSES_DIR),
+        "worker_license_tree": tree_record(REPO / WORKER_LICENSES_DIR),
         "notice_check": "ok",
     }
 

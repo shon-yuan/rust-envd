@@ -19,11 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 import tomllib
 from pathlib import Path
 
@@ -42,18 +40,27 @@ COPYRIGHT_RE = re.compile(
     r"(?i)copyright\s*(?:\(c\)|\xa9|\d{4})|\xa9|\(c\)\s*\d{4}"
 )
 # Apache-2.0 appendix placeholder; never a real holder statement.
-PLACEHOLDER_RE = re.compile(r"(?i)copyright\s*\[yyyy\]")
+PLACEHOLDER_RE = re.compile(
+    r"(?i)copyright\s*(?:\(c\)\s*)?(?:\[yyyy\]|<year>|<copyright holders>)"
+)
 
 # Crates that declare a license expression but ship no license file in the
-# published package get the canonical text for that identifier synthesized
-# from the dominant byte-identical copy in the local registry. Keyed by SPDX
-# identifier; value is (pattern matching canonical source files, output name).
+# published package get canonical text synthesized either from the dominant
+# byte-identical copy in the local registry (Apache-2.0) or from the checked-in
+# SPDX license texts under scripts/license-overrides/ (MIT, MPL-2.0, which
+# embed no package-specific copyright line). Keyed by SPDX identifier; value
+# is (pattern matching canonical source files, output name).
 SYNTHETIC_LICENSE_SOURCES = {
     "Apache-2.0": (
         re.compile(r"(?i)license[.\-_ ]?apache"),
         "LICENSE-APACHE",
     ),
+    "MIT": (None, "LICENSE-MIT"),
+    "MPL-2.0": (None, "LICENSE-MPL"),
+    "BSL-1.0": (None, "LICENSE-BSL"),
 }
+
+OVERRIDES_DIR = Path(__file__).resolve().parent / "license-overrides"
 
 NOTICES_NAME = "NOTICES.md"
 LICENSES_DIR = "licenses"
@@ -319,7 +326,7 @@ def build_canonical_index(pkgs: list[dict]) -> dict[str, tuple[bytes, str]]:
             if not entry.is_file():
                 continue
             for ident, (pat, _out) in SYNTHETIC_LICENSE_SOURCES.items():
-                if pat.match(entry.name):
+                if pat is not None and pat.match(entry.name):
                     origin = f"{pkg['name']}-{pkg['version']}/{entry.name}"
                     groups.setdefault(ident, {}).setdefault(
                         entry.read_bytes(), []
@@ -335,12 +342,79 @@ def build_canonical_index(pkgs: list[dict]) -> dict[str, tuple[bytes, str]]:
     return index
 
 
-def generate(repo: Path) -> tuple[str, dict[str, bytes], int, int]:
-    """Return (NOTICES.md text, {relative path under third_party: bytes},
-    total package count, third-party crate count)."""
-    enumerated = cargo_metadata_packages(repo)
+def synthesized_license(
+    repo: Path, pkg: dict, canonical: dict[str, tuple[bytes, str]]
+) -> tuple[str, bytes, str] | None:
+    """Text for a crate whose published package ships no license file.
+
+    The vendored Cua Driver crates reuse the upstream repository's MIT text,
+    which covers them and names the actual holder. Other crates fall back to
+    the dominant registry copy (Apache-2.0) or the checked-in SPDX text
+    (MIT, MPL-2.0), which carry no holder of their own.
+    """
+    manifest_dir = pkg.get("manifest_dir")
+    if manifest_dir is not None:
+        try:
+            manifest_dir.resolve().relative_to((repo / "vendor" / "cua-driver").resolve())
+        except ValueError:
+            pass
+        else:
+            upstream = repo / "vendor" / "cua-driver" / "LICENSE"
+            if upstream.is_file():
+                return (
+                    "LICENSE",
+                    upstream.read_bytes(),
+                    "upstream repository license, reproduced byte-for-byte;"
+                    " the published crate ships no per-crate file (see"
+                    " vendor/cua-driver/PROVENANCE.md)",
+                )
+    if not pkg["license"]:
+        return None
+    for ident, (_pat, out_name) in SYNTHETIC_LICENSE_SOURCES.items():
+        if ident not in pkg["license"]:
+            continue
+        if ident in canonical:
+            payload, origin = canonical[ident]
+            return (
+                out_name,
+                payload,
+                f"canonical {ident} text; the crate package ships no license"
+                f" file — reproduced byte-for-byte from {origin} in the local"
+                " registry",
+            )
+        override = OVERRIDES_DIR / f"{ident}.txt"
+        if override.is_file():
+            return (
+                out_name,
+                override.read_bytes(),
+                f"canonical {ident} text from the SPDX license list"
+                f" (scripts/license-overrides/{override.name}); the crate"
+                " package ships no license file and embeds no copyright notice",
+            )
+    return None
+
+
+def generate(
+    package_dir: Path,
+    repo: Path,
+    *,
+    title: str,
+    scope: str,
+    root_label: str,
+    license_link: str,
+    vendored_kind: str = "patch",
+) -> tuple[str, dict[str, bytes], int, int]:
+    """Return (NOTICES.md text, {relative path under the bundle root: bytes},
+    total package count, third-party crate count).
+
+    ``package_dir`` is the crate whose dependency graph is enumerated (the
+    repository root, or a nested package such as ``cua-worker`` with its own
+    lockfile). ``repo`` stays the repository root for shared license and
+    provenance files.
+    """
+    enumerated = cargo_metadata_packages(package_dir)
     if enumerated is None:
-        enumerated = lockfile_packages(repo)
+        enumerated = lockfile_packages(package_dir)
     pkgs, root, method = enumerated
     if method.startswith("Cargo.lock"):
         fill_license_fields(pkgs)
@@ -360,17 +434,12 @@ def generate(repo: Path) -> tuple[str, dict[str, bytes], int, int]:
         basenames = collect_basenames(pkg, src_dir)
         synthetic: dict[str, str] = {}
         synthetic_payloads: dict[str, bytes] = {}
-        if not basenames and pkg["license"]:
-            for ident, (_pat, out_name) in SYNTHETIC_LICENSE_SOURCES.items():
-                if ident in pkg["license"] and ident in canonical:
-                    payload, origin = canonical[ident]
-                    synthetic_payloads[out_name] = payload
-                    synthetic[out_name] = (
-                        f"canonical {ident} text; the crate package ships no"
-                        f" license file — reproduced byte-for-byte from"
-                        f" {origin} in the local registry"
-                    )
-                    break
+        if not basenames:
+            synthesized = synthesized_license(repo, pkg, canonical)
+            if synthesized is not None:
+                out_name, payload, note = synthesized
+                synthetic_payloads[out_name] = payload
+                synthetic[out_name] = note
         if not basenames and not synthetic_payloads:
             where = str(src_dir) if src_dir else "registry source/cache"
             collector.add(
@@ -399,7 +468,18 @@ def generate(repo: Path) -> tuple[str, dict[str, bytes], int, int]:
         fail(f"{len(collector.errors)} crate(s) failed; bundle not written")
         sys.exit(1)
 
-    text = render_notices(repo, root, method, collected, len(pkgs) + 1)
+    text = render_notices(
+        repo,
+        root,
+        method,
+        collected,
+        len(pkgs) + 1,
+        title=title,
+        scope=scope,
+        root_label=root_label,
+        license_link=license_link,
+        vendored_kind=vendored_kind,
+    )
     tree: dict[str, bytes] = {NOTICES_NAME: text.encode("utf-8")}
     for pkg, files, _synthetic in collected:
         prefix = f"{LICENSES_DIR}/{pkg['name']}-{pkg['version']}"
@@ -430,6 +510,12 @@ def render_notices(
     method: str,
     collected: list[tuple[dict, dict[str, bytes], dict[str, str]]],
     total: int,
+    *,
+    title: str,
+    scope: str,
+    root_label: str,
+    license_link: str,
+    vendored_kind: str,
 ) -> str:
     own_copyright = ""
     lic = repo / "LICENSE"
@@ -438,7 +524,7 @@ def render_notices(
 
     lines: list[str] = []
     add = lines.append
-    add("# Third-Party Notices — rust-envd")
+    add(f"# {title}")
     add("")
     add(
         "This file and the `licenses/` directory beside it constitute the"
@@ -447,14 +533,7 @@ def render_notices(
     add("")
     add("## Scope")
     add("")
-    add(
-        "These notices cover every distribution built from this repository:"
-        " the linked `envd` daemon binaries produced from this crate, and any"
-        " guest or sandbox image that embeds such a binary. Distributing a"
-        " covered distribution requires reproducing this file, the"
-        " `licenses/` tree, and the files called out in"
-        " [`PACKAGING.md`](PACKAGING.md)."
-    )
+    add(scope)
     add("")
     add(
         f"Enumerated from the pinned dependency graph via {method}:"
@@ -468,59 +547,83 @@ def render_notices(
     add("## This project (MIT)")
     add("")
     add(
-        f"rust-envd (crate `{root['name']}` {root['version']}) is licensed"
-        " under the MIT License; see [`LICENSE`](../LICENSE) at the"
-        " repository root."
+        f"{root_label} (crate `{root['name']}` {root['version']}) is licensed"
+        " under the MIT License; see"
+        f" [`LICENSE`]({license_link}) at the repository root."
     )
     add("")
     if own_copyright:
         add(f"{own_copyright}")
         add("")
-    add("## Vendored upstream schemas (Apache-2.0)")
-    add("")
-    add(
-        "`third_party/e2b/` contains e2b `envd` protobuf schemas"
-        " redistributed byte-for-byte from https://github.com/e2b-dev/runtime"
-        " (release 0.10.2, commit"
-        " 51083a83cc0903185d992725ea6bb33683814b29) under the Apache License,"
-        " 2.0. Any covered distribution must include"
-        " `third_party/e2b/LICENSE` and `third_party/e2b/PROVENANCE`;"
-        " generated code built from those schemas carries the same"
-        " attribution and does not replace those files."
-    )
-    add("")
-    add("## Go-derived source (BSD-3-Clause)")
-    add("")
-    add(
-        "`src/platform/linux/mmds/go_url.rs` is a Go-derived redirect URL helper carrying"
-        ' The Go Authors\' BSD-3-Clause notice ("Copyright 2009 The Go'
-        ' Authors.") in its file header. Binary redistribution of a covered'
-        " distribution must reproduce that notice; source distributions"
-        " include the file itself."
-    )
-    add("")
-    add("## Vendored Rust crate forks")
-    add("")
+    if vendored_kind != "cua":
+        add("## Vendored upstream schemas (Apache-2.0)")
+        add("")
+        add(
+            "`third_party/e2b/` contains e2b `envd` protobuf schemas"
+            " redistributed byte-for-byte from https://github.com/e2b-dev/runtime"
+            " (release 0.10.2, commit"
+            " 51083a83cc0903185d992725ea6bb33683814b29) under the Apache License,"
+            " 2.0. Any covered distribution must include"
+            " `third_party/e2b/LICENSE` and `third_party/e2b/PROVENANCE`;"
+            " generated code built from those schemas carries the same"
+            " attribution and does not replace those files."
+        )
+        add("")
+        add("## Go-derived source (BSD-3-Clause)")
+        add("")
+        add(
+            "`src/platform/linux/mmds/go_url.rs` is a Go-derived redirect URL helper carrying"
+            ' The Go Authors\' BSD-3-Clause notice ("Copyright 2009 The Go'
+            ' Authors.") in its file header. Binary redistribution of a covered'
+            " distribution must reproduce that notice; source distributions"
+            " include the file itself."
+        )
+        add("")
     forks = vendored_forks(repo, collected)
-    if not forks:
+    if vendored_kind == "cua":
+        add("## Vendored Cua Driver crates")
+        add("")
         add(
-            "No in-tree crate forks are resolved by the current lockfile; this"
-            " section becomes active when a `[patch.crates-io]` path"
-            " dependency is present."
+            "`vendor/cua-driver/` carries the MIT-licensed Cua Driver crates"
+            " used by the optional `coorworker-cua` worker, copied"
+            " byte-for-byte from a pinned upstream commit. Provenance, the"
+            " vendored list, and the deliberately excluded AGPL/FSL"
+            " components are recorded in `vendor/cua-driver/PROVENANCE.md`."
+            " Covered distributions must include that file and the license"
+            " texts enumerated below."
         )
         add("")
-    for relative, pkg in forks:
-        crate = f"{pkg['name']}-{pkg['version']}"
-        add(
-            f"`{relative}/` is an in-tree fork of crates.io `{pkg['name']}`"
-            f" {pkg['version']} ({pkg['license'] or 'see files'}), selected with"
-            " `[patch.crates-io]`. Covered distributions must include this"
-            f" file, the license text(s) under `{LICENSES_DIR}/{crate}/`,"
-            f" and `{relative}/PATCHES.md`, which records the upstream"
-            " revision and every local change. The fork's license text is"
-            " enumerated below with the other third-party crates."
-        )
+        for relative, pkg in forks:
+            crate = f"{pkg['name']}-{pkg['version']}"
+            add(
+                f"`{relative}/` is a vendored upstream crate `{pkg['name']}`"
+                f" {pkg['version']} ({pkg['license'] or 'see files'}). Its"
+                f" license text is under `{LICENSES_DIR}/{crate}/` and is"
+                " also indexed below."
+            )
+            add("")
+    else:
+        add("## Vendored Rust crate forks")
         add("")
+        if not forks:
+            add(
+                "No in-tree crate forks are resolved by the current lockfile; this"
+                " section becomes active when a `[patch.crates-io]` path"
+                " dependency is present."
+            )
+            add("")
+        for relative, pkg in forks:
+            crate = f"{pkg['name']}-{pkg['version']}"
+            add(
+                f"`{relative}/` is an in-tree fork of crates.io `{pkg['name']}`"
+                f" {pkg['version']} ({pkg['license'] or 'see files'}), selected with"
+                " `[patch.crates-io]`. Covered distributions must include this"
+                f" file, the license text(s) under `{LICENSES_DIR}/{crate}/`,"
+                f" and `{relative}/PATCHES.md`, which records the upstream"
+                " revision and every local change. The fork's license text is"
+                " enumerated below with the other third-party crates."
+            )
+            add("")
     add("## Third-party crates")
     add("")
     add(
@@ -632,22 +735,22 @@ def write_bundle(third_party: Path, tree: dict[str, bytes]) -> None:
     notices.write_bytes(tree[NOTICES_NAME])
 
 
-def committed_bundle(repo: Path) -> dict[str, bytes]:
+def committed_bundle(base: Path) -> dict[str, bytes]:
     """Snapshot of the committed bundle only: NOTICES.md + licenses/ tree."""
     committed: dict[str, bytes] = {}
-    notices = repo / "third_party" / NOTICES_NAME
+    notices = base / NOTICES_NAME
     if notices.is_file():
         committed[NOTICES_NAME] = notices.read_bytes()
-    for rel, payload in snapshot(repo / "third_party" / LICENSES_DIR).items():
+    for rel, payload in snapshot(base / LICENSES_DIR).items():
         committed[f"{LICENSES_DIR}/{rel}"] = payload
     return committed
 
 
-def check_bundle(repo: Path, tree: dict[str, bytes]) -> int:
-    committed = committed_bundle(repo)
+def check_bundle(base: Path, tree: dict[str, bytes], label: str) -> int:
+    committed = committed_bundle(base)
     if committed == tree:
         print(
-            f"OK: third_party/{NOTICES_NAME} and third_party/{LICENSES_DIR}/"
+            f"OK: {label}/{NOTICES_NAME} and {label}/{LICENSES_DIR}/"
             f" match the locked dependency graph ({len(tree) - 1} license files)."
         )
         return 0
@@ -656,18 +759,68 @@ def check_bundle(repo: Path, tree: dict[str, bytes]) -> int:
     changed = sorted(
         k for k in set(committed) & set(tree) if committed[k] != tree[k]
     )
-    print(f"MISMATCH between committed third_party/ and regenerated bundle:", file=sys.stderr)
-    for label, paths in (
+    print(f"MISMATCH between committed {label}/ and regenerated bundle:", file=sys.stderr)
+    for description, paths in (
         ("committed but not in lockfile bundle", only_committed),
         ("in lockfile bundle but not committed", only_new),
         ("content differs", changed),
     ):
         for rel in paths[:20]:
-            print(f"  {label}: {rel}", file=sys.stderr)
+            print(f"  {description}: {rel}", file=sys.stderr)
         if len(paths) > 20:
-            print(f"  {label}: ... and {len(paths) - 20} more", file=sys.stderr)
+            print(f"  {description}: ... and {len(paths) - 20} more", file=sys.stderr)
     print("Run `python3 scripts/generate_notices.py` to refresh the bundle.", file=sys.stderr)
     return 1
+
+
+MAIN_SCOPE = (
+    "These notices cover every distribution built from this repository:"
+    " the linked `envd` daemon binaries produced from this crate, and any"
+    " guest or sandbox image that embeds such a binary. Distributing a"
+    " covered distribution requires reproducing this file, the"
+    " `licenses/` tree, and the files called out in"
+    " [`PACKAGING.md`](PACKAGING.md)."
+)
+WORKER_SCOPE = (
+    "These notices cover the `coorworker-cua` worker binary built from"
+    " `cua-worker/`, a separate package with its own lockfile that rust-envd"
+    " supervises but does not link. Distributing the worker requires"
+    " reproducing this file and the `licenses/` tree beside it; the daemon's"
+    " bundle in `third_party/` is separate. Packaging steps are specified in"
+    " [`../PACKAGING.md`](../PACKAGING.md)."
+)
+
+
+def bundles(repo: Path) -> list[tuple[str, Path, tuple[str, dict[str, bytes], int, int]]]:
+    """The notice bundles this repository ships: the daemon's and the
+    worker's. Each is generated from its own locked dependency graph."""
+    return [
+        (
+            "third_party",
+            repo / "third_party",
+            generate(
+                repo,
+                repo,
+                title="Third-Party Notices — rust-envd",
+                scope=MAIN_SCOPE,
+                root_label="rust-envd",
+                license_link="../LICENSE",
+            ),
+        ),
+        (
+            "third_party/cua-worker",
+            repo / "third_party" / "cua-worker",
+            generate(
+                repo / "cua-worker",
+                repo,
+                title="Third-Party Notices — coorworker-cua",
+                scope=WORKER_SCOPE,
+                root_label="coorworker-cua",
+                license_link="../../LICENSE",
+                vendored_kind="cua",
+            ),
+        ),
+    ]
 
 
 def main() -> int:
@@ -675,32 +828,24 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="regenerate into a temp dir and exit nonzero if the committed bundle differs",
+        help="regenerate and exit nonzero if a committed bundle differs",
     )
     args = parser.parse_args()
     repo = Path(__file__).resolve().parent.parent
 
     if args.check:
-        workdir = Path(tempfile.mkdtemp(prefix="rust-envd-notices-check-"))
-        try:
-            _, tree, _, _ = generate(repo)
-            out = workdir / "third_party"
-            out.mkdir()
-            for rel, payload in tree.items():
-                dest = out / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(payload)
-            return check_bundle(repo, tree)
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        failed = 0
+        for label, base, (_text, tree, _total, _ncrates) in bundles(repo):
+            failed |= check_bundle(base, tree, label)
+        return 0 if failed == 0 else 1
 
-    text, tree, total, ncrates = generate(repo)
-    write_bundle(repo / "third_party", tree)
-    print(
-        f"Wrote third_party/{NOTICES_NAME} ({len(text.encode('utf-8'))} bytes)"
-        f" and {len(tree) - 1} license files for {ncrates} crates"
-        f" ({total} packages in the locked graph, root included)."
-    )
+    for label, base, (text, tree, total, ncrates) in bundles(repo):
+        write_bundle(base, tree)
+        print(
+            f"Wrote {label}/{NOTICES_NAME} ({len(text.encode('utf-8'))} bytes)"
+            f" and {len(tree) - 1} license files for {ncrates} crates"
+            f" ({total} packages in the locked graph, root included)."
+        )
     return 0
 
 

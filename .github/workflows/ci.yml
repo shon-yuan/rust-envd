@@ -15,17 +15,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc and the X11 headers the cua worker links
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler \
+            libx11-dev libxi-dev libxtst-dev libxfixes-dev libxrandr-dev \
+            libxcomposite-dev libxrender-dev libxext-dev libxdamage-dev
       - run: cargo build --locked -j4
       - run: cargo test --locked -j4
       - run: cargo clippy --locked -j4 --all-targets -- -D warnings
       - run: cargo fmt --check
-      - name: Fetch the full lockfile for the notice bundle
-        # The bundle covers every platform in Cargo.lock, and
+      - name: Build, test and lint the cua worker
+        run: |
+          cargo build --locked -j4 --manifest-path cua-worker/Cargo.toml --bin coorworker-cua
+          cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins
+          cargo clippy --locked -j4 --manifest-path cua-worker/Cargo.toml --all-targets -- -D warnings
+          cargo fmt --manifest-path cua-worker/Cargo.toml --check
+      - name: Fetch both lockfiles for the notice bundles
+        # The bundles cover every platform in each lockfile, and
         # `cargo metadata --offline` needs those sources in the registry cache.
-        run: cargo fetch --locked
-      - name: License notice bundle matches Cargo.lock
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path cua-worker/Cargo.toml
+      - name: License notice bundles match both lockfiles
         run: python3 scripts/generate_notices.py --check
 
   windows-check:

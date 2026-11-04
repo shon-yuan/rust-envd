@@ -23,8 +23,9 @@ optional `coorworker-cua` worker (provenance in
 `vendor/cua-driver/PROVENANCE.md`); the AGPL perception crates and the FSL
 `cua-spacesd` are excluded.
 The distributable notice bundle
-([`third_party/NOTICES.md`](third_party/NOTICES.md), `third_party/licenses/`)
-and the release manifest procedure are specified in
+([`third_party/NOTICES.md`](third_party/NOTICES.md), `third_party/licenses/`;
+the worker's separate bundle is under `third_party/cua-worker/`) and the
+release manifest procedure are specified in
 [`third_party/PACKAGING.md`](third_party/PACKAGING.md).
 
 ## Platforms

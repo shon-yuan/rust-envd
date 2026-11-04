@@ -149,7 +149,11 @@ Only the MIT crates are vendored (`vendor/cua-driver/`, provenance in
 `cua-driver-contract`, `platform-linux`, `platform-windows`,
 `cursor-overlay`, `cua-cursor-motion`, `pip-preview`. `cua-perception` is
 AGPL-3.0-only and is excluded. `libs/cua-spacesd` is FSL-1.1-MIT and must
-not be merged into this MIT repository.
+not be merged into this MIT repository. The worker's dependency notices are
+a separate bundle under `third_party/cua-worker/` (502 packages, generated
+from `cua-worker/Cargo.lock` by `scripts/generate_notices.py`); packages that
+ship no license file use the upstream Cua Driver license or the checked-in
+SPDX texts in `scripts/license-overrides/`.
 
 ### Evidence
 
@@ -161,3 +165,10 @@ not be merged into this MIT repository.
   `200`; MCP `initialize` (`cua-driver 0.38.0`), `tools/list` (63 tools),
   `tools/call get_desktop_state` returned a valid 1024×768 PNG; killing the
   worker turned `/cua/health` into `503` while S0 `/health` stayed `204`.
+- Downstream client conformance: the coorworker AgentHost's MCP client
+  (official Go SDK v1.8.0, Streamable HTTP, session-less, `Authorization:
+  Bearer`) completes `initialize`, lists all 63 tools and calls
+  `get_desktop_state` against `POST /mcp`. Tool descriptions total 44,350
+  bytes; two exceed 4 KiB, which is why the AgentHost per-description bound
+  was raised to 8 KiB with a 256 KiB aggregate bound rather than truncating
+  the driver's usage notes.
