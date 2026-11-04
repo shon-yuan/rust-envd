@@ -28,11 +28,11 @@ enum Container {
     Array,
 }
 #[derive(Default)]
-pub(super) struct Scanner {
+pub(crate) struct Scanner {
     state: ScanState,
     stack: Vec<Container>,
 }
-pub(super) fn space(byte: u8) -> bool {
+pub(crate) fn space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\n' | b'\r' | b'\t')
 }
 fn syntax(byte: u8, context: &str) -> String {
@@ -60,7 +60,7 @@ impl Scanner {
         self.state = ScanState::End;
         self.stack.is_empty()
     }
-    pub(super) fn eof(&self) -> bool {
+    pub(crate) fn eof(&self) -> bool {
         self.stack.is_empty()
             && matches!(
                 self.state,
@@ -71,7 +71,7 @@ impl Scanner {
                     | ScanState::ExponentDigits
             )
     }
-    pub(super) fn step(&mut self, byte: u8) -> Result<bool, String> {
+    pub(crate) fn step(&mut self, byte: u8) -> Result<bool, String> {
         use ScanState::*;
         match self.state {
             Begin => self.begin(byte),
@@ -213,4 +213,17 @@ impl Scanner {
         }
         Ok(false)
     }
+}
+
+/// ASCII case-insensitive key fold with Go's special runs: `ſ` (U+017F) folds
+/// to `S` and the Kelvin sign (U+212A) folds to `K`, as `encoding/json` does
+/// when matching struct fields.
+pub(crate) fn folded_field(key: &str) -> String {
+    key.chars()
+        .map(|ch| match ch {
+            'ſ' => 'S',
+            'K' => 'K',
+            ch => ch.to_ascii_uppercase(),
+        })
+        .collect()
 }

@@ -1,9 +1,21 @@
 //! POST /files/compose, pinned to runtime 51083a83 compose.go.
-// Shared HTTP helpers return complete responses, including protocol error headers.
+//!
+//! The decoder, validation order, error strings, HTML escaping and response
+//! framing are shared by both daemons. The OS-owned parts (random temp name,
+//! creation mode, ownership, file identity, copy and close) go through
+//! [`crate::platform::compose_files`]. Shared HTTP helpers return complete
+//! responses, including protocol error headers.
 #![allow(clippy::result_large_err)]
-use super::Daemon;
-use crate::exec_context::{Account, Defaults};
-use crate::files_http::{json_error, lookup_account, resolve};
+use crate::{
+    compose_decode::{folded_field, quote, space, Scanner},
+    exec_context::{Account, Defaults},
+    files_http::{json_error, lookup_account, resolve},
+    http::ConfigurationState,
+    platform::compose_files::{
+        adopt_owner, close_output, copy_file, create_new_temp, ensure_dirs, errno_text, identity,
+        is_no_space, parent, random_bytes, rename_over, same_file, FileId,
+    },
+};
 use axum::{
     body::Body,
     extract::State,
@@ -11,25 +23,23 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use nix::unistd::{chown, close, Gid, Uid};
 use serde_json::json;
 use std::{
-    fs::{self, File, Metadata, OpenOptions},
-    io::{self, Read, Write},
-    os::{
-        fd::{AsRawFd, IntoRawFd},
-        unix::fs::{MetadataExt, OpenOptionsExt},
-    },
+    fs::{self, File},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-pub(super) async fn compose(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
+pub async fn compose<S: ConfigurationState>(
+    State(state): State<Arc<S>>,
+    request: Request<Body>,
+) -> Response {
     let request = match decode_body(request.into_body()).await {
         Ok(request) => request,
         Err(message) => return json_error(400, &format!("invalid request body: {message}")),
     };
-    let defaults = daemon.state.lock().await.defaults.clone();
+    let defaults = state.configuration().lock().await.defaults.clone();
     match tokio::task::spawn_blocking(move || assemble(request, &defaults)).await {
         Ok(Ok(path)) => {
             let name = Path::new(&path)
@@ -77,10 +87,6 @@ async fn decode_body(body: Body) -> Result<ComposeRequest, String> {
     }
 }
 
-#[path = "compose_decode.rs"]
-mod decode;
-use decode::{quote, space, Scanner};
-
 #[derive(Default)]
 struct ComposeRequest {
     sources: Vec<String>,
@@ -103,7 +109,7 @@ impl ComposeRequest {
             cursor.peek();
             cursor.offset += 1; // colon, already validated by Scanner
             let value = cursor.value();
-            let result = match super::folded_field(&key).as_str() {
+            let result = match folded_field(&key).as_str() {
                 "SOURCE_PATHS" => request.sources(value),
                 "DESTINATION" => assign_string(value, "destination", &mut request.destination),
                 "USERNAME" => {
@@ -326,53 +332,48 @@ fn assemble(request: ComposeRequest, defaults: &Defaults) -> Result<String, Resp
     let account = lookup_account(username)?;
     let destination = resolve_path(defaults, &account, &request.destination, "destination path")?;
     // Lstat is intentional: rename replaces a destination symlink itself.
-    let destination_info = fs::symlink_metadata(&destination).ok();
+    let destination_info = identity(Path::new(&destination), false).ok();
     let sources = validate_sources(
         &request.sources,
         &destination,
-        destination_info.as_ref(),
+        destination_info,
         defaults,
         &account,
     )?;
     let destination_path = Path::new(&destination);
-    ensure_dirs(&go_parent(&destination), &account)
+    ensure_dirs(&parent(&destination), &account)
         .map_err(|error| json_error(500, &format!("error ensuring directories: {error}")))?;
-    let (mut output, temporary) = temporary_file(&destination)?;
-    chown(
-        &temporary.0,
-        Some(Uid::from_raw(account.uid)),
-        Some(Gid::from_raw(account.gid)),
-    )
-    .map_err(|error| {
+    let mut temporary = temporary_file(&destination)?;
+    let temporary_path = temporary.path().to_path_buf();
+    adopt_owner(&temporary_path, &account).map_err(|error| {
         json_error(
             500,
             &format!(
                 "error changing file ownership: chown {}: {}",
-                temporary.0.display(),
-                error.desc().to_ascii_lowercase()
+                temporary_path.display(),
+                errno_text(&error)
             ),
         )
     })?;
-    copy_sources(&sources, &mut output, &temporary.0)?;
-    // File::drop cannot report delayed close errors; transfer ownership to close.
-    close(output.into_raw_fd()).map_err(|error| {
+    copy_sources(&sources, temporary.file(), &temporary_path)?;
+    temporary.close().map_err(|error| {
         json_error(
             500,
             &format!(
                 "error closing destination file: close {}: {}",
-                temporary.0.display(),
-                error.desc().to_ascii_lowercase()
+                temporary_path.display(),
+                errno_text(&error)
             ),
         )
     })?;
-    fs::rename(&temporary.0, destination_path).map_err(|error| {
+    rename_over(&temporary_path, destination_path).map_err(|error| {
         json_error(
             500,
             &format!(
                 "error finalizing compose: rename {} {}: {}",
-                temporary.0.display(),
+                temporary_path.display(),
                 destination,
-                go_errno(&error)
+                errno_text(&error)
             ),
         )
     })?;
@@ -400,7 +401,7 @@ fn resolve_path(
 fn validate_sources(
     sources: &[String],
     destination: &str,
-    destination_info: Option<&Metadata>,
+    destination_info: Option<FileId>,
     defaults: &Defaults,
     account: &Account,
 ) -> Result<Vec<String>, Response> {
@@ -433,27 +434,48 @@ fn validate_sources(
                     &format!("source path is not a regular file: {source}"),
                 ));
             }
-            if destination_info.is_some_and(|dest| same_file(&info, dest)) {
+            if destination_info.is_some_and(|dest| {
+                identity(Path::new(&path), true).is_ok_and(|info| same_file(info, dest))
+            }) {
                 return Err(same_error());
             }
             Ok(path)
         })
         .collect()
 }
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
-    left.dev() == right.dev() && left.ino() == right.ino()
+/// Owns the temporary path and the output handle. The handle is always closed
+/// (or dropped) before the guard unlinks the file, which Windows requires.
+struct Temporary {
+    path: PathBuf,
+    output: Option<File>,
 }
-struct Temporary(PathBuf);
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        // Best-effort rollback, including after a successful rename removes this name.
-        let _ = fs::remove_file(&self.0);
+impl Temporary {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+    fn file(&mut self) -> &mut File {
+        self.output
+            .as_mut()
+            .expect("temporary output is open until closed")
+    }
+    fn close(&mut self) -> io::Result<()> {
+        match self.output.take() {
+            Some(file) => close_output(file),
+            None => Ok(()),
+        }
     }
 }
-fn temporary_file(destination: &str) -> Result<(File, Temporary), Response> {
-    let mut random = [0u8; 16];
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut random))
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        // Close before unlinking: Windows refuses to remove a file that is
+        // still open unless every handle allows delete sharing.
+        drop(self.output.take());
+        // Best-effort rollback, including after a successful rename removes this name.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+fn temporary_file(destination: &str) -> Result<Temporary, Response> {
+    let mut random = random_bytes()
         .map_err(|error| json_error(500, &format!("error creating destination file: {error}")))?;
     random[6] = (random[6] & 0x0f) | 0x40;
     random[8] = (random[8] & 0x3f) | 0x80;
@@ -472,19 +494,17 @@ fn temporary_file(destination: &str) -> Result<(File, Temporary), Response> {
         })
         .collect();
     let path = PathBuf::from(format!("{destination}.e2b-compose.{id}.tmp"));
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o666)
-        .open(&path)
-        .map_err(|error| {
-            storage_error(
-                "error creating destination file",
-                &format!("open {}: {}", path.display(), go_errno(&error)),
-                &error,
-            )
-        })?;
-    Ok((file, Temporary(path)))
+    let file = create_new_temp(&path).map_err(|error| {
+        storage_error(
+            "error creating destination file",
+            &format!("open {}: {}", path.display(), errno_text(&error)),
+            &error,
+        )
+    })?;
+    Ok(Temporary {
+        path,
+        output: Some(file),
+    })
 }
 fn copy_sources(sources: &[String], output: &mut File, temporary: &Path) -> Result<(), Response> {
     for source in sources {
@@ -493,171 +513,32 @@ fn copy_sources(sources: &[String], output: &mut File, temporary: &Path) -> Resu
                 500,
                 &format!(
                     "error opening source file {source}: open {source}: {}",
-                    go_errno(&error)
+                    errno_text(&error)
                 ),
             )
         })?;
         copy_file(&mut input, output, source, temporary).map_err(|(operation, error)| {
             storage_error(
                 &format!("error composing source {source}"),
-                &format!("{operation}: {}", go_errno(&error)),
+                &format!("{operation}: {}", errno_text(&error)),
                 &error,
             )
         })?;
     }
     Ok(())
 }
-fn copy_file(
-    input: &mut File,
-    output: &mut File,
-    source: &str,
-    temporary: &Path,
-) -> Result<(), (String, io::Error)> {
-    // Match os.File.ReadFrom: copy_file_range first, buffered fallback only for
-    // kernels/filesystems that do not support the accelerated operation.
-    loop {
-        // SAFETY: both live File objects own valid descriptors; null offsets use
-        // and advance those descriptors' current positions, as Go ReadFrom does.
-        let copied = unsafe {
-            nix::libc::copy_file_range(
-                input.as_raw_fd(),
-                std::ptr::null_mut(),
-                output.as_raw_fd(),
-                std::ptr::null_mut(),
-                1 << 30,
-                0,
-            )
-        };
-        if copied > 0 {
-            continue;
-        }
-        if copied == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(nix::libc::EINTR) => continue,
-            Some(
-                nix::libc::ENOSYS
-                | nix::libc::EXDEV
-                | nix::libc::EINVAL
-                | nix::libc::EIO
-                | nix::libc::EOPNOTSUPP
-                | nix::libc::EPERM,
-            ) => break,
-            _ => {
-                return Err((
-                    format!("write {}: copy_file_range", temporary.display()),
-                    error,
-                ))
-            }
-        }
-    }
-    let mut buffer = [0u8; 32 * 1024];
-    loop {
-        let count = input
-            .read(&mut buffer)
-            .map_err(|error| (format!("read {source}"), error))?;
-        if count == 0 {
-            return Ok(());
-        }
-        output
-            .write_all(&buffer[..count])
-            .map_err(|error| (format!("write {}", temporary.display()), error))?;
-    }
-}
-fn go_errno(error: &io::Error) -> String {
-    error.raw_os_error().map_or_else(
-        || error.to_string(),
-        |code| {
-            nix::errno::Errno::from_raw(code)
-                .desc()
-                .to_ascii_lowercase()
-        },
-    )
-}
-fn go_parent(destination: &str) -> PathBuf {
-    use std::path::Component;
-    let parent =
-        destination.rsplit_once('/').map_or(
-            ".",
-            |(parent, _)| if parent.is_empty() { "/" } else { parent },
-        );
-    let mut clean = PathBuf::new();
-    for component in Path::new(parent).components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => match clean.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    clean.pop();
-                }
-                Some(Component::RootDir) => {}
-                _ => clean.push(".."),
-            },
-            component => clean.push(component.as_os_str()),
-        }
-    }
-    if clean.as_os_str().is_empty() {
-        clean.push(".")
-    }
-    clean
-}
-fn ensure_dirs(path: &Path, account: &Account) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        match fs::metadata(&current) {
-            Ok(info) if info.is_dir() => {}
-            Ok(_) => return Err(format!("path is a file: {}", current.display())),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match fs::DirBuilder::new().mode(0o755).create(&current) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => {
-                        return Err(format!(
-                            "failed to create directory: mkdir {}: {}",
-                            current.display(),
-                            go_errno(&error)
-                        ))
-                    }
-                }
-                chown(
-                    &current,
-                    Some(Uid::from_raw(account.uid)),
-                    Some(Gid::from_raw(account.gid)),
-                )
-                .map_err(|error| {
-                    format!(
-                        "failed to chown directory: chown {}: {}",
-                        current.display(),
-                        error.desc().to_ascii_lowercase()
-                    )
-                })?;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "failed to stat directory: stat {}: {}",
-                    current.display(),
-                    go_errno(&error)
-                ))
-            }
-        }
-    }
-    Ok(())
-}
 fn storage_error(context: &str, detail: &str, error: &io::Error) -> Response {
-    if error.raw_os_error() == Some(nix::libc::ENOSPC) {
+    if is_no_space(error) {
         json_error(507, "not enough disk space available")
     } else {
         json_error(500, &format!("{context}: {detail}"))
     }
 }
 fn cleanup_sources(sources: &[String], destination: &str) {
-    let composed = fs::metadata(destination).ok();
+    let composed = identity(Path::new(destination), true).ok();
     for source in sources {
-        if let (Ok(info), Some(composed)) = (fs::symlink_metadata(source), composed.as_ref()) {
-            if same_file(&info, composed) {
+        if let (Ok(info), Some(composed)) = (identity(Path::new(source), false), composed) {
+            if same_file(info, composed) {
                 continue;
             }
         }

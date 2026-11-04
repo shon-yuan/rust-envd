@@ -2,16 +2,23 @@
 //! memory/collapse_linux.go at 51083a83cc0903185d992725ea6bb33683814b29.
 //! Best-effort: windows that cannot collapse are skipped, never errors.
 
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// The x86_64 transparent-hugepage size (oracle collapse_linux.go:19).
+#[cfg(target_os = "linux")]
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 /// Stable kernel ABI: MADV_HUGEPAGE = 14 (linux/mman.h), MADV_COLLAPSE = 25
 /// (uapi/asm-generic/mman-common.h, 5.14+). Defined here rather than read
 /// from libc so the musl and gnu targets take the same path.
+#[cfg(target_os = "linux")]
 const MADV_HUGEPAGE: nix::libc::c_int = 14;
+#[cfg(target_os = "linux")]
 const MADV_COLLAPSE: nix::libc::c_int = 25;
 
 /// Oracle CollapseStats (api.gen.go CollapseResult wire shape).
@@ -24,6 +31,14 @@ pub struct CollapseStats {
     pub skipped: i64,
 }
 
+/// One heap-compaction backend. Linux issues `MADV_COLLAPSE`; Windows trims
+/// the working set and compacts heaps, because there is no transparent
+/// hugepage API to migrate base pages with. The daemon runs it on the
+/// blocking pool and turns the returned stats into the six-field wire shape.
+pub trait Collapser: Send + Sync {
+    fn collapse_self(&self, cancelled: &Arc<AtomicBool>) -> io::Result<CollapseStats>;
+}
+
 /// Oracle collapse_linux.go:36-75 CollapseSelf: consolidate this process's
 /// anonymous heap into 2 MiB transparent hugepages. Raw madvise successes
 /// conflate real migrations with already-huge no-ops; the AnonHugePages delta
@@ -32,6 +47,7 @@ pub struct CollapseStats {
 /// error (:74) — the daemon passes a flag that the request teardown flips, so
 /// a disconnected client stops the madvise sweep exactly like Go's
 /// r.Context() (api/collapse.go:26).
+#[cfg(target_os = "linux")]
 pub fn collapse_self(cancelled: &AtomicBool) -> io::Result<CollapseStats> {
     let maps = fs::read_to_string("/proc/self/maps")?;
     let mut stats = CollapseStats::default();
@@ -67,6 +83,7 @@ pub fn collapse_self(cancelled: &AtomicBool) -> io::Result<CollapseStats> {
 /// Oracle collapse_linux.go:132-145 anonRWRegions: anonymous read-write
 /// mappings only — a pathname means file-backed or pseudo ([vdso] and
 /// friends), neither of which is an anon heap arena.
+#[cfg(target_os = "linux")]
 fn anon_rw_regions(maps: &str) -> Vec<(usize, usize)> {
     let mut regions = Vec::new();
     for line in maps.lines() {
@@ -103,6 +120,7 @@ fn anon_rw_regions(maps: &str) -> Vec<(usize, usize)> {
 /// MADV_HUGEPAGE eligibility hint, then MADV_COLLAPSE per fully-contained
 /// 2 MiB window — a whole-region call aborts on the first empty window, so
 /// each window is issued on its own and failures are skips, not errors.
+#[cfg(target_os = "linux")]
 fn collapse_range(start: usize, end: usize) -> CollapseStats {
     let mut stats = CollapseStats::default();
     // SAFETY: madvise over this process's own mapped range; hint failures
@@ -138,6 +156,7 @@ fn collapse_range(start: usize, end: usize) -> CollapseStats {
 /// An unmeasurable or backwards delta falls back to counting every success as
 /// a migration; the migrated count is clamped to the successes so background
 /// THP activity cannot inflate the attribution.
+#[cfg(target_os = "linux")]
 fn split_collapsed(successes: i64, before: Option<u64>, after: Option<u64>) -> (i64, i64) {
     let Some((before, after)) = before.zip(after) else {
         return (successes, 0);
@@ -154,6 +173,7 @@ fn split_collapsed(successes: i64, before: Option<u64>, after: Option<u64>) -> (
 /// Oracle collapse_linux.go:100-126 anonHugePagesBytes: AnonHugePages from
 /// /proc/self/smaps_rollup, in bytes; None when unreadable (the caller falls
 /// back instead of treating a missing read as zero hugepages).
+#[cfg(target_os = "linux")]
 fn anon_huge_pages_bytes() -> Option<u64> {
     let rollup = fs::read_to_string("/proc/self/smaps_rollup").ok()?;
     for line in rollup.lines() {
@@ -166,7 +186,7 @@ fn anon_huge_pages_bytes() -> Option<u64> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

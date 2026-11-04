@@ -6,7 +6,7 @@
 //! Go IsPrint tables in [`printable`], and passes printable non-ASCII through
 //! verbatim.
 
-#[path = "daemon/compose_quote.rs"]
+#[path = "compose_quote.rs"]
 mod printable;
 use printable::is_print;
 

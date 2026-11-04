@@ -6,15 +6,11 @@
 //! after the call, server streams log start before the handler and end after
 //! it, and the client stream logs start without a request payload. Payload
 //! fields are Go `encoding/json` shapes (daemon::process_payload).
-use super::{
-    process_payload as payload,
-    rpc_log::{event as interceptor_event, unary_event, StreamEndError},
-    Daemon,
-};
-use crate::{
-    process::{ProcessRuntime, RuntimeError, Subscription},
-    proto::process as pb,
-};
+use crate::process_api::{ProcessRpcState, ProcessRuntimeApi, ProcessSubscription};
+use crate::process_contract::RuntimeError;
+use crate::proto::process as pb;
+use crate::rpc::process_payload as payload;
+use crate::rpc::rpc_log::{event as interceptor_event, unary_event, StreamEndError};
 use connectrpc::{
     handler::{client_streaming_handler_fn, handler_fn, streaming_handler_fn},
     ConnectError, RequestContext, Response, Router, ServiceStream,
@@ -77,12 +73,12 @@ fn input_error(cause: RuntimeError, input: &pb::ProcessInput) -> ConnectError {
     mapped
 }
 
-async fn configured(
-    daemon: &Daemon,
-    runtime: &ProcessRuntime,
+async fn configured<S: ProcessRpcState>(
+    daemon: &Arc<S>,
+    runtime: &Arc<dyn ProcessRuntimeApi>,
     ctx: RequestContext,
-) -> Result<ProcessRuntime, ConnectError> {
-    let state = daemon.state.lock().await;
+) -> Result<Arc<dyn ProcessRuntimeApi>, ConnectError> {
+    let state = daemon.configuration().lock().await;
     let defaults = state.defaults.clone();
     let environment = state.environment.clone();
     drop(state);
@@ -108,7 +104,7 @@ fn keepalive_interval(ctx: &RequestContext) -> Duration {
 }
 
 fn events<T: Send + 'static>(
-    subscription: Subscription,
+    subscription: Box<dyn ProcessSubscription>,
     interval: Duration,
     wrap: fn(pb::ProcessEvent) -> T,
 ) -> impl futures_util::Stream<Item = Result<T, ConnectError>> + Send {
@@ -238,7 +234,10 @@ impl<T> Drop for LoggedStream<T> {
     }
 }
 
-pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
+pub fn router<S: ProcessRpcState + 'static>(
+    daemon: Arc<S>,
+    runtime: Arc<dyn ProcessRuntimeApi>,
+) -> Router {
     let router = Router::new();
     let listed = runtime.clone();
     let list_daemon = daemon.clone();
@@ -249,7 +248,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
             let daemon = list_daemon.clone();
             let runtime = listed.clone();
             async move {
-                let logger = daemon.process_logger.clone();
+                let logger = daemon.process_logger().clone();
                 let operation_id = crate::logs::assign_operation_id();
                 let procedure = "/process.Process/List";
                 let processes = runtime.list().await;
@@ -282,7 +281,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
             let daemon = start_daemon.clone();
             let runtime = started.clone();
             async move {
-                let logger = daemon.process_logger.clone();
+                let logger = daemon.process_logger().clone();
                 // Go's per-request operation ID reaches the interceptor lines
                 // (start.go:20) and the handler's own process_start/process_end
                 // lines (start.go:25-27).
@@ -306,7 +305,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
                 let started = async {
                     let runtime = configured(&daemon, &runtime, ctx).await?;
                     runtime
-                        .start_with_operation_id(request, timeout, Some(operation_id.clone()))
+                        .start(request, timeout, Some(operation_id.clone()))
                         .await
                         .map_err(error)
                 }
@@ -350,7 +349,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
             let daemon = connect_daemon.clone();
             let runtime = connected.clone();
             async move {
-                let logger = daemon.process_logger.clone();
+                let logger = daemon.process_logger().clone();
                 let operation_id = crate::logs::assign_operation_id();
                 let procedure = "/process.Process/Connect";
                 log_server_stream_start(
@@ -403,7 +402,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
             let daemon = input_daemon.clone();
             let runtime = fed.clone();
             async move {
-                let logger = daemon.process_logger.clone();
+                let logger = daemon.process_logger().clone();
                 let operation_id = crate::logs::assign_operation_id();
                 let procedure = "/process.Process/SendInput";
                 let request_value = payload::send_input_request(&request);
@@ -433,7 +432,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
             let daemon = close_daemon.clone();
             let runtime = closed.clone();
             async move {
-                let logger = daemon.process_logger.clone();
+                let logger = daemon.process_logger().clone();
                 let operation_id = crate::logs::assign_operation_id();
                 let procedure = "/process.Process/CloseStdin";
                 let request_value = payload::close_stdin_request(&request.process);
@@ -480,7 +479,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
             let daemon = signal_daemon.clone();
             let runtime = signalled.clone();
             async move {
-                let logger = daemon.process_logger.clone();
+                let logger = daemon.process_logger().clone();
                 let operation_id = crate::logs::assign_operation_id();
                 let procedure = "/process.Process/SendSignal";
                 let request_value =
@@ -511,7 +510,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
             let daemon = update_daemon.clone();
             let runtime = updated.clone();
             async move {
-                let logger = daemon.process_logger.clone();
+                let logger = daemon.process_logger().clone();
                 let operation_id = crate::logs::assign_operation_id();
                 let procedure = "/process.Process/Update";
                 let request_value = payload::update_request(&request);
@@ -547,7 +546,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
                 let daemon = stream_daemon.clone();
                 let runtime = streamed.clone();
                 async move {
-                    let logger = daemon.process_logger.clone();
+                    let logger = daemon.process_logger().clone();
                     let operation_id = crate::logs::assign_operation_id();
                     let procedure = "/process.Process/StreamInput";
                     // interceptor.go:132-138: the client-stream start line
@@ -617,7 +616,7 @@ pub(super) fn router(daemon: Arc<Daemon>, runtime: ProcessRuntime) -> Router {
 #[cfg(test)]
 mod error_mapping {
     use super::{error, ConnectError};
-    use crate::process::RuntimeError;
+    use crate::process_contract::RuntimeError;
     use connectrpc::ErrorCode;
 
     /// start_error.go:32-34 via start.go:184: an armed request deadline that

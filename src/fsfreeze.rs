@@ -4,19 +4,25 @@
 //! /fsthaw through the [`FsFreezer`] seam so tests script the outcome instead
 //! of freezing a real host mount.
 
-use std::fs::File;
 use std::io;
+
+#[cfg(target_os = "linux")]
+use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
 /// The guest root filesystem — the only persisted filesystem in a
 /// filesystem-only snapshot (oracle fsfreeze.go rootfsMountpoint).
+#[cfg(target_os = "linux")]
 pub const ROOTFS_MOUNTPOINT: &str = "/";
 
 /// FIFREEZE / FITHAW ioctl request codes — _IOWR('X', 119/120, int). Not
 /// exported by libc; stable on the architectures envd runs on (x86_64, arm64),
 /// which use the generic ioctl encoding. Both ioctls ignore their argument
 /// (oracle fsfreeze_linux.go:17-24).
+#[cfg(target_os = "linux")]
 const FIFREEZE: nix::libc::c_ulong = 0xC0045877;
+#[cfg(target_os = "linux")]
 const FITHAW: nix::libc::c_ulong = 0xC0045878;
 
 /// The failure text carries the operation and mountpoint exactly as Go's
@@ -30,10 +36,12 @@ pub trait FsFreezer: Send + Sync {
 /// Go syscall errno text ("operation not supported"): the shared Go-string
 /// translation — nix's desc table diverges from Go for 23 values, and this
 /// handler's ramfs refusal is one of them.
+#[cfg(target_os = "linux")]
 fn go_errno_text(error: &io::Error) -> String {
     crate::errno_text::go_text(error)
 }
 
+#[cfg(target_os = "linux")]
 fn ioctl_mount(
     mountpoint: &str,
     request: nix::libc::c_ulong,
@@ -70,6 +78,7 @@ fn ioctl_mount(
 /// (fsfreeze_linux.go:36-43, :56-63). Each operation passes its own errno as
 /// `success_errno`; the wrong-pair errno is a real refusal the handler turns
 /// into a 500, wrapped like Go's fmt.Errorf("%s %s: %w").
+#[cfg(target_os = "linux")]
 fn settle_ioctl(
     op: &str,
     mountpoint: &str,
@@ -86,8 +95,10 @@ fn settle_ioctl(
 }
 
 /// The FIFREEZE/FITHAW-backed freezer used in the guest.
+#[cfg(target_os = "linux")]
 pub struct LinuxFsFreezer;
 
+#[cfg(target_os = "linux")]
 impl FsFreezer for LinuxFsFreezer {
     fn freeze(&self, mountpoint: &str) -> io::Result<()> {
         ioctl_mount(mountpoint, FIFREEZE, "FIFREEZE", nix::libc::EBUSY)
@@ -98,7 +109,7 @@ impl FsFreezer for LinuxFsFreezer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

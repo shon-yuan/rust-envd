@@ -24,8 +24,9 @@
 //! gating, argv/env of the exec, the failure thaw) is carried 1:1.
 
 use std::io::Write as _;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use buffa::Message as _;
@@ -56,6 +57,44 @@ pub const HANDOVER_SCHEMA: u32 = HANDOVER_SCHEMA_DEFAULTS;
 /// The append-only argv tail the outgoing envd re-execs with
 /// (upgrade.go:286-288: original flags kept, `--resume-handover` appended).
 pub const RESUME_HANDOVER_FLAG: &str = "--resume-handover";
+
+/// The blob path this process uses. Linux keeps the oracle's tmpfs location;
+/// Windows has no `/run`, so the handover lives under `%ProgramData%\e2b\`.
+/// Resolved at call time (not a constant) so tests can redirect `ProgramData`
+/// to a temporary directory.
+pub fn handover_path() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from(HANDOVER_PATH)
+    }
+    #[cfg(windows)]
+    {
+        program_data_dir().join("e2b").join("envd-handover.pb")
+    }
+}
+
+/// The staged replacement binary this process upgrades from. The Linux oracle
+/// path is fixed by `DEFAULT_UPGRADE_BIN_PATH`; Windows stages next to the
+/// handover under `%ProgramData%\e2b\envd.next.exe`.
+pub fn upgrade_bin_path() -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from(DEFAULT_UPGRADE_BIN_PATH)
+    }
+    #[cfg(windows)]
+    {
+        program_data_dir().join("e2b").join("envd.next.exe")
+    }
+}
+
+/// `%ProgramData%`, falling back to the conventional `C:\ProgramData` when
+/// the variable is absent (it is defined for services and interactive users).
+#[cfg(windows)]
+fn program_data_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+}
 
 /// Oracle upgrade.go:572-574 (`ErrWorkloadNotFrozen`).
 #[derive(Debug, thiserror::Error)]
@@ -170,19 +209,21 @@ pub fn write_handover(path: &Path, state: &wire::HandoverState) -> Result<u32, U
     // write — which the handler's "write handover: %w" wraps into the 500
     // body (upgrade.go:270-276).
     let path_error = |op: &str, error: std::io::Error| {
-        UpgradeError::Write(crate::process::path_text_error(
+        UpgradeError::Write(crate::platform::path_error_text(
             op,
             &path.to_string_lossy(),
             error,
         ))
     };
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(target_os = "linux")]
+    {
         // os.WriteFile's perm applies on create only; an existing blob keeps
         // its mode (upgrade.go:274).
-        .mode(0o600)
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(path)
         .map_err(|error| path_error("open", error))?;
     file.write_all(&blob)
@@ -199,7 +240,7 @@ pub fn read_handover(path: &Path) -> Result<Option<wire::HandoverState>, Upgrade
     // *fs.PathError under "read handover: %w" (upgrade.go:341-361). A missing
     // blob stays the no-op resume.
     let path_error = |error: std::io::Error| {
-        UpgradeError::Read(crate::process::path_text_error(
+        UpgradeError::Read(crate::platform::path_error_text(
             "open",
             &path.to_string_lossy(),
             error,
@@ -226,10 +267,10 @@ pub fn decode_handover(blob: &[u8]) -> Result<wire::HandoverState, UpgradeError>
     wire::HandoverState::decode_from_slice(blob).map_err(UpgradeError::Unmarshal)
 }
 
-/// One restored terminal event. Defined in `crate::process` (which owns the
-/// retention cache) and re-exported here so the handover surface is complete;
-/// the wire conversions live with it.
-pub use crate::process::RetainedExit;
+/// One restored terminal event. Defined in `crate::process_contract` (which
+/// owns the retention cache) and re-exported here so the handover surface is
+/// complete; the wire conversions live with it.
+pub use crate::process_contract::RetainedExit;
 
 /// Oracle store.go:119-133 (`handoverResult`) — the /init `X-Envd-Handover`
 /// JSON header payload. Field names are Go's json tags (snake_case on the
@@ -306,9 +347,13 @@ mod tests {
         let read = read_handover(&path).unwrap().unwrap();
         assert_eq!(read.schema, HANDOVER_SCHEMA_GUEST_FROZEN);
         // The written file carries owner-only permissions (upgrade.go:274).
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        // Windows inherits the ACL of the handover directory instead.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     /// Oracle os.WriteFile renders its failure as the *fs.PathError Display —
@@ -325,9 +370,17 @@ mod tests {
         let path = blocker.join("envd-handover.pb");
         let error = write_handover(&path, &wire::HandoverState::default()).unwrap_err();
         assert!(matches!(error, UpgradeError::Write(_)), "{error:?}");
+        // POSIX reports ENOTDIR. Win32 collapses "a path component is a
+        // regular file" into ERROR_PATH_NOT_FOUND, so the Windows arm carries
+        // that code's stable text instead of "not a directory".
+        let refusal = if cfg!(windows) {
+            "no such file or directory"
+        } else {
+            "not a directory"
+        };
         assert_eq!(
             error.to_string(),
-            format!("write handover: open {}: not a directory", path.display())
+            format!("write handover: open {}: {refusal}", path.display())
         );
     }
 }

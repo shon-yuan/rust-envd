@@ -32,35 +32,9 @@ pub const AF_INET6: u32 = nix::libc::AF_INET6 as u32;
 /// `syscall.SOCK_STREAM` — the only socket type the "tcp" kind scans.
 const SOCK_STREAM: u32 = nix::libc::SOCK_STREAM as u32;
 
-/// gopsutil `net.Addr` (the fields the port package and the dedup key use).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Addr {
-    pub ip: String,
-    pub port: u32,
-}
-
-/// gopsutil `net.ConnectionStat`, reduced to the fields `net.Connections`
-/// populates that the oracle port package reads (`Family`, `Laddr`, `Status`,
-/// `Pid`; forward.go:159-191) plus the dedup-key inputs. `Uids` is dropped:
-/// gopsutil fetches and then drops every read error (`conn.Uids, _ =`) and no
-/// port-package code reads it (net_linux.go:467-470).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConnectionStat {
-    pub fd: u32,
-    pub family: u32,
-    pub sock_type: u32,
-    pub laddr: Addr,
-    pub raddr: Addr,
-    pub status: String,
-    pub pid: i32,
-}
-
-/// The scan the scanner broadcasts. The production source reads `/proc`; tests
-/// inject a synthetic proc tree or a fully scripted source.
-pub trait ScanSource: Send + Sync {
-    /// gopsutil `net.Connections("tcp")`: both address families or an error.
-    fn connections(&self) -> io::Result<Vec<ConnectionStat>>;
-}
+// The contract types are shared with the Windows backend; this module keeps
+// the Linux-specific constants and the `/proc` reader.
+pub use crate::platform::port::{Addr, ConnectionStat, ScanSource};
 
 /// Reads `$root/net/tcp` and `$root/net/tcp6` the way gopsutil does with
 /// `HOST_PROC` set to `root`.

@@ -7,8 +7,8 @@
 //! `metadata` is an empty map (the documented "otherwise empty" case), never
 //! an error.
 //!
-//! Watchers still return [`std::io::ErrorKind::Unsupported`]; they land with
-//! the `ReadDirectoryChangesW` slice.
+//! The Connect watcher surface lives in `watchers.rs` over
+//! `ReadDirectoryChangesW`.
 
 use std::ffi::c_void;
 use std::fs::{self, Metadata};
@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use buffa_types::google::protobuf::Timestamp;
-use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_SUCCESS, HLOCAL, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
@@ -27,12 +29,18 @@ use windows_sys::Win32::Security::{
     LookupAccountSidW, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
     PSECURITY_DESCRIPTOR, PSID, SID_NAME_USE,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, SetFileAttributesW,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+use windows_sys::Win32::System::SystemServices::{
+    IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK,
+};
 
-use crate::platform::{FsBackend, WatchId, WatcherBackend};
-use crate::proto::filesystem::{EntryInfo, FileType, FilesystemEvent};
-
-/// `FILE_ATTRIBUTE_READONLY` from `winnt.h`.
-const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+use crate::platform::FsBackend;
+use crate::proto::filesystem::{EntryInfo, FileType};
 
 /// Fallback account name when the security descriptor cannot be read.
 const UNKNOWN_ACCOUNT: &str = "None";
@@ -66,12 +74,7 @@ impl FsBackend for WindowsFsBackend {
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
-        let result = match fs::symlink_metadata(path) {
-            Ok(info) if info.is_dir() => fs::remove_dir_all(path),
-            Ok(_) => fs::remove_file(path),
-            Err(err) => Err(err),
-        };
-        match result {
+        match remove_entry(path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
@@ -83,35 +86,132 @@ impl FsBackend for WindowsFsBackend {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct WindowsWatcherBackend;
-
-impl WatcherBackend for WindowsWatcherBackend {
-    fn watch(&self, _path: &Path) -> io::Result<WatchId> {
-        Err(super::unsupported("filesystem watcher"))
+/// True only for a reparse point that names another entry: an NTFS symlink or
+/// a directory junction/mount point. `FILE_ATTRIBUTE_REPARSE_POINT` alone is
+/// not enough — cloud placeholders, deduplication and AppExecLink entries also
+/// carry it — so the tag decides. If the tag cannot be read the entry is
+/// treated as a link, which is the safe answer for removal and traversal.
+/// `symlink_metadata` never follows a reparse point, so the lookups below
+/// inspect the link itself.
+pub(crate) fn is_link(path: &Path, info: &Metadata) -> bool {
+    if info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return false;
     }
-
-    fn unwatch(&self, _id: WatchId) -> io::Result<()> {
-        Err(super::unsupported("filesystem watcher removal"))
-    }
-
-    fn events(&self, _id: WatchId) -> io::Result<Vec<FilesystemEvent>> {
-        Err(super::unsupported("filesystem watcher events"))
+    match reparse_tag(path) {
+        Some(tag) => tag == IO_REPARSE_TAG_SYMLINK || tag == IO_REPARSE_TAG_MOUNT_POINT,
+        None => true,
     }
 }
 
-fn entry_info(path: &Path) -> io::Result<EntryInfo> {
+/// Reads the reparse tag without following the entry. `None` means the tag
+/// could not be queried (for example the entry vanished or access was denied).
+fn reparse_tag(path: &Path) -> Option<u32> {
+    let wide = wide_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    unsafe {
+        CloseHandle(handle);
+    }
+    (ok != 0).then_some(info.ReparseTag)
+}
+
+/// True when the *link itself* names a directory, without consulting
+/// `FileType::is_dir` (which excludes symlinks on Windows).
+fn is_directory(info: &Metadata) -> bool {
+    info.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
+}
+
+/// Deletes an entry without following a symlink or junction. The recursion is
+/// explicit and depth-first: every child is inspected with `symlink_metadata`,
+/// a directory reparse point is unlinked with `RemoveDirectory` (which deletes
+/// only the link, never the target's contents), and the walk never descends
+/// into a reparse point. Read-only regular files have
+/// `FILE_ATTRIBUTE_READONLY` cleared before `DeleteFile` so a read-only
+/// attribute cannot mask the real outcome. `fs::remove_dir_all` is not used:
+/// its reparse-point handling is what this module must not depend on.
+pub(crate) fn remove_entry(path: &Path) -> io::Result<()> {
+    let info = fs::symlink_metadata(path)?;
+    remove_entry_with_metadata(path, &info)
+}
+
+fn remove_entry_with_metadata(path: &Path, info: &Metadata) -> io::Result<()> {
+    if is_link(path, info) {
+        return if is_directory(info) {
+            fs::remove_dir(path)
+        } else {
+            fs::remove_file(path)
+        };
+    }
+    if is_directory(info) {
+        for child in fs::read_dir(path)? {
+            let child = child?;
+            let child_path = child.path();
+            let child_info = fs::symlink_metadata(&child_path)?;
+            remove_entry_with_metadata(&child_path, &child_info)?;
+        }
+        fs::remove_dir(path)
+    } else {
+        clear_read_only_attribute(path, info)?;
+        fs::remove_file(path)
+    }
+}
+
+/// Clears `FILE_ATTRIBUTE_READONLY` on a regular file before deleting it.
+/// Removal still reports the real Win32 outcome if the attribute cannot be
+/// changed.
+fn clear_read_only_attribute(path: &Path, info: &Metadata) -> io::Result<()> {
+    let attributes = info.file_attributes();
+    if attributes & FILE_ATTRIBUTE_READONLY == 0 {
+        return Ok(());
+    }
+    let wide = wide_path(path);
+    let ok = unsafe { SetFileAttributesW(wide.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn entry_info(path: &Path) -> io::Result<EntryInfo> {
     let raw = fs::symlink_metadata(path)?;
-    let is_symlink = raw.file_type().is_symlink();
-    // Follow the link for the effective type, as the Linux entry helper does;
-    // a dangling link keeps the raw metadata and reports Symlink.
+    let is_symlink = is_link(path, &raw);
+    // Follow the link for the effective type, as the Linux entry helper does.
+    // A dangling link has no effective metadata at all: Linux reports
+    // `FILE_TYPE_UNSPECIFIED`/mode 0, never the link's own metadata.
     let target = if is_symlink {
         fs::metadata(path).ok()
     } else {
         None
     };
-    let effective = target.as_ref().unwrap_or(&raw);
-    let mode = synthesized_mode(&raw, effective);
+    let effective = if is_symlink {
+        target.as_ref()
+    } else {
+        Some(&raw)
+    };
+    let full_mode = synthesized_mode(path, &raw, effective);
+    let mode = if effective.is_some() { full_mode } else { 0 };
     let (owner, group) = owner_and_group(path);
     Ok(EntryInfo {
         name: path
@@ -119,10 +219,13 @@ fn entry_info(path: &Path) -> io::Result<EntryInfo> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string()),
         path: path.to_string_lossy().into_owned(),
-        r#type: file_type(effective).into(),
-        size: raw.file_size() as i64,
+        r#type: effective
+            .map(file_type)
+            .unwrap_or(FileType::Unspecified)
+            .into(),
+        size: entry_size(path, &raw, is_symlink),
         mode,
-        permissions: permissions(mode, &raw),
+        permissions: permissions(path, full_mode, &raw),
         owner,
         group,
         modified_time: modified_time(&raw).into(),
@@ -131,6 +234,21 @@ fn entry_info(path: &Path) -> io::Result<EntryInfo> {
         is_symlink,
         ..Default::default()
     })
+}
+
+/// Linux `lstat` reports a symlink's own size as the number of bytes in its
+/// stored target path, not the target's size and never zero merely because the
+/// entry is a link. Win32 reports a logical size of 0 for the link itself, so
+/// use the UTF-16 byte length of the reparse target that `read_link` returns
+/// (the closest analogue of the stored path); fall back to the file size if
+/// the target cannot be read.
+fn entry_size(path: &Path, raw: &Metadata, is_symlink: bool) -> i64 {
+    if is_symlink {
+        if let Ok(target) = fs::read_link(path) {
+            return (target.as_os_str().encode_wide().count() * 2) as i64;
+        }
+    }
+    raw.file_size() as i64
 }
 
 fn file_type(info: &Metadata) -> FileType {
@@ -147,14 +265,16 @@ fn file_type(info: &Metadata) -> FileType {
 }
 
 /// Windows has no POSIX mode: synthesize one from the read-only attribute and
-/// the entry kind, as documented. Symlinks report `0777`, matching a Linux
-/// symlink's own mode, and the value is never zero.
-fn synthesized_mode(raw: &Metadata, effective: &Metadata) -> u32 {
-    if raw.file_type().is_symlink() {
+/// the entry kind, as documented. Links report `0777` for `permissions`,
+/// matching a Linux symlink's own mode. Passing `None` for `effective` (a
+/// dangling link) makes the caller report mode `0`.
+fn synthesized_mode(path: &Path, raw: &Metadata, effective: Option<&Metadata>) -> u32 {
+    if is_link(path, raw) {
         return 0o777;
     }
     let read_only = raw.file_attributes() & FILE_ATTRIBUTE_READONLY != 0;
-    match (effective.is_dir(), read_only) {
+    let directory = effective.map_or_else(|| is_directory(raw), is_directory);
+    match (directory, read_only) {
         (true, true) => 0o555,
         (true, false) => 0o755,
         (false, true) => 0o444,
@@ -164,13 +284,14 @@ fn synthesized_mode(raw: &Metadata, effective: &Metadata) -> u32 {
 
 /// Renders the synthesized mode in Go `FileMode.String` form, the same shape
 /// the Linux entry helper produces (`-rw-r--r--`, `drwxr-xr-x`, `Lrwxrwxrwx`).
-fn permissions(mode: u32, info: &Metadata) -> String {
+fn permissions(path: &Path, mode: u32, info: &Metadata) -> String {
     let kind = info.file_type();
+    let link = is_link(path, info);
     let mut result = String::new();
-    if kind.is_dir() {
+    if kind.is_dir() && !link {
         result.push('d');
     }
-    if kind.is_symlink() {
+    if link {
         result.push('L');
     }
     if result.is_empty() {
@@ -363,8 +484,83 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            // Use the module's depth-first delete so a test that leaves a
+            // junction or a read-only file behind still cleans up safely.
+            let _ = remove_entry(&self.0);
         }
+    }
+
+    /// Creates a directory junction with `mklink /J`, the only link kind an
+    /// ordinary Windows account can create without Developer Mode. Returns
+    /// false when the runner refuses, so link tests skip cleanly.
+    fn junction(link: &Path, target: &Path) -> bool {
+        let command = format!(r#"mklink /J "{}" "{}""#, link.display(), target.display());
+        std::process::Command::new("cmd")
+            .args(["/C", &command])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn reparse_point_directory_is_classified_as_a_link() {
+        let scratch = Scratch::new("junction-predicate");
+        let target = scratch.join("target");
+        fs::create_dir(&target).expect("target");
+        let link = scratch.join("link");
+        if !junction(&link, &target) {
+            return;
+        }
+        let info = fs::symlink_metadata(&link).expect("link metadata");
+        assert!(is_link(&link, &info));
+        remove_entry(&link).expect("unlink junction");
+    }
+
+    #[test]
+    fn removing_a_tree_does_not_follow_a_junction() {
+        let scratch = Scratch::new("tree-junction");
+        let target = scratch.join("target");
+        fs::create_dir(&target).expect("target");
+        fs::write(target.join("sentinel"), b"keep").expect("sentinel");
+        let tree = scratch.join("tree");
+        fs::create_dir(&tree).expect("tree");
+        let link = tree.join("junction");
+        if !junction(&link, &target) {
+            return;
+        }
+
+        remove_entry(&tree).expect("remove tree");
+
+        assert!(!tree.exists());
+        assert!(
+            target.join("sentinel").exists(),
+            "the junction target must not be deleted by the containing tree"
+        );
+    }
+
+    #[test]
+    fn dangling_directory_link_reports_unspecified_type_and_zero_mode() {
+        let scratch = Scratch::new("dangling");
+        let target = scratch.join("gone-target");
+        fs::create_dir(&target).expect("target");
+        let link = scratch.join("link");
+        if !junction(&link, &target) {
+            return;
+        }
+        // Deleting the target leaves a dangling directory reparse point.
+        fs::remove_dir(&target).expect("remove target");
+
+        let info = WindowsFsBackend.stat(&link).expect("stat");
+        assert!(info.is_symlink);
+        assert_eq!(info.r#type, FileType::Unspecified);
+        assert_eq!(info.mode, 0);
+        // Linux keeps the link's own `Lrwxrwxrwx` permissions string.
+        assert_eq!(info.permissions, "Lrwxrwxrwx");
+        assert!(info.symlink_target.is_some());
+        // Linux lstat reports the stored target length, never 0.
+        assert!(info.size > 0, "dangling link size must not be 0");
+
+        remove_entry(&link).expect("unlink dangling junction");
     }
 
     #[test]
@@ -398,6 +594,25 @@ mod tests {
         let info = WindowsFsBackend.stat(&path).expect("stat");
         assert_eq!(info.mode, 0o444);
         assert_eq!(info.permissions, "-r--r--r--");
+
+        // Scratch::drop cannot remove a read-only file, so clear the attribute
+        // before the guard drops.
+        let info = fs::metadata(&path).expect("metadata");
+        clear_read_only_attribute(&path, &info).expect("clear readonly");
+    }
+
+    #[test]
+    fn read_dir_orders_non_ascii_names_by_wtf8_bytes() {
+        let scratch = Scratch::new("unicode-order");
+        // U+E000 encodes as EE 80 80 and U+10000 as F0 90 80 80 in WTF-8, so
+        // the private-use character sorts first. UTF-16 code-unit order would
+        // put the surrogate pair first.
+        fs::write(scratch.join("\u{e000}.txt"), b"a").expect("write");
+        fs::write(scratch.join("\u{10000}.txt"), b"b").expect("write");
+
+        let entries = WindowsFsBackend.read_dir(&scratch.0).expect("read_dir");
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["\u{e000}.txt", "\u{10000}.txt"]);
     }
 
     #[test]

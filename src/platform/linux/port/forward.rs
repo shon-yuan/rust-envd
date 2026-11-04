@@ -30,61 +30,12 @@ use super::{
     scan::Scanner,
     scan_subscriber::{ScannerFilter, ScannerSubscriber},
 };
+pub use crate::platform::port::ForwardedPort;
 use crate::{
     cgroups::{freeze::WorkloadFreezer, place_into_cgroup, ProcessType},
     logs::Logger,
+    platform::port::{PortState, DEFAULT_GATEWAY_IP},
 };
-
-/// Oracle forward.go:31 — the guest gateway IP the socats bind.
-pub const DEFAULT_GATEWAY_IP: [u8; 4] = [169, 254, 0, 21];
-
-/// Oracle forward.go:24-29.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PortState {
-    Forward,
-    Delete,
-}
-
-/// One active port-forward carried across a live-upgrade
-/// (handover.proto ForwardedPort fields 1-5). The wire encoding is the
-/// generated `proto::upgrade::ForwardedPort` — byte-identical to Go's
-/// proto.Marshal by construction; `to_wire`/`from_wire` are the conversions
-/// the upgrade blob travels through.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ForwardedPort {
-    /// The forwarder map key: "<listener_pid>-<port>" (forward.go:160).
-    pub key: String,
-    pub port: u32,
-    /// pid of the guest process listening on the port.
-    pub listener_pid: i32,
-    /// IP version (4 or 6).
-    pub family: u32,
-    /// pid of the running socat child to re-adopt.
-    pub socat_pid: i32,
-}
-
-impl ForwardedPort {
-    pub fn to_wire(&self) -> crate::proto::upgrade::ForwardedPort {
-        crate::proto::upgrade::ForwardedPort {
-            key: self.key.clone(),
-            port: self.port,
-            listener_pid: self.listener_pid,
-            family: self.family,
-            socat_pid: self.socat_pid,
-            ..Default::default()
-        }
-    }
-
-    pub fn from_wire(port: &crate::proto::upgrade::ForwardedPort) -> Self {
-        Self {
-            key: port.key.clone(),
-            port: port.port,
-            listener_pid: port.listener_pid,
-            family: port.family,
-            socat_pid: port.socat_pid,
-        }
-    }
-}
 
 /// A socat this envd spawned itself: Go keeps the `*exec.Cmd`
 /// (forward.go:34); only its pid is read afterwards (socatPID).

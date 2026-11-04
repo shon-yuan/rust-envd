@@ -5,7 +5,7 @@
 
 use super::{gojson, Logger};
 use crate::{
-    process::{ProcessEnd, ProcessLogSink, ProcessStart},
+    process_contract::{ProcessEnd, ProcessLogSink, ProcessStart},
     proto::process as pb,
 };
 

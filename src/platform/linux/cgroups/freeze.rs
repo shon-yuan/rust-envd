@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::sleep;
 
@@ -20,140 +19,10 @@ use super::hierarchy::{
 use super::spawn::{SpawnBarrier, SpawnError};
 use super::{Manager, PathManager, ProcessType, DEFAULT_THAW_MAX_CGROUPS, WORKLOAD_PROCESS_TYPES};
 
-/// Oracle freeze.go:23-31.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub enum FreezeMode {
-    #[default]
-    #[serde(rename = "legacy")]
-    Legacy,
-    #[serde(rename = "hierarchy")]
-    Hierarchy,
-}
-
-impl FreezeMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FreezeMode::Legacy => "legacy",
-            FreezeMode::Hierarchy => "hierarchy",
-        }
-    }
-}
-
-/// Oracle freeze.go:99-110.
-#[derive(Debug, Clone)]
-pub struct FreezeOptions {
-    /// Bounds the wait for the written cgroups to read back frozen; zero
-    /// observes nothing (oracle awaitFrozen: `budget <= 0` returns at once).
-    pub max_wait: Duration,
-    pub mode: FreezeMode,
-    /// Bounds a hierarchy sweep; zero or negative means
-    /// DEFAULT_FREEZE_MAX_CGROUPS — a caller cannot accidentally disable the
-    /// guard (freeze.go:118-121) — and any positive value is clamped at
-    /// DEFAULT_THAW_MAX_CGROUPS (freeze.go:123-129, the drift guard).
-    pub max_cgroups: i64,
-}
-
-impl Default for FreezeOptions {
-    fn default() -> Self {
-        Self {
-            max_wait: Duration::ZERO,
-            mode: FreezeMode::Legacy,
-            max_cgroups: 0,
-        }
-    }
-}
-
-impl FreezeOptions {
-    /// Oracle freeze.go:112-117: anything but hierarchy is legacy, so a
-    /// caller that has not been taught about modes keeps today's behaviour.
-    pub fn effective_mode(&self) -> FreezeMode {
-        match self.mode {
-            FreezeMode::Hierarchy => FreezeMode::Hierarchy,
-            FreezeMode::Legacy => FreezeMode::Legacy,
-        }
-    }
-    /// Oracle freeze.go:118-130.
-    pub fn effective_max_cgroups(&self) -> usize {
-        if self.max_cgroups <= 0 {
-            super::DEFAULT_FREEZE_MAX_CGROUPS
-        } else {
-            (self.max_cgroups as usize).min(super::DEFAULT_THAW_MAX_CGROUPS)
-        }
-    }
-}
-
-/// Oracle freeze.go:436-545. Frozen+NotFrozen+Unobservable accounts for every
-/// cgroup whose state we read; Failed and Vanished span both the sweep and the
-/// poll and deliberately do not reconcile against Requested (freeze.go:439-456).
-#[derive(Debug, Default, Clone)]
-pub struct FreezeResult {
-    pub requested: i64,
-    pub frozen: i64,
-    pub not_frozen: i64,
-    pub scan_failed: i64,
-    pub pre_frozen: i64,
-    pub failed: i64,
-    pub vanished: i64,
-    pub vanished_paths: Vec<String>,
-    pub unobservable: i64,
-    pub sweep_duration: Duration,
-    pub mode: FreezeMode,
-    pub visited: i64,
-    pub allowlisted: i64,
-    pub truncated: bool,
-    pub wait_duration: Duration,
-}
-
-impl FreezeResult {
-    /// Oracle freeze.go:547-550. Unobservable is not counted against it: a
-    /// guest with no manager never had this guarantee.
-    pub fn all_frozen(&self) -> bool {
-        self.not_frozen == 0 && self.failed == 0
-    }
-}
-
-/// The wire form the /freeze handler answers with; oracle api.gen.go:150-204,
-/// every field filled by init.go:627-643, so nothing is omitted.
-#[derive(Debug, Serialize)]
-pub struct FreezeResultWire {
-    pub allowlisted: i64,
-    pub failed: i64,
-    pub frozen: i64,
-    pub mode: FreezeMode,
-    #[serde(rename = "notFrozen")]
-    pub not_frozen: i64,
-    #[serde(rename = "preFrozen")]
-    pub pre_frozen: i64,
-    pub requested: i64,
-    #[serde(rename = "sweepMs")]
-    pub sweep_ms: i64,
-    pub truncated: bool,
-    pub unobservable: i64,
-    pub vanished: i64,
-    pub visited: i64,
-    #[serde(rename = "waitMs")]
-    pub wait_ms: i64,
-}
-
-impl FreezeResult {
-    pub fn wire(&self) -> FreezeResultWire {
-        FreezeResultWire {
-            allowlisted: self.allowlisted,
-            failed: self.failed,
-            frozen: self.frozen,
-            mode: self.mode,
-            not_frozen: self.not_frozen,
-            pre_frozen: self.pre_frozen,
-            requested: self.requested,
-            sweep_ms: self.sweep_duration.as_millis() as i64,
-            truncated: self.truncated,
-            unobservable: self.unobservable,
-            vanished: self.vanished,
-            visited: self.visited,
-            wait_ms: self.wait_duration.as_millis() as i64,
-        }
-    }
-}
+/// The wire types and the Go-compatible query binder are platform-neutral;
+/// re-exported here so every historical `crate::cgroups::freeze::*` path keeps
+/// working unchanged.
+pub use crate::freeze_wire::{FreezeMode, FreezeOptions, FreezeResult, FreezeResultWire};
 
 /// Oracle freeze.go:1187-1206.
 #[derive(Debug, Default, Clone)]

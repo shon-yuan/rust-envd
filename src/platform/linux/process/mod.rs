@@ -14,42 +14,9 @@
 use crate::exec_context::{Account, Defaults, Environment};
 use crate::proto::process as pb;
 
-/// One retained terminal event, in the handover's wire shape
-/// (upgrade.go:254-268 out, :542-570 in). Defined here — not in
-/// `crate::upgrade` — because tests/process_runtime.rs compiles this module
-/// directly, without the crate root; `upgrade` re-exports it.
-#[allow(dead_code)] // Unused only where the test harness compiles this file directly.
-#[derive(Clone, Debug)]
-pub struct RetainedExit {
-    pub pid: u32,
-    pub tag: Option<String>,
-    pub end: Option<pb::process_event::EndEvent>,
-    pub remaining_ms: i64,
-}
-
-impl RetainedExit {
-    #[allow(dead_code)] // Unused only where the test harness compiles this file directly.
-    pub fn to_wire(&self) -> crate::proto::upgrade::HandoverExit {
-        crate::proto::upgrade::HandoverExit {
-            pid: self.pid,
-            tag: self.tag.clone().unwrap_or_default(),
-            has_tag: self.tag.is_some(),
-            end: self.end.clone().into(),
-            remaining_ms: self.remaining_ms,
-            ..Default::default()
-        }
-    }
-
-    #[allow(dead_code)] // Unused only where the test harness compiles this file directly.
-    pub fn from_wire(entry: &crate::proto::upgrade::HandoverExit) -> Self {
-        Self {
-            pid: entry.pid,
-            tag: entry.has_tag.then(|| entry.tag.clone()),
-            end: entry.end.as_option().cloned(),
-            remaining_ms: entry.remaining_ms,
-        }
-    }
-}
+pub use crate::process_contract::{
+    ProcessEnd, ProcessLogSink, ProcessStart, RetainedExit, RuntimeError, Subscription,
+};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::AtomicI64;
@@ -67,86 +34,16 @@ pub(crate) mod supervise;
 #[allow(unused_imports)] // Unused only where the test harness compiles this file directly.
 pub(crate) use spawn::path_text_error;
 
-const RETENTION: Duration = Duration::from_secs(30);
+pub(crate) use crate::process_contract::{
+    end_event, input_error, matches_selector, publish, signal_refusal, start_error, start_event,
+    user_command, validate_selector, Subscribers, RETENTION,
+};
 
 /// Go upgrade.go `fdBase` (200): the first handover slot. Each carried
 /// process gets five slots (`fdBase + i*5`): stdout, stderr, stdin, tty, and
 /// one unused — matching the oracle's layout so a chained upgrade between a
 /// Go and a Rust envd reuses the same free window.
 const HANDOVER_FD_BASE: RawFd = 200;
-
-#[derive(Debug, thiserror::Error)]
-pub enum RuntimeError {
-    #[error("process not found")]
-    NotFound,
-    #[error("{0}")]
-    InvalidArgument(String),
-    #[error("{0}")]
-    FailedPrecondition(String),
-    #[error("{0}")]
-    Unimplemented(String),
-    #[error("{0}")]
-    Unavailable(String),
-    /// Oracle start_error.go:32-34: an armed request deadline that ends the
-    /// start pre-fork codes CodeDeadlineExceeded (start.go:40-44 arms procCtx
-    /// from connect-timeout-ms; exec.CommandContext refuses with
-    /// context.DeadlineExceeded).
-    #[error("{0}")]
-    DeadlineExceeded(String),
-    #[error("{0}")]
-    ResourceExhausted(String),
-    #[error("{0}")]
-    Internal(String),
-}
-
-/// Structured process lifecycle logs (Go handler.go:599-605, :697-706). The
-/// runtime reaches logs through this seam so its private modules stay
-/// independent of the logging stack; the production adapter is
-/// `logs::ProcessLogger`.
-pub trait ProcessLogSink: Send + Sync {
-    fn process_started(&self, start: &ProcessStart);
-    fn process_ended(&self, end: &ProcessEnd);
-}
-
-// The integration harness at tests/process_runtime.rs compiles this file
-// directly without the production `logs::ProcessLogger` adapter, so the
-// producer-side fields look unread in that compilation unit.
-#[allow(dead_code)]
-pub struct ProcessStart {
-    pub pid: u32,
-    pub command: String,
-    pub request_timeout: Option<Duration>,
-    pub operation_id: Option<String>,
-}
-
-#[allow(dead_code)]
-pub struct ProcessEnd {
-    pub pid: u32,
-    pub end: pb::process_event::EndEvent,
-    pub stdout_bytes: i64,
-    pub stderr_bytes: i64,
-    pub pty_bytes: i64,
-    pub operation_id: Option<String>,
-}
-
-/// Dropping a subscription disconnects that observer, never the running child.
-pub struct Subscription {
-    receiver: mpsc::Receiver<pb::ProcessEvent>,
-}
-
-impl Subscription {
-    pub async fn recv(&mut self) -> Option<pb::ProcessEvent> {
-        self.receiver.recv().await
-    }
-}
-
-type Sender = mpsc::Sender<pb::ProcessEvent>;
-
-#[derive(Default)]
-struct Subscribers {
-    senders: Vec<Sender>,
-    terminal: Option<pb::process_event::EndEvent>,
-}
 
 struct Entry {
     info: pb::ProcessInfo,
@@ -179,6 +76,12 @@ struct Entry {
     /// timer actually arms after the thaw (readopt.go `setDeadline`), so a
     /// frozen window never burns the remaining time down.
     deadline_at: Mutex<Option<Instant>>,
+}
+
+impl crate::process_contract::SubscriptionHolder for Entry {
+    fn subscribers(&self) -> &Mutex<Subscribers> {
+        &self.subscribers
+    }
 }
 
 /// The handover slots a successful `export_processes` relocated. Dropping
@@ -596,16 +499,7 @@ impl ProcessRuntime {
         let signal = match signal {
             15 => nix::sys::signal::Signal::SIGTERM,
             9 => nix::sys::signal::Signal::SIGKILL,
-            0 => {
-                return Err(RuntimeError::Unimplemented(
-                    "invalid signal: SIGNAL_UNSPECIFIED".into(),
-                ))
-            }
-            other => {
-                return Err(RuntimeError::Unimplemented(format!(
-                    "invalid signal: {other}"
-                )))
-            }
+            other => return Err(signal_refusal(other)),
         };
         let (reply, response) = tokio::sync::oneshot::channel();
         entry
@@ -946,28 +840,6 @@ async fn write_input(entry: &Entry, input: &pb::ProcessInput) -> Result<(), Runt
     pipe.write_all(bytes).await.map_err(input_error)
 }
 
-/// Go handler.go:161-163: `cmd` plus `args`, space joined.
-fn user_command(config: &pb::ProcessConfig) -> String {
-    let mut parts = Vec::with_capacity(1 + config.args.len());
-    parts.push(config.cmd.clone());
-    parts.extend(config.args.iter().cloned());
-    parts.join(" ")
-}
-
-/// Oracle handler.go:317-328 (PTY) vs :593 (plain): both wrap the spawn
-/// failure with the user command, and a PTY start additionally names the
-/// resolved dir and the requested window size.
-fn start_error(request: &pb::StartRequest, cwd: &str, error: impl std::fmt::Display) -> String {
-    let command = user_command(&request.process);
-    match request.pty.as_option() {
-        Some(pty) => format!(
-            "error starting pty with command '{command}' in dir '{cwd}' with '{}' cols and '{}' rows: {error}",
-            pty.size.cols, pty.size.rows
-        ),
-        None => format!("error starting process '{command}': {error}"),
-    }
-}
-
 /// start.go:184 wraps every admission refusal through StartErrorCode: a
 /// frozen target stays retryable Unavailable (start_error.go:17-22), while an
 /// armed caller deadline is the caller's own outcome, DeadlineExceeded
@@ -1004,75 +876,5 @@ fn wrapped_spawn_error(
     match mapped {
         RuntimeError::ResourceExhausted(_) => RuntimeError::ResourceExhausted(message),
         _ => RuntimeError::InvalidArgument(message),
-    }
-}
-
-fn input_error(error: std::io::Error) -> RuntimeError {
-    match error.kind() {
-        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected => {
-            RuntimeError::FailedPrecondition(error.to_string())
-        }
-        _ => RuntimeError::Internal(error.to_string()),
-    }
-}
-
-fn validate_selector(selector: &pb::ProcessSelector) -> Result<(), RuntimeError> {
-    if selector.selector.is_none() {
-        // Oracle service.go:171-200 getProcess default branch: %T names the
-        // concrete pointer type of the unset oneof, so the refusal is this
-        // exact text for every operation that resolves a selector.
-        return Err(RuntimeError::Unimplemented(
-            "invalid input type *process.ProcessSelector".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn matches_selector(selector: &pb::ProcessSelector, info: &pb::ProcessInfo) -> bool {
-    match &selector.selector {
-        Some(pb::process_selector::Selector::Pid(pid)) => *pid == info.pid,
-        Some(pb::process_selector::Selector::Tag(tag)) => info.tag.as_ref() == Some(tag),
-        None => false,
-    }
-}
-
-fn start_event(pid: u32) -> pb::ProcessEvent {
-    pb::ProcessEvent {
-        event: Some(
-            pb::process_event::StartEvent {
-                pid,
-                ..Default::default()
-            }
-            .into(),
-        ),
-        ..Default::default()
-    }
-}
-
-fn end_event(end: pb::process_event::EndEvent) -> pb::ProcessEvent {
-    pb::ProcessEvent {
-        event: Some(end.into()),
-        ..Default::default()
-    }
-}
-
-async fn publish(entry: &Entry, event: pb::ProcessEvent, discard_if_blocked: bool) {
-    let senders = {
-        let mut subscribers = entry.subscribers.lock().await;
-        subscribers.senders.retain(|sender| !sender.is_closed());
-        if let Some(pb::process_event::Event::End(end)) = &event.event {
-            subscribers.terminal = Some((**end).clone());
-            std::mem::take(&mut subscribers.senders)
-        } else {
-            subscribers.senders.clone()
-        }
-    };
-    for sender in senders {
-        // At a process deadline no observer may hold lifecycle cleanup hostage.
-        if discard_if_blocked {
-            let _ = sender.try_send(event.clone());
-        } else {
-            let _ = sender.send(event.clone()).await;
-        }
     }
 }

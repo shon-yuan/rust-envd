@@ -1,4 +1,4 @@
-pub use coorworker_envd::{cgroups, exec_context, proto};
+pub use coorworker_envd::{cgroups, exec_context, process_contract, proto};
 // Import the runtime directly so integration tests also cover its private modules.
 #[path = "../src/platform/linux/process/mod.rs"]
 mod runtime;

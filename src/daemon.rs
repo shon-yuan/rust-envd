@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    body::{Body, HttpBody},
+    body::Body,
     extract::State,
     http::{header, Method, Request, StatusCode},
     response::{IntoResponse, Response},
@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 use crate::{
     configuration::Configuration,
     exec_context::Defaults,
+    freeze_wire::{freeze_params, FreezeParams},
     http::{json_error, plain_http_error},
     memory_protection::{read_memory_protection, MemoryProtection},
 };
@@ -50,16 +51,56 @@ pub fn share_freezer(
     (daemon, runtime)
 }
 
-mod compose;
-mod filesystem_rpc;
-pub mod http1;
 mod metrics;
 pub mod nfs;
-mod process_rpc;
 
 impl crate::http::ConfigurationState for Daemon {
     fn configuration(&self) -> &Arc<Mutex<Configuration>> {
         &self.state
+    }
+}
+
+impl crate::upgrade_http::UpgradeState for Daemon {
+    fn upgrade_run(&self) -> Option<crate::upgrade::UpgradeRun> {
+        self.upgrade_run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn upgrade_bin_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(crate::upgrade::DEFAULT_UPGRADE_BIN_PATH)
+    }
+}
+
+impl crate::filesystem_rpc::FilesystemServiceState for Daemon {
+    type Runtime = crate::platform::FilesystemRuntime;
+    type Watchers = crate::platform::WatcherRegistry;
+
+    fn new_runtime(
+        &self,
+        account: crate::exec_context::Account,
+        defaults: Defaults,
+    ) -> Self::Runtime {
+        crate::platform::FilesystemRuntime::new(account, defaults)
+    }
+
+    fn watcher_registry(&self) -> &Self::Watchers {
+        &self.watchers
+    }
+
+    fn filesystem_logger(&self) -> &crate::logs::Logger {
+        &self.filesystem_logger
+    }
+}
+
+impl crate::process_api::ProcessRpcState for Daemon {
+    fn configuration(&self) -> &Arc<Mutex<Configuration>> {
+        &self.state
+    }
+
+    fn process_logger(&self) -> &crate::logs::Logger {
+        &self.process_logger
     }
 }
 
@@ -123,10 +164,6 @@ pub struct Daemon {
     /// Oracle api/fsfreeze.go fsFreezeLock: one freeze/thaw at a time.
     fsfreeze_lock: Arc<tokio::sync::Semaphore>,
 }
-
-mod filesystem_payload;
-mod process_payload;
-mod rpc_log;
 
 /// Mirrors Go `SetupHyperloop`: a per-daemon lock serializes rewrites (last
 /// writer wins), success stores the internal events address, failure only logs.
@@ -513,7 +550,7 @@ pub fn app(state: Arc<Daemon>) -> Router {
 }
 
 pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
-    let rpc = filesystem_rpc::router(state.clone());
+    let rpc = crate::filesystem_rpc::router(state.clone());
     crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
@@ -521,8 +558,9 @@ pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
 }
 
 pub fn app_with_execution(state: Arc<Daemon>, runtime: crate::process::ProcessRuntime) -> Router {
-    let rpc =
-        process_rpc::router(state.clone(), runtime).merge(filesystem_rpc::router(state.clone()));
+    let runtime: Arc<dyn crate::process_api::ProcessRuntimeApi> = Arc::new(runtime);
+    let rpc = crate::rpc::process::router(state.clone(), runtime)
+        .merge(crate::filesystem_rpc::router(state.clone()));
     crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
@@ -542,14 +580,17 @@ fn http_routes(state: Arc<Daemon>) -> Router {
         .route("/metrics", any(metrics::get_metrics))
         .route("/envs", any(crate::http::envs::<Daemon>))
         .route("/init", any(init))
-        .route("/upgrade", any(upgrade))
+        .route("/upgrade", any(crate::upgrade_http::upgrade::<Daemon>))
         .route("/freeze", any(freeze))
         .route("/unfreeze", any(unfreeze))
         .route("/collapse", any(collapse))
         .route("/fsfreeze", any(fsfreeze))
         .route("/fsthaw", any(fsthaw))
         .route("/files", any(files))
-        .route("/files/compose", any(compose::compose))
+        .route(
+            "/files/compose",
+            any(crate::files_compose::compose::<Daemon>),
+        )
         .with_state(state)
 }
 
@@ -561,252 +602,6 @@ async fn files(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Res
         Method::POST => crate::files_upload::upload(State(daemon), request).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
-}
-
-/// Go main.go:427-475. The choreography's non-exec parts live here so they are
-/// testable without the wired services: the pre-init 409, the foreign-target
-/// 400, and the fixed-path body delivery. On success the process execs and
-/// this never responds; the caller treats a dropped connection as success.
-/// The run itself is spawned detached (Go's never-cancelled handler
-/// goroutine, main.go:382-385), so a disconnect that drops this future still
-/// lets the choreography run to its exec or its release+thaw tail.
-async fn upgrade(State(daemon): State<Arc<Daemon>>, request: Request<Body>) -> Response {
-    // Refuse upgrades until the first authenticated /init. A re-exec'd envd
-    // serves before /init with its access token cleared, so without this a
-    // guest process could drive an unauthenticated upgrade in that window
-    // (main.go:427-433).
-    if !daemon.initialized().await {
-        return plain_http_error(StatusCode::CONFLICT, "envd not initialized");
-    }
-    // The delivered binary is always written to and exec'd from a fixed path;
-    // reject a caller asking for anything else (main.go:437-445).
-    if let Some(target) = request
-        .headers()
-        .get("x-envd-upgrade-bin")
-        .and_then(|value| value.to_str().ok())
-    {
-        if target != crate::upgrade::DEFAULT_UPGRADE_BIN_PATH {
-            return plain_http_error(StatusCode::BAD_REQUEST, "unsupported upgrade target");
-        }
-    }
-    let mut new_bin = None;
-    if request.body().size_hint().exact() != Some(0) {
-        // The orchestrator streams the new binary in the request body; write it
-        // to the fixed path before swapping (main.go:447-468).
-        new_bin = Some(crate::upgrade::DEFAULT_UPGRADE_BIN_PATH.to_owned());
-        let staged = std::path::Path::new(crate::upgrade::DEFAULT_UPGRADE_BIN_PATH);
-        if let Err(error) = write_upgrade_binary(request.into_body(), staged).await {
-            return plain_http_error(StatusCode::INTERNAL_SERVER_ERROR, &error);
-        }
-    }
-    let run = daemon
-        .upgrade_run
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    let Some(run) = run else {
-        // Unreachable on the guest path (main always wires doUpgrade); a
-        // development daemon has nothing to swap into.
-        return plain_http_error(StatusCode::INTERNAL_SERVER_ERROR, "upgrade is not wired");
-    };
-    // The choreography runs DETACHED from the connection, Go's own shape:
-    // net/http never cancels a handler goroutine, so doUpgrade always
-    // completes and its deferred release+thaw runs on every non-exec exit
-    // (main.go:382-385) — the orchestrator treats the dropped connection as
-    // success (main.go:426). axum drops this handler future on a disconnect,
-    // and dropping an awaited future cancels it: an inline await would leave
-    // the workload frozen with the spawn barrier up while a success that
-    // never exec'd was recorded. The spawn owns the run from here on; this
-    // future only awaits the handle, so a drop lands on the handle and never
-    // reaches the choreography.
-    let run_task = tokio::spawn(async move { run(new_bin).await });
-    match run_task.await {
-        // doUpgrade does not return on success — the process has exec'd and
-        // this never responds. Reaching here means a wired hook that came
-        // back, which Go could only produce by a failed Exec (main.go:295).
-        Ok(Ok(())) => plain_http_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "upgrade returned without replacing the process",
-        ),
-        Ok(Err(error)) => plain_http_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
-        // The spawned task owns its rollback, so a join error is a panic
-        // outside the choreography's own error paths; answer the same 500 the
-        // failed run returns.
-        Err(join_error) => {
-            plain_http_error(StatusCode::INTERNAL_SERVER_ERROR, &join_error.to_string())
-        }
-    }
-}
-
-/// Go main.go:447-468: stream the delivered binary to the fixed path with
-/// unlink-first (on a chained upgrade this envd runs FROM that path, so
-/// O_TRUNC on the live image fails with ETXTBSY; the create then lands on a
-/// fresh inode while the running process keeps its unlinked image).
-async fn write_upgrade_binary(body: Body, path: &std::path::Path) -> Result<(), String> {
-    use futures_util::StreamExt;
-    let _ = tokio::fs::remove_file(path).await;
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o755)
-        .open(path)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| error.to_string())?;
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    // Same seam as `cacerts::prepare_file`: tokio's fs File reports write_all
-    // complete once the write is QUEUED on the blocking pool, so without this
-    // await a straggler chunk can still be in flight when the response (and,
-    // on the upgrade path, the swap) goes out. Go streams through a
-    // synchronous io.Copy and returns with every byte in the file; flush is
-    // the await that waits for the write syscall itself.
-    tokio::io::AsyncWriteExt::flush(&mut file)
-        .await
-        .map_err(|error| error.to_string())?;
-    // While this write fd is open, a concurrently forked child of this
-    // process inherits it (O_CLOEXEC closes only at that child's execve), so
-    // an exec of this image racing a fork can fail ETXTBSY. Go's io.Copy
-    // holds the same window; parity behavior, not a defect.
-    Ok(())
-}
-
-/// Go api.gen.go:323-354, form-bound query parameters. Absent or unknown
-/// values keep the contracts of callers predating each parameter.
-#[derive(Debug, Default)]
-struct FreezeParams {
-    max_wait_ms: Option<i64>,
-    mode: Option<String>,
-    max_cgroups: Option<i64>,
-}
-
-/// api.gen.go:723-765 binding order: mode, maxCgroups, maxWaitMs, stopping at
-/// the first invalid value. Go answers a binding failure with http.Error and
-/// oapi's `Invalid format for parameter ...` text; axum's Query rejection text
-/// would be different, so the binding is reproduced here.
-fn freeze_params(query: Option<&str>) -> Result<FreezeParams, String> {
-    let query = go_query_values(query.unwrap_or(""));
-    let mut params = FreezeParams::default();
-    if let Some(value) = query.get("mode") {
-        params.mode = Some(value.clone());
-    }
-    if let Some(value) = query.get("maxCgroups") {
-        params.max_cgroups = Some(bind_integer("maxCgroups", value)?);
-    }
-    if let Some(value) = query.get("maxWaitMs") {
-        params.max_wait_ms = Some(bind_integer("maxWaitMs", value)?);
-    }
-    Ok(params)
-}
-
-fn bind_integer(name: &str, value: &str) -> Result<i64, String> {
-    go_parse_int(value).map_err(|error| {
-        format!("Invalid format for parameter {name}: error binding string parameter: {error}")
-    })
-}
-
-/// Go `url.ParseQuery` as `r.URL.Query()` exposes it: malformed pairs (bad
-/// percent escape, unescaped `;`) are dropped, `+` is a space, and oapi's
-/// scalar binding takes the first value for a repeated key.
-fn go_query_values(query: &str) -> std::collections::HashMap<String, String> {
-    let mut values = std::collections::HashMap::new();
-    for piece in query.split('&') {
-        if piece.is_empty() || piece.contains(';') {
-            continue;
-        }
-        let (raw_key, raw_value) = piece.split_once('=').unwrap_or((piece, ""));
-        let (Some(key), Some(value)) = (go_query_unescape(raw_key), go_query_unescape(raw_value))
-        else {
-            continue;
-        };
-        values.entry(key).or_insert(value);
-    }
-    values
-}
-
-fn go_query_unescape(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                output.push(b' ');
-                index += 1;
-            }
-            b'%' => {
-                let high = (*bytes.get(index + 1)? as char).to_digit(16)?;
-                let low = (*bytes.get(index + 2)? as char).to_digit(16)?;
-                output.push((high << 4 | low) as u8);
-                index += 3;
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(output).ok()
-}
-
-/// strconv.ParseInt(value, 10, 64)'s failure text.
-fn go_parse_int(value: &str) -> Result<i64, String> {
-    let (negative, digits) = match value.as_bytes().first() {
-        Some(b'+') => (false, &value[1..]),
-        Some(b'-') => (true, &value[1..]),
-        _ => (false, value),
-    };
-    let out_of_range = || {
-        format!(
-            "strconv.ParseInt: parsing {}: value out of range",
-            go_quote(value)
-        )
-    };
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!(
-            "strconv.ParseInt: parsing {}: invalid syntax",
-            go_quote(value)
-        ));
-    }
-    let magnitude = digits.parse::<u128>().map_err(|_| out_of_range())?;
-    let limit = if negative {
-        1u128 << 63
-    } else {
-        i64::MAX as u128
-    };
-    if magnitude > limit {
-        return Err(out_of_range());
-    }
-    Ok(if negative {
-        (-(magnitude as i128)) as i64
-    } else {
-        magnitude as i64
-    })
-}
-
-/// strconv.Quote's shape for the ASCII query values a caller can send.
-fn go_quote(value: &str) -> String {
-    let mut quoted = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '\\' => quoted.push_str("\\\\"),
-            '"' => quoted.push_str("\\\""),
-            '\n' => quoted.push_str("\\n"),
-            '\r' => quoted.push_str("\\r"),
-            '\t' => quoted.push_str("\\t"),
-            character if (character as u32) < 0x20 || character as u32 == 0x7f => {
-                quoted.push_str(&format!("\\x{:02x}", character as u32));
-            }
-            character => quoted.push(character),
-        }
-    }
-    quoted.push('"');
-    quoted
 }
 
 /// Go init.go:494-643 PostFreeze. maxWaitMs is what tells the two callers
@@ -1168,15 +963,7 @@ struct InitRequest {
 
 // Go encoding/json folds ASCII case plus Unicode simple-fold equivalents.
 // For these ASCII field names, only long-s and Kelvin sign add equivalents.
-fn folded_field(key: &str) -> String {
-    key.chars()
-        .map(|ch| match ch {
-            'ſ' => 'S',
-            'K' => 'K',
-            ch => ch.to_ascii_uppercase(),
-        })
-        .collect()
-}
+use crate::compose_decode::folded_field;
 
 impl<'de> Deserialize<'de> for InitRequest {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -1967,7 +1754,7 @@ mod upgrade_connection_tests {
             })
         }));
         let request = Request::builder().body(Body::empty()).expect("request");
-        let handler = tokio::spawn(upgrade(State(daemon.clone()), request));
+        let handler = tokio::spawn(crate::upgrade_http::upgrade(State(daemon.clone()), request));
         // Rendezvous: the handler is parked inside the choreography's
         // handover window.
         started_rx
@@ -2139,47 +1926,9 @@ mod freezer_sharing_tests {
 }
 
 #[cfg(test)]
-mod upgrade_write_tests {
-    use super::write_upgrade_binary;
-    use axum::body::Body;
-
-    /// Go main.go:447-468 streams the binary through a synchronous
-    /// `io.Copy`/`WriteFile`: when the handler returns, the staged file holds
-    /// every byte. Tokio's `fs::File` completes `write_all` when the write is
-    /// QUEUED on the blocking pool (fs/file.rs `poll_write` spawns the task and
-    /// returns Ready); the awaited `flush` is what waits for the syscall.
-    /// Without it the response can return while the last chunk is still in
-    /// flight, so a caller that stats or execs the staged image immediately can
-    /// observe a truncated binary. Each round writes a multi-chunk body and
-    /// reads the length back as soon as the write future resolves; the same
-    /// class was captured in `cacerts::prepare_file` (wrote=N on_disk=0).
-    #[tokio::test]
-    async fn a_completed_write_holds_every_byte_on_disk() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("envd.next");
-        const CHUNKS: usize = 64;
-        const CHUNK: usize = 1024;
-        for round in 0..200 {
-            let body =
-                Body::from_stream(futures_util::stream::iter((0..CHUNKS).map(|index| {
-                    Ok::<_, std::io::Error>(vec![b'a' + (index % 26) as u8; CHUNK])
-                })));
-            write_upgrade_binary(body, &path).await.expect("write");
-            let on_disk = std::fs::metadata(&path)
-                .expect("the staged upgrade binary exists")
-                .len();
-            assert_eq!(
-                on_disk as usize,
-                CHUNKS * CHUNK,
-                "round {round}: the write future resolved before the staged binary held every byte"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod binding_tests {
     use super::*;
+    use crate::freeze_wire::{go_parse_int, go_query_values};
     use std::io;
 
     #[test]

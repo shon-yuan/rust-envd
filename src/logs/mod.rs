@@ -1,10 +1,12 @@
 //! Structured log production and the MMDS logs exporter.
+#[cfg(target_os = "linux")]
 pub mod exporter;
 pub mod gojson;
 pub mod logger;
 pub mod process;
 pub mod ratelimit;
 
+#[cfg(target_os = "linux")]
 pub use exporter::{ExporterTasks, HttpExporter};
 pub use gojson::{decorate, JsonError};
 pub use logger::{Level, Logger, StdoutSink};

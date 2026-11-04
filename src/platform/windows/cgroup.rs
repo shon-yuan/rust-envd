@@ -1,20 +1,28 @@
-//! Resource limits, freeze/thaw, and accounting skeleton; Job Objects arrive
-//! in P2.
+//! Resource limits and freeze/thaw for Windows.
+//!
+//! The behaviour lives in [`super::resource`], which owns the workload
+//! registry, the suspend/resume primitives and the optional Job Object. This
+//! module only keeps the platform seam honest: `ResourceBackend` maps onto the
+//! backend's legacy (registry) freeze path, while the daemon's HTTP surface
+//! drives the async methods directly so it can report the full structured
+//! result.
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::platform::ResourceBackend;
 
-#[derive(Debug, Default)]
-pub struct WindowsResourceBackend;
+pub use super::resource::WindowsResourceBackend;
 
-impl ResourceBackend for WindowsResourceBackend {
-    fn freeze(&self, _max_wait: Duration) -> io::Result<()> {
-        Err(super::unsupported("freeze"))
+// The watchdog needs a shared owner for its backstop task, so the platform
+// seam is implemented for the `Arc` the daemon actually holds.
+impl ResourceBackend for Arc<WindowsResourceBackend> {
+    fn freeze(&self, max_wait: Duration) -> io::Result<()> {
+        self.freeze_blocking(max_wait)
     }
 
     fn thaw(&self) -> io::Result<()> {
-        Err(super::unsupported("unfreeze"))
+        self.thaw_blocking()
     }
 }

@@ -3,20 +3,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::exec_context::{Account, Defaults};
-use crate::filesystem::watchers::WatcherRegistry;
+use crate::exec_context::{request_account, Account, Defaults};
+use crate::filesystem_payload as payload;
+use crate::http::ConfigurationState;
 use crate::logs::{assign_operation_id, format_method, Logger};
+use crate::platform::{FilesystemService, WatchSubscription, WatcherService};
+use crate::proto::filesystem as pb;
+use crate::rpc::rpc_log::{event as interceptor_event, unary_event, StreamEndError};
 use connectrpc::{
     handler::{handler_fn, streaming_handler_fn},
     ConnectError, RequestContext, Response, Router,
 };
 use futures_util::{stream, Stream};
-
-use super::rpc_log::{event as interceptor_event, unary_event, StreamEndError};
-use super::{filesystem_payload as payload, Daemon};
-use crate::{
-    exec_context::request_account, filesystem::FilesystemRuntime, proto::filesystem as pb,
-};
 use serde_json::Value;
 
 /// Go `NewUnaryLogInterceptor` (internal/logs/interceptor.go:52-93): one line
@@ -123,8 +121,21 @@ impl Drop for LoggedWatchStream {
     }
 }
 
-async fn execute<T, F, R>(
-    daemon: Arc<Daemon>,
+/// The daemon state the shared filesystem adapter needs: the configuration
+/// every HTTP handler already exposes, the platform runtime constructor, the
+/// daemon-owned watcher registry, and the filesystem-scoped logger. Linux and
+/// Windows daemons implement this so one router serves both.
+pub trait FilesystemServiceState: ConfigurationState {
+    type Runtime: FilesystemService + Send + 'static;
+    type Watchers: WatcherService + Clone + Send + 'static;
+
+    fn new_runtime(&self, account: Account, defaults: Defaults) -> Self::Runtime;
+    fn watcher_registry(&self) -> &Self::Watchers;
+    fn filesystem_logger(&self) -> &Logger;
+}
+
+async fn execute<D, T, F, R>(
+    daemon: Arc<D>,
     context: RequestContext,
     method: &'static str,
     request_value: Value,
@@ -132,16 +143,18 @@ async fn execute<T, F, R>(
     operation: F,
 ) -> Result<T, ConnectError>
 where
+    D: FilesystemServiceState,
     T: Send + 'static,
-    F: FnOnce(&FilesystemRuntime) -> Result<T, ConnectError> + Send + 'static,
+    F: FnOnce(&D::Runtime) -> Result<T, ConnectError> + Send + 'static,
     R: FnOnce(&T) -> Value + Send + 'static,
 {
-    let logger = daemon.filesystem_logger.clone();
+    let logger = daemon.filesystem_logger().clone();
     let operation_id = assign_operation_id();
-    let defaults = daemon.state.lock().await.defaults.clone();
+    let defaults = daemon.configuration().lock().await.defaults.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let account = request_account(&defaults, &context)?;
-        operation(&FilesystemRuntime::new(account, defaults))
+        let runtime = daemon.new_runtime(account, defaults);
+        operation(&runtime)
     })
     .await
     .map_err(|_| ConnectError::internal("filesystem worker failed"))?;
@@ -156,7 +169,7 @@ where
     outcome
 }
 
-pub(super) fn router(daemon: Arc<Daemon>) -> Router {
+pub fn router<D: FilesystemServiceState>(daemon: Arc<D>) -> Router {
     let stat = daemon.clone();
     let make_dir = daemon.clone();
     let move_entry = daemon.clone();
@@ -282,17 +295,18 @@ pub(super) fn router(daemon: Arc<Daemon>) -> Router {
     watcher_routes(router, daemon)
 }
 
-async fn watcher_context<T, F>(
-    daemon: Arc<Daemon>,
+async fn watcher_context<D, T, F>(
+    daemon: Arc<D>,
     context: RequestContext,
     operation: F,
 ) -> Result<T, ConnectError>
 where
+    D: FilesystemServiceState,
     T: Send + 'static,
-    F: FnOnce(WatcherRegistry, Account, Defaults) -> Result<T, ConnectError> + Send + 'static,
+    F: FnOnce(D::Watchers, Account, Defaults) -> Result<T, ConnectError> + Send + 'static,
 {
-    let defaults = daemon.state.lock().await.defaults.clone();
-    let registry = daemon.watchers.clone();
+    let defaults = daemon.configuration().lock().await.defaults.clone();
+    let registry = daemon.watcher_registry().clone();
     tokio::task::spawn_blocking(move || {
         let account = request_account(&defaults, &context)?;
         operation(registry, account, defaults)
@@ -309,9 +323,7 @@ async fn validate_explicit_user(context: RequestContext) -> Result<(), ConnectEr
         return Ok(());
     }
     tokio::task::spawn_blocking(move || {
-        let user = nix::unistd::User::from_uid(nix::unistd::geteuid())
-            .map_err(|_| ConnectError::internal("failed to look up daemon user"))?
-            .ok_or_else(|| ConnectError::internal("daemon user not found"))?;
+        let user = crate::platform::daemon_account().map_err(ConnectError::internal)?;
         request_account(
             &Defaults {
                 user: user.name,
@@ -325,7 +337,7 @@ async fn validate_explicit_user(context: RequestContext) -> Result<(), ConnectEr
     .map_err(|_| ConnectError::internal("watcher worker failed"))?
 }
 
-fn watcher_routes(router: Router, daemon: Arc<Daemon>) -> Router {
+fn watcher_routes<D: FilesystemServiceState>(router: Router, daemon: Arc<D>) -> Router {
     let create = daemon.clone();
     let events = daemon.clone();
     let remove = daemon.clone();
@@ -337,7 +349,7 @@ fn watcher_routes(router: Router, daemon: Arc<Daemon>) -> Router {
                 move |context: RequestContext, request: pb::CreateWatcherRequest| {
                     let daemon = create.clone();
                     async move {
-                        let logger = daemon.filesystem_logger.clone();
+                        let logger = daemon.filesystem_logger().clone();
                         let operation_id = assign_operation_id();
                         let request_value = payload::watch_request(&request);
                         let outcome =
@@ -365,12 +377,14 @@ fn watcher_routes(router: Router, daemon: Arc<Daemon>) -> Router {
                 move |context: RequestContext, request: pb::GetWatcherEventsRequest| {
                     let daemon = events.clone();
                     async move {
-                        let logger = daemon.filesystem_logger.clone();
+                        let logger = daemon.filesystem_logger().clone();
                         let operation_id = assign_operation_id();
                         let request_value = payload::watcher_id_request(&request.watcher_id);
                         let outcome = async {
                             validate_explicit_user(context).await?;
-                            daemon.watchers.get_watcher_events(&request.watcher_id)
+                            daemon
+                                .watcher_registry()
+                                .get_watcher_events(&request.watcher_id)
                         }
                         .await;
                         log_unary(
@@ -396,12 +410,14 @@ fn watcher_routes(router: Router, daemon: Arc<Daemon>) -> Router {
                 move |context: RequestContext, request: pb::RemoveWatcherRequest| {
                     let daemon = remove.clone();
                     async move {
-                        let logger = daemon.filesystem_logger.clone();
+                        let logger = daemon.filesystem_logger().clone();
                         let operation_id = assign_operation_id();
                         let request_value = payload::watcher_id_request(&request.watcher_id);
                         let outcome = async {
                             validate_explicit_user(context).await?;
-                            daemon.watchers.remove_watcher(&request.watcher_id)
+                            daemon
+                                .watcher_registry()
+                                .remove_watcher(&request.watcher_id)
                         }
                         .await;
                         log_unary(
@@ -428,7 +444,7 @@ fn watcher_routes(router: Router, daemon: Arc<Daemon>) -> Router {
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_owned);
                     async move {
-                        let logger = daemon.filesystem_logger.clone();
+                        let logger = daemon.filesystem_logger().clone();
                         let operation_id = assign_operation_id();
                         // interceptor.go:104-110: the start line precedes the
                         // handler unconditionally and carries the request
@@ -458,7 +474,10 @@ fn watcher_routes(router: Router, daemon: Arc<Daemon>) -> Router {
                             }
                         };
                         let events = stream::unfold(subscription, |mut subscription| async move {
-                            subscription.recv().await.map(|event| (event, subscription))
+                            subscription
+                                .next_frame()
+                                .await
+                                .map(|event| (event, subscription))
                         });
                         Response::stream_ok(LoggedWatchStream {
                             inner: Box::pin(events),

@@ -148,6 +148,26 @@ fn current_user_sid() -> Option<Vec<u8>> {
     }
 }
 
+/// Whether `name` resolves to the daemon's own user SID. The process runtime
+/// uses this for the start-time refusal documented as a deviation from Linux
+/// setuid: without a credential provider, `CreateProcessW` runs only as the
+/// daemon.
+pub(crate) fn is_current_user(name: &str) -> bool {
+    let Some(sid) = current_user_sid() else {
+        return false;
+    };
+    lookup_sid(split_domain(name).0).is_ok_and(|candidate| candidate == sid)
+}
+
+/// Whether the current process token is the builtin SYSTEM account
+/// (`S-1-5-18`). Boot validation refuses SYSTEM outside SCM service mode.
+pub fn is_system_account() -> bool {
+    // SID layout: revision 1, one sub-authority, identifier authority 5
+    // (NT), sub-authority 18 (LOCAL SYSTEM), little-endian.
+    const SYSTEM_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 0x12, 0, 0, 0];
+    current_user_sid().is_some_and(|sid| sid == SYSTEM_SID)
+}
+
 /// The account the daemon runs as, used as the builtin default user. Windows
 /// always exports `USERNAME` for interactive and service processes; the
 /// `SYSTEM` fallback covers a stripped environment.

@@ -82,6 +82,7 @@ pub fn go_timespec_parts(nanos: i64) -> (i64, i64) {
 /// guest path (development daemons never touch the host clock), mirroring the
 /// established development-boundary convention. The nix errno text differs
 /// from Go's syscall error text (deviation, diagnostics only).
+#[cfg(target_os = "linux")]
 pub fn system_time_sink(nanos: i64) -> Result<(), String> {
     let (sec, nsec) = go_timespec_parts(nanos);
     nix::time::clock_settime(
@@ -89,6 +90,14 @@ pub fn system_time_sink(nanos: i64) -> Result<(), String> {
         nix::sys::time::TimeSpec::new(sec, nsec),
     )
     .map_err(|error| error.to_string())
+}
+
+/// Production sink on Windows: `SetSystemTime` from the same nanosecond
+/// target (see `platform::windows::clock`). The same guest-only wiring rule
+/// applies.
+#[cfg(windows)]
+pub fn system_time_sink(nanos: i64) -> Result<(), String> {
+    crate::platform::windows::clock::set_system_time(nanos)
 }
 
 /// Decode an RFC3339 timestamp body value to nanoseconds since the epoch,

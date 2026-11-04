@@ -3,7 +3,6 @@
 //! The guest main runs it as a task and the daemon reports its snapshot on
 //! `/metrics` (`daemon/metrics.rs`, matching internal/api/store.go GetMetrics).
 
-use serde::Serialize;
 use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -16,11 +15,9 @@ use tokio::{
     time::{sleep, Instant},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct OomKill {
-    pub seq: i64,
-    pub process: String,
-}
+/// The shared wire type lives in the platform-neutral metrics module; this
+/// path stays for the Linux watcher and its tests.
+pub use crate::metrics::OomKill;
 
 #[derive(Default)]
 struct State {

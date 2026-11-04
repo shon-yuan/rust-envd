@@ -17,7 +17,7 @@ use std::{
 
 use tokio::sync::Notify;
 
-use super::procnet::ConnectionStat;
+use super::ConnectionStat;
 
 /// Oracle scanfilter.go:9-27. A filter with neither state nor IPs matches
 /// nothing (scanfilter.go:15-18); otherwise the connection's local IP must be
@@ -195,19 +195,23 @@ impl ScannerSubscriber {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Addr, ConnectionStat};
     use super::*;
-    use crate::port::procnet::AF_INET;
+
+    /// `AF_INET` is 2 on both supported platforms; only the shared filter's
+    /// string matching is under test here.
+    const AF_INET: u32 = 2;
 
     fn connection(ip: &str, port: u32, status: &str) -> ConnectionStat {
         ConnectionStat {
             fd: 0,
             family: AF_INET,
             sock_type: 1,
-            laddr: super::super::procnet::Addr {
+            laddr: Addr {
                 ip: ip.to_owned(),
                 port,
             },
-            raddr: super::super::procnet::Addr {
+            raddr: Addr {
                 ip: "0.0.0.0".into(),
                 port: 0,
             },

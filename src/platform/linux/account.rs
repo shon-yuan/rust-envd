@@ -8,6 +8,23 @@ use crate::exec_context::Account;
 /// `error looking up user '<name>': ` wrapper each caller adds.
 const UNKNOWN: &str = "user: unknown user";
 
+/// The account the daemon process runs as. The Connect ID operations use it
+/// only as the fallback identity for validating an explicitly supplied Basic
+/// username, so it deliberately skips the supplementary-group lookup that
+/// [`lookup`] performs.
+pub fn daemon_account() -> Result<Account, String> {
+    let user = nix::unistd::User::from_uid(nix::unistd::geteuid())
+        .map_err(|_| "failed to look up daemon user".to_owned())?
+        .ok_or_else(|| "daemon user not found".to_owned())?;
+    Ok(Account {
+        name: user.name,
+        home: user.dir.to_string_lossy().into_owned(),
+        uid: user.uid.as_raw(),
+        gid: user.gid.as_raw(),
+        groups: Vec::new(),
+    })
+}
+
 pub fn lookup(username: &str) -> Result<Account, String> {
     let user = nix::unistd::User::from_name(username)
         .map_err(|error| error.to_string())?

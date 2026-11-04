@@ -6,9 +6,11 @@
 
 pub mod account;
 pub mod cgroups;
+pub mod compose_files;
 pub mod cpus;
 pub mod file_writes;
 pub mod filesystem;
 pub mod mmds;
 pub mod port;
 pub mod process;
+pub mod upgrade_fs;

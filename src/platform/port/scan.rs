@@ -13,8 +13,8 @@ use std::{
 };
 
 use super::{
-    procnet::{ProcNetSource, ScanSource},
     scan_subscriber::{ScanBatch, ScannerFilter, ScannerSubscriber},
+    ScanSource,
 };
 use crate::logs::Logger;
 
@@ -33,9 +33,10 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    /// Oracle NewScanner (scan.go:23-30) with the production /proc source.
+    /// Oracle NewScanner (scan.go:23-30) with the platform's production
+    /// source: `/proc/net/tcp{,6}` on Linux, the Win32 TCP table on Windows.
     pub fn new(logger: &Logger, period: Duration) -> Self {
-        Self::with_source(logger, period, Arc::new(ProcNetSource::proc_default()))
+        Self::with_source(logger, period, crate::platform::port_scan_source())
     }
 
     /// Test seam: an injected scan source, standing in for gopsutil's
@@ -127,7 +128,11 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::procnet::{Addr, ConnectionStat, AF_INET};
+    use crate::platform::port::{Addr, ConnectionStat};
+
+    /// `AF_INET` is 2 on both supported platforms (`AF_INET6` differs and
+    /// these scan-loop tests only build IPv4 listeners).
+    const AF_INET: u32 = 2;
     use std::{
         io,
         sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},

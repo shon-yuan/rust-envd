@@ -914,3 +914,417 @@ line on every read, so the debug-build test alone costs several seconds
 still rejecting correctly. The deadline now exists only to fail a hang
 (60 s), with the reason in the test; the guest binary is byte-identical
 (`bccb04e9…`), so the gated candidate stands.
+
+## Windows port P1 — Filesystem Connect slice (2026-11-04)
+
+The nine Filesystem Connect procedures are served on Windows through the same
+shared adapter as Linux. `src/platform/windows/fs_runtime.rs` implements the
+`FilesystemService` runtime with the Linux resolution order and message shapes
+over `std::fs`/Win32 calls: lstat-shaped `Stat` with synthesized
+mode/permissions/owner/group and an empty metadata map; `MakeDir`'s
+`already_exists`/`invalid_argument` ordering; `Move`'s destination-parents
+side effect before the source check plus `MoveFileExW` with
+`MOVEFILE_REPLACE_EXISTING`; the 255-link, sorted depth-first `ListDir` walk
+with alias paths; and idempotent, symlink-safe recursive `Remove` that clears
+the read-only attribute once on access-denied. A published Win32-to-errno text
+table supplies the Go-shaped tails of the wrapped messages.
+`src/platform/windows/watchers.rs` implements the watcher service over
+overlapped `ReadDirectoryChangesW`: one directory handle and dedicated thread
+per watcher, a 64 KiB buffer, a manual-reset stop event, `CancelIoEx` plus a
+`GetOverlappedResult` drain and a join on drop, the documented action mapping,
+`/`-separated relative names, `ERROR_NOTIFY_ENUM_DIR` as the terminal
+`watcher event queue overflow`, and UNCs/`DRIVE_REMOTE` as network mounts.
+`src/daemon_windows.rs` owns the watcher registry and `Logger::none()`, mounts
+the shared router through `transport::rpc_service` in both `app()` and
+`app_with_filesystem()`, and answers unknown process procedures with the
+Connect router's 404 `method not found: <path>`.
+
+Declared deviations: native `\` separators in returned paths and messages
+while event names use `/`; synthesized mode/owner/group; `metadata` always
+empty; no CHMOD events; RDCW batching and no synthetic child Create events
+for a directory moved in; moving the watched root does not end the watch;
+`Move` refuses an existing directory; `Remove` clears read-only attributes;
+no SID cache; no interceptor log lines on Windows. The complete list is in
+`docs/windows-port.md` §5.2. **Windows behaviour is contract-tested, not
+differentially verified** — no Windows oracle exists.
+
+Verification, Linux: the filesystem runtime/RPC, watcher RPC and production
+log suites named in the step's verification list, clippy `-D warnings` on all
+targets and fmt are clean on this candidate. Verification, Windows: the
+Windows-target `check --lib --bins` and clippy `-D warnings` are clean. The
+new contract tests (Stat value synthesis and message shapes, MakeDir, Move,
+ListDir, Remove including a junction, token/Basic auth,
+CreateWatcher/GetWatcherEvents/RemoveWatcher drain and authorization,
+missing/file watcher refusals, WatchDir Start/Create/Write/Rename frames,
+keepalive, and handle release) and the new unit tests (RDCW buffer mapping,
+`/` names, overflow, network classification, error table, runtime
+move/junction/walk/stat) are written for the `windows-test` job on
+`windows-latest`; they were type-checked against the Windows target locally
+but cannot run without a Windows host.
+
+## Windows port P1 — `POST /files/compose` (2026-11-04)
+
+The compose handler and the incremental Go encoding/json scanner moved out of
+the Linux-only daemon into `src/files_compose.rs` and `src/compose_decode.rs`;
+both daemons mount one handler, so the decoder, validation order, error
+strings, HTML escaping and response framing are the moved Linux code. The
+file operations moved behind `src/platform/compose_files.rs`. Linux keeps the
+verbatim `/dev/urandom`, `0666` temp mode, chown of the temp and created
+directories, `copy_file_range` with the 32 KiB buffered fallback, descriptor
+close and lowercased errno text. Windows implements the same facade with real
+Win32 calls: `BCryptGenRandom`, exclusive temp creation sharing
+read/write/delete, a drive/UNC-aware lexical parent, `fs::create_dir` without
+chown, a no-op `adopt_owner`, `GetFileInformationByHandle` identity (volume
+serial + file index, optionally `FILE_FLAG_OPEN_REPARSE_POINT`), a 1 MiB
+buffered copy with the oracle's operation strings, `FlushFileBuffers` +
+`CloseHandle`, Windows system-message `errno_text`, and the shared disk-full
+classifier. `src/daemon_windows.rs` routes `/files/compose` to the shared
+handler; the 501 gap test now uses `POST /freeze`.
+
+Declared deviations: no POSIX mode/uid/gid (the temp inherits the destination
+directory's ACL, the service account is its creator, and ownership adoption is
+a no-op); Windows system-message tails in OS error details instead of
+lowercased errno text; no `copy_file_range` operation string; lexical `..`
+collapse in Win32 path resolution; a read-only source cannot be unlinked by
+the best-effort cleanup; renaming over a destination held open without delete
+sharing returns a 500; `ERROR_DISK_QUOTA_EXCEEDED` stays 500 while disk-full
+maps to 507; and long relative paths can still fail near `MAX_PATH`. The
+Windows unit and contract tests (four unit, seven contract plus the updated
+gap test) run only in the `windows-test` job on `windows-latest`; they were
+type-checked against the Windows target locally but cannot run without a
+Windows host.
+
+Verification, Linux: `cargo fmt --check` clean; `cargo check -j4 --offline
+--all-targets` clean; `cargo clippy -j4 --offline --all-targets -- -D
+warnings` clean; `cargo test -j4 --offline` 814 passed / 0 failed. Verification,
+Windows (cross-compiled on this Linux host): `cargo check -j4 --offline --lib
+--bins --target x86_64-pc-windows-msvc` clean and `cargo clippy -j4 --offline
+--lib --target x86_64-pc-windows-msvc -- -D warnings` clean;
+`cargo test --no-run --lib --target x86_64-pc-windows-msvc` compiled every
+Windows test body and stopped only at the absent MSVC `link.exe`. The Windows
+tests themselves have not run here.
+
+## Windows port P1 — resource slice: metrics, freeze/unfreeze, collapse, fsfreeze (2026-11-04)
+
+The remaining five REST resource operations are now served by the Windows
+daemon. `src/platform/windows/metrics.rs` implements `WindowsCollector` on the
+shared `Metrics`/`CpuTimes`/`disk_usage` code: `GetSystemTimes` for the CPU
+delta, `GetActiveProcessorCount` (with a `GetSystemInfo` fallback),
+`GlobalMemoryStatusEx` for memory, `GetPerformanceInfo().SystemCache *
+PageSize` for cache, and `GetDiskFreeSpaceExW` on the system volume. The four
+CPU hotplug fields are 0 (no CPU manager) and `oom_kills` is omitted.
+`src/platform/windows/collapse.rs` implements the shared `Collapser` with
+`SetProcessWorkingSetSizeEx`, `GetProcessHeaps`/`HeapCompact` and a
+`VirtualQuery` scan of committed private `PAGE_READWRITE` regions; it cannot
+migrate base pages, so `collapsed == alreadyHuge == 0` and
+`skipped == chunks`. `src/platform/windows/fsfreeze.rs` implements the shared
+`FsFreezer` by resolving the system volume and calling `FlushFileBuffers` on
+`\\.\C:`. `src/daemon_windows.rs` wires `GET /metrics`, `POST /collapse`,
+`POST /fsfreeze` and `POST /fsthaw` with the exact Linux wire contract (headers,
+newline framing, 204s, 500 envelopes, one shared fsfreeze semaphore with a
+request-bound freeze acquire and a detached thaw), and `/init` now decodes
+`thaw` and runs the generation-guarded thaw unless it is `"skip"`.
+
+Review hardening (same slice): the freeze backend now has the Linux ten-minute
+thaw watchdog — a sweep that suspended anything arms a generation-guarded
+backstop task, only a clean thaw disarms it, and a partially failed thaw keeps
+the unresolved thread records and the spawn gate so a retry resumes exactly
+what is left. `/init` registers its thaw as a detached task at the defer point
+(a dropped client still thaws it) and answers `X-Envd-Thaw: skip` when the
+thaw is withheld. `generation()` is taken under the freeze lock, so a freeze
+accepted just before `/init` is waited out instead of skipped. `preFrozen`
+counts pre-suspended processes rather than threads, a spawn-drain refusal
+reports the Linux `failed: 2` with zero walk counters, and a recycled tid is
+rejected by `GetProcessIdOfThread` before any resume. The spawn gate stores
+its drain permit instead of `mem::forget`ting it, fsfreeze handlers hold the
+request body until the response, and a failed volume resolution still names
+`%SystemDrive%` in the error text.
+
+Declared deviations: fsfreeze is a flush-only operation (no FIFREEZE write
+barrier and no VSS snapshot); fsthaw repeats the flush and is a no-op; collapse
+cannot produce or attribute huge pages; CPU hotplug metrics stay 0;
+`oom_kills` is absent; Win32 error text replaces Go errno text in 500
+envelopes; `X-Envd-Freeze-Audit` is not emitted (no cgroup observation); the
+clock-correction header was absent at this slice and is emitted now (see
+*loopback forwarding, the `/init` clock* below); volume flush requires
+system-volume write access (typically an elevated service account); and a
+crash while workloads are suspended leaves them frozen until reboot because
+the suspended-tid set is not persisted.
+
+New contract tests (in `src/daemon_windows/contract_tests.rs`) cover the
+twelve metrics fields/headers/newline and the absent `oom_kills`, the zero
+hotplug fields, the GET-only method matrix with auth precedence, the empty-500
+shape of a failed metrics sample, the six-field collapse shape and its token
+requirement, bodiless no-store fsfreeze/fsthaw 204s and their 500 envelopes,
+token enforcement, and `/init` thawing by default but not when `thaw: "skip"`
+(including its `X-Envd-Thaw: skip` header). New unit tests cover the shared
+CPU formula, region-window counting and cancellation, the volume-device
+mapping, the guarded thaw and freeze-lock serialization, the thaw watchdog,
+pre-frozen pid counting, and the tid-ownership check.
+
+Verification, Linux: see the status lines below. Verification, Windows
+(cross-compiled on this Linux host): `cargo check -j4 --offline --lib --bins
+--target x86_64-pc-windows-msvc` clean and `cargo clippy -j4 --offline --lib
+--target x86_64-pc-windows-msvc -- -D warnings` clean; `cargo test --no-run
+--lib --target x86_64-pc-windows-msvc` compiled every Windows test body and
+stopped only at the absent MSVC `link.exe`. The Windows tests themselves have
+not run here.
+
+Verification, Linux (this candidate): `cargo fmt --check` clean; `cargo check
+-j4 --offline --all-targets` clean; `cargo check -j4 --offline --lib --bins
+--target x86_64-pc-windows-msvc` clean; `cargo clippy -j4 --offline
+--all-targets -- -D warnings` clean; `cargo clippy -j4 --offline --lib
+--target x86_64-pc-windows-msvc -- -D warnings` clean; `cargo test -j4
+--offline` 817 passed / 0 failed (the 814 pre-slice Linux count plus the three
+`freeze_wire` tests already present in the uncommitted resource work).
+
+## Windows port P1 — process Connect slice (2026-11-04)
+
+The eight Process Connect procedures (`List`, `Start`, `Connect`,
+`StreamInput`, `SendInput`, `CloseStdin`, `Update`, `SendSignal`) are served
+on Windows by the same shared adapter as Linux, `src/rpc/process.rs`, over
+`WindowsProcessRuntime`. The runtime keeps the Linux registry, connect and
+30-second retention algorithms one-for-one: `CreateProcessW` creates the
+child suspended, assigns it to the sandbox Job used by hierarchy freeze first
+and then to a per-process `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job, registers
+it before the
+spawn-gate permit is released, queues the `StartEvent` before the readers
+start, and the supervisor synthesizes the terminal `EndEvent`, moves the entry
+to retained, and expires it. `src/daemon_windows.rs` owns `process_logger`
+(`Logger::none()`), implements `ProcessRpcState`, and adds
+`app_with_execution(state, runtime)` which merges
+`crate::rpc::process::router` with the filesystem router under the one
+`transport::rpc_service` fallback. `app()` builds and retains a single
+`WindowsProcessRuntime` from the service account (`current_user_name` +
+`USERPROFILE`), the `Configuration` defaults/environment and `PATH`, the
+sandbox `JobHandle`, and the workload registry shared with
+`WindowsResourceBackend::with_registry` (the sandbox `JobHandle` is attached
+with `with_job`), and wraps `process_logger` in the shared
+`logs::ProcessLogger` (`with_process_logs`), so the handler.go:599-605/:697-706
+lifecycle lines appear when a logger is configured; the resource backend and
+the runtime therefore share one registry, and a `/freeze` sweep sees started
+processes.
+When the runtime cannot be constructed (no Job, unresolvable service account,
+locked configuration), `app()` logs the reason and keeps the Connect router's
+404 `unimplemented` fallback instead of panicking. The existing gap test now
+targets an unknown procedure (`/process.Process/NotAProcedure`) because all
+declared procedures are served. `src/platform/windows/account.rs` already
+exposed `pub(crate) is_current_user` (the SID comparison the start check
+uses), so this slice consumes it without changes.
+
+Declared deviations: no `/bin/sh` wrapper (the request `cmd` is the
+executable, so shell syntax does not run); a missing executable is
+`invalid_argument` (400) rather than a child exiting 127; no
+`oom_score_adj`/`nice`/`ionice` wrapper; SIGTERM is best-effort
+`CTRL_BREAK_EVENT` (console), ETX 0x03 (ConPTY) or `WM_CLOSE`
+(GUI/no-console) followed by `TerminateProcess` after a 5 s grace; PTY bytes
+are ConPTY-encoded and `Update` truncates to `i16` and clamps below 1;
+signal deaths are synthesized as `exitCode -1`/`exited false` with
+`signal: killed`/`signal: terminated`, and a `STATUS_CONTROL_C_EXIT` exit
+maps to `signal: terminated`; a different-user start needs credentials that
+are not plumbed and is refused `failed_precondition` (unknown accounts remain
+the Linux 401); the sandbox Job is assigned first (the nesting root) and the
+per-process kill-on-close Job second, and a failure of either fails the start
+so hierarchy freeze cannot miss a live process; the per-process Job is
+terminated as soon as the direct child is reaped, which releases
+descendant-held stdio and lets `End` publish promptly (Linux leaves such a
+descendant running); the child environment is the shared
+`Environment::for_process` plus fixed Windows defaults, never the daemon's
+block, matching Linux `env_clear` so service credentials do not leak; NUL,
+empty and `=`-leading names are refused as `invalid_argument`; and there is no
+live-upgrade adoption (`export_processes`/`readopt_processes` are absent). The
+complete list is in `docs/windows-port.md` §4.2. **Windows behaviour is
+contract-tested, not differentially verified** — no Windows oracle exists.
+
+New contract tests (in `src/daemon_windows/contract_tests/process.rs`) drive a
+real loopback listener over the production `app()`: Start→Data→End for a real
+`cmd.exe` child with stdout/stderr/exit 7 and no live List entry; List config,
+tag and Windows-pid echo; Connect attach without output replay and retained
+exits by pid and tag; selector refusals for all five procedures plus the
+unset-selector text; missing-cwd and unknown-Basic-user errors with List
+staying empty; stdin/PTY channel rules and the absent-input text; StreamInput
+ordering and Go wrappers; CloseStdin idempotence and the PTY rejection;
+Update no-op/non-PTY/after-exit paths and a live ConPTY resize; SIGKILL and
+SIGTERM end synthesis; invalid signal names; keepalive at the request-header
+interval; PTY-only data events with a retained exit after ConPTY close; the
+different-user `failed_precondition`; Job kill-on-close descendant reaping
+with a prompt-`End` assertion; a >2 MiB PTY burst before close reaching `End`;
+SIGTERM served while a blocked PTY writer holds the input path; the
+`connect-timeout-ms` execution deadline (`signal: killed`, List empty); and a
+ConPTY resize verified through `mode con`'s reported columns. Runtime-level
+tests in `process/mod.rs` exercise the retained window and tag-reuse pruning
+through a shortened test retention, avoiding a 30 s real-time wait. New unit
+tests cover the closed-pipe `FailedPrecondition` classification (`pipe.rs`),
+`CommandLineToArgvW` round-trip quoting, NUL rejection and environment-name
+validation (`spawn.rs`, adding the `Win32_UI_Shell` feature; no new crate and
+no lockfile change). These tests only run on a Windows host; the Linux suite
+does not compile them.
+
+Verification, Linux (this candidate): `cargo fmt --check` clean; `cargo check
+-j4 --offline --all-targets` clean; `cargo check -j4 --offline --lib --bins
+--target x86_64-pc-windows-msvc` clean; `cargo clippy -j4 --offline
+--all-targets -- -D warnings` clean; `cargo clippy -j4 --offline --lib
+--target x86_64-pc-windows-msvc -- -D warnings` clean; `cargo test -j4
+--offline` 817 passed / 0 failed. Verification, Windows (cross-compiled on
+this Linux host): `cargo test --no-run --lib --target
+x86_64-pc-windows-msvc` compiled every Windows test body and stopped only at
+the absent MSVC `link.exe`. The Windows tests themselves have not run here.
+
+## Windows port P3 — entry point, SCM lifecycle and `POST /upgrade` (2026-11-04)
+
+The Windows daemon now has a real entry point and serves every REST operation.
+`src/platform/windows/entry.rs` (library-side, because the handover seams are
+crate-internal; `src/main.rs` calls `entry::run()` on Windows) parses the
+shared CLI, guards `E2B_REEXEC_HELPER`, runs the boot guard
+(`src/platform/windows/boot.rs`: SCM service is a guest by construction,
+console requires `COORWORKER_ENVD=1`, `--resume-handover` is a guest by
+construction, development must be loopback and non-SYSTEM), and serves through
+the shared `http1::serve_gated` with an accept gate. A process the SCM did not
+start falls back from `StartServiceCtrlDispatcherW` error 1063 to console
+mode. Service and console guests keep the oracle's `0.0.0.0:49983` default;
+development keeps the loopback-ephemeral default. Missing standard handles are
+pointed at NUL before any diagnostic (Rust's `println!` panics on a failed
+write, and the successor inherits no std handles), and console-less processes
+report through the event log (`src/platform/windows/log.rs`).
+
+`src/platform/windows/service.rs` implements the SCM contract:
+`StartServiceCtrlDispatcherW`, `RegisterServiceCtrlHandlerExW`, and the
+START_PENDING → RUNNING → STOP_PENDING → STOPPED transitions. STOP and
+SHUTDOWN flip the serve shutdown watch; INTERROGATE re-reports the current
+state; the serve future runs on a multi-thread runtime built inside
+`ServiceMain`, so a console fallback never shares or leaks one.
+
+`POST /upgrade` is served by the shared front half; the Windows choreography
+freezes the workload with the strict `freeze_workload_hold(2 s)` (the permit
+is held across the handover), exports the retention cache and exec context
+into the pinned Linux-identical blob under `%ProgramData%\e2b\`, writes an
+`ENVDWIN1` sidecar (duplicated socket, readiness pipe, empty process table),
+spawns the successor suspended with `CreateProcessW` +
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` + `WSADuplicateSocketW`, waits for 'S',
+closes the accept gate, waits for 'R', reports `SERVICE_STOPPED` in service
+mode, and exits 0 without an HTTP response. Failures before 'R' terminate the
+unconfirmed successor, delete the sidecar, re-open the gate, drop the freeze
+hold and thaw, leaving the old envd serving and the request answering 500.
+`src/platform/windows/handover.rs` owns the sidecar format, adoption
+(`WSAStartup`/`WSASocketW`) and the successor spawn; the pinned blob is
+unchanged, so the Linux schema gate still applies.
+
+Declared deviations are listed in `docs/windows-port.md` §8.3: no live
+process/watcher/mount carry (per-process kill-on-close Jobs end children at
+the outgoing process's exit), a successor PID separate from the parent's, a
+successor that is not SCM-registered, a two-phase readiness handshake instead
+of `execve`, best-effort removal of the renamed predecessor image, and
+thread-suspension freezing. **Windows behaviour is contract evidence only; no
+differential claim.**
+
+New unit tests cover the boot guard's four modes, the SCM transitions and
+control handling, the event-log severity mapping, and the sidecar
+round-trip/refusal and command-line quoting. Windows tests cannot run on this
+Linux host.
+
+Verification, Linux (this candidate): `cargo fmt --check` clean; `cargo check
+-j4 --offline --all-targets` clean; `cargo check -j4 --offline --target
+x86_64-pc-windows-msvc --lib --bins` clean; `cargo clippy -j4 --offline
+--all-targets -- -D warnings` clean; `cargo clippy -j4 --offline --target
+x86_64-pc-windows-msvc --lib --bins -- -D warnings` clean; `cargo test -j4
+--offline` 818 passed / 0 failed. Verification, Windows (cross-compiled):
+`cargo test --no-run --lib --target x86_64-pc-windows-msvc` compiled every
+Windows test body and stopped only at the absent MSVC `link.exe`. The Windows
+tests themselves have not run here.
+
+## Windows port P1 — native guest validation and four runtime fixes (2026-11-04)
+
+The Windows library suite ran natively for the first time, inside a Windows 11
+guest (interactive session, `cargo test -j4 --lib -- --test-threads=1`,
+`PROTOC` set): 275 passed / 0 failed, twice in a row. Until now these tests
+only compiled for `x86_64-pc-windows-msvc` on the Linux host; the run found
+four defects that cross-compilation cannot see.
+
+`ReadDirectoryChangesW` on an `FILE_FLAG_OVERLAPPED` directory handle returns
+nonzero when the request is queued, not completed, and `lpBytesReturned` is
+undefined until the completion arrives. The watcher read the count
+immediately, so every refresh ended in `ERROR_IO_INCOMPLETE` (996). It now
+waits on the stop event and the overlapped event and then reads the count with
+`GetOverlappedResult`; the seven watcher contract tests pass.
+
+`seckey`'s non-Unix fallback toggles the token page between `PAGE_NOACCESS`
+and `PAGE_READONLY` around every borrow, and `VirtualProtect` to
+`PAGE_NOACCESS` drops the page's `VirtualLock`, so the later `VirtualUnlock`
+reports `ERROR_NOT_LOCKED` and `region`'s `LockGuard::drop` panics. Windows
+now keeps a fixed `Box<[u8]>` token buffer whose protection never changes,
+locked once through the refcounted `PageLocks` registry.
+
+A pseudoconsole child created without an explicit standard-handle triple
+inherits the daemon's redirected handles. The PTY stream then carried only
+conhost's 86-byte init sequence and every child byte landed in the daemon's
+stdout — verified directly: `echo X` reached the caller's log,
+`echo X>CONOUT$` reached the stream, and `mode con` reported the caller's
+console. PTY children are now created with `STARTF_USESTDHANDLES` and
+`INVALID_HANDLE_VALUE` for all three handles, so conhost's console handles are
+used; `mode con` then reports the requested size and the 2 MiB PTY-output
+contract test passes.
+
+`mode con` is localized (the guest prints 行/列), so the resize contract test
+parsed nothing on a zh-CN guest. It now reads the report structurally — the
+first two `<label>: <number>` pairs are the line and column counts — and
+asserts `[40, 100]` after the `Update`. Two smaller fixes came out of the same
+run: the "vanished pid" tests use a never-existing pid (`u32::MAX - 3`)
+instead of a recycled one, and a Ctrl-Break delivered while the child is still
+in loader initialization aborts it with `STATUS_DLL_INIT_FAILED`
+(`0xC0000142`) rather than `STATUS_CONTROL_C_EXIT`. The end synthesis maps
+that code to `signal: terminated` only when a Term signal was accepted for
+that child; an unsolicited loader failure keeps its raw exit status. The
+SIGTERM contract test passed in both full runs after this change.
+
+Declared deviations (also in `docs/windows-port.md`): the Windows token buffer
+keeps one protection instead of `seckey`'s protection toggling, and a Term
+that lands during loader initialization is reported as `signal: terminated`
+although the child exits with `STATUS_DLL_INIT_FAILED`. **Windows behaviour is
+contract evidence only; no differential claim.**
+
+## Windows port P1 — loopback forwarding, the `/init` clock, and two native defeats (2026-11-04)
+
+The last two platform slices are in. The loopback port forwarder is an
+in-process Tokio proxy behind the oracle's scan/refresh state machine
+(`docs/windows-port.md` §6.1), and `/init` now decodes `timestamp` with the
+oracle's raw-bytes rules, corrects it by the handler delay, gates it
+newest-wins, and steps the guest clock with `SetSystemTime` (§6.2). Both ride
+shared code: `src/platform/port/` is the scan both daemons use, and
+`src/clock.rs` is the whole correction contract, with only the step sink
+platform-specific.
+
+The native Windows 11 guest runs (`cargo test -j4 --lib --
+--test-threads=1`) found two defects that neither the Linux host nor a
+cross-compiled type-check could see:
+
+The `SYSTEMTIME` conversion divided the sub-second tick remainder by 10
+instead of 10 000, so every clock step carried a bogus millisecond field —
+`123` ms arrived as `57920` after the `u16` cast. The conversion now divides
+by `TICKS_PER_MILLISECOND`; the known-instant and pre-epoch unit tests pin
+the field.
+
+The `/init` decoder walked a `serde_json::Value`, which decodes JSON escapes
+before the timestamp parse. Go hands `time.Time` and `SecureToken` the raw
+bytes of their value, so a body the oracle answers 400 for — an escaped
+timestamp, an escaped token — was accepted here with 204. The decoder now
+captures those two members from the raw body, accepts a literal `null` body
+as the zero struct the way Go does, and type-checks the Go-typed fields it
+ignores (`cpuCount`, `volumeMounts`, `caBundle`, `hyperloopIP`,
+`lifecycleID`), so a body Go rejects is a 400 on Windows too. The new
+contract tests pin both rules.
+
+One native flake was fixed as well:
+`process_stream_input_orders_selection_and_reports_go_wrappers` started
+`more`, closed its stdin and immediately asserted the input rules; `more`
+exits on the closed stdin and can be reaped first, so a run answered
+`not_found` instead of the input errors. The child is now `ping -n 3`, which
+outlives the round trips and still ends with the expected exit code.
+
+Verification, Windows (native guest, twice back to back): 305 passed /
+0 failed in both runs, exit 0. Verification, Linux (this candidate):
+`cargo fmt --check` clean; `cargo check --locked --all-targets` clean;
+Windows target `cargo check`/`clippy -D warnings` on `--lib --bins` clean;
+`cargo clippy --all-targets -D warnings` clean; `cargo test -j4 --offline`
+819 passed / 0 failed; `python3 scripts/generate_notices.py --check` matches
+the locked graph. **Windows behaviour is contract evidence only; no
+differential claim.**

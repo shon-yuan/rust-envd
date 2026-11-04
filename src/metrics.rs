@@ -1,11 +1,16 @@
-//! Read-only Linux metrics matching E2B envd runtime 51083a83 and gopsutil v4.26.6.
+//! Read-only metrics matching E2B envd runtime 51083a83 and gopsutil v4.26.6.
 //!
-//! Formula provenance: envd/internal/host/metrics.go and gopsutil cpu/cpu.go,
-//! cpu/cpu_linux.go, mem/mem_linux.go at the pinned versions above. CPU state is
-//! per collector (initialized at construction), never a process-global counter.
+//! The wire struct ([`Metrics`]), the CPU status, and the shared CPU/disk
+//! arithmetic are platform-neutral so both the Linux collector below and the
+//! Windows collector can produce byte-identical values. Formula provenance:
+//! envd/internal/host/metrics.go and gopsutil cpu/cpu.go, cpu/cpu_linux.go,
+//! mem/mem_linux.go at the pinned versions above. CPU state is per collector
+//! (initialized at construction), never a process-global counter.
 
+#[cfg(target_os = "linux")]
 use nix::sys::statfs::statfs;
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use std::{collections::HashMap, fs, io, path::PathBuf, time::SystemTime};
 
 /// Status supplied by the CPU manager. Outside Firecracker every field is zero.
@@ -15,6 +20,15 @@ pub struct CpuStatus {
     pub target: u32,
     pub attempts: u32,
     pub write_pending_ms: u64,
+}
+
+/// One OOM kill as the oracle reports it (internal/host/oom.go). Shared so the
+/// metrics wire layer can name it on every platform; only the Linux watcher
+/// produces values today.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OomKill {
+    pub seq: i64,
+    pub process: String,
 }
 
 /// The official JSON shape. OOM kills are omitted until a watcher can supply them.
@@ -49,18 +63,21 @@ fn go_float32<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok,
 }
 
 /// Read roots, injectable without changing environment variables or host files.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 pub struct MetricPaths {
     pub proc_root: PathBuf,
     pub disk_root: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct Collector {
     paths: MetricPaths,
     previous: CpuTimes,
 }
 
+#[cfg(target_os = "linux")]
 impl Collector {
     /// Capture the aggregate CPU baseline at daemon startup.
     pub fn new() -> io::Result<Self> {
@@ -109,14 +126,19 @@ impl Collector {
     }
 }
 
+// Shared with the Windows collector (next slice); unused on Windows until it
+// lands, so the dead-code lint is silenced there rather than hiding real dead
+// code on Linux.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
-struct CpuTimes {
-    total: f64,
-    busy: f64,
+pub(crate) struct CpuTimes {
+    pub(crate) total: f64,
+    pub(crate) busy: f64,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl CpuTimes {
-    fn percent(self, current: Self) -> f64 {
+    pub(crate) fn percent(self, current: Self) -> f64 {
         if current.busy <= self.busy {
             return 0.0;
         }
@@ -127,16 +149,19 @@ impl CpuTimes {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+#[cfg(target_os = "linux")]
 fn read_proc(paths: &MetricPaths, name: &str) -> io::Result<String> {
     let path = paths.proc_root.join(name);
     fs::read_to_string(&path)
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
+#[cfg(target_os = "linux")]
 fn system_constant(name: nix::libc::c_int, fallback: u64) -> u64 {
     // SAFETY: sysconf only reads a process/system constant and takes no pointers.
     let value = unsafe { nix::libc::sysconf(name) };
@@ -146,6 +171,7 @@ fn system_constant(name: nix::libc::c_int, fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
+#[cfg(target_os = "linux")]
 fn read_cpu_times(paths: &MetricPaths) -> io::Result<CpuTimes> {
     let stat = read_proc(paths, "stat")?;
     let fields: Vec<_> = stat
@@ -179,6 +205,7 @@ fn read_cpu_times(paths: &MetricPaths) -> io::Result<CpuTimes> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn logical_cpu_count(paths: &MetricPaths) -> io::Result<u32> {
     let count = match read_proc(paths, "cpuinfo") {
         Ok(text) => text
@@ -209,6 +236,7 @@ fn logical_cpu_count(paths: &MetricPaths) -> io::Result<u32> {
     u32::try_from(count).map_err(|_| invalid("logical cpu count exceeds uint32"))
 }
 
+#[cfg(target_os = "linux")]
 struct Memory {
     total: u64,
     available: u64,
@@ -217,6 +245,7 @@ struct Memory {
 
 // gopsutil validates all recognized meminfo numbers, even fields not returned by
 // envd. Unknown kernel extensions are ignored. HugePages counts are not in KiB.
+#[cfg(target_os = "linux")]
 const MEMORY_KEYS: &[&str] = &[
     "MemTotal",
     "MemFree",
@@ -261,6 +290,7 @@ const MEMORY_KEYS: &[&str] = &[
     "AnonHugePages",
 ];
 
+#[cfg(target_os = "linux")]
 fn read_memory(paths: &MetricPaths) -> io::Result<Memory> {
     let text = read_proc(paths, "meminfo")?;
     let mut values = HashMap::new();
@@ -307,6 +337,7 @@ fn read_memory(paths: &MetricPaths) -> io::Result<Memory> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn legacy_available(
     paths: &MetricPaths,
     free: u64,
@@ -341,6 +372,7 @@ fn legacy_available(
         )
 }
 
+#[cfg(target_os = "linux")]
 fn read_disk(paths: &MetricPaths) -> io::Result<(u64, u64)> {
     let stat = statfs(&paths.disk_root).map_err(io::Error::from)?;
     Ok(disk_usage(
@@ -350,7 +382,8 @@ fn read_disk(paths: &MetricPaths) -> io::Result<(u64, u64)> {
     ))
 }
 
-fn disk_usage(blocks: u64, available_blocks: u64, block_size: u64) -> (u64, u64) {
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn disk_usage(blocks: u64, available_blocks: u64, block_size: u64) -> (u64, u64) {
     let total = blocks.wrapping_mul(block_size);
     let available = available_blocks.wrapping_mul(block_size);
     (total, total.wrapping_sub(available))

@@ -58,13 +58,58 @@ pub async fn serve(
     app: Router,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    serve_gated(listener, app, shutdown, AcceptGate::always_open()).await
+}
+
+/// Controls whether [`serve_gated`] accepts new connections. In-flight
+/// connections are never touched: closing the gate pauses the accept loop and
+/// keeps the listener and every established connection alive, so the handover
+/// can stop accepting from a shared backlog without dropping clients that are
+/// already being served.
+pub struct AcceptGate {
+    open: watch::Receiver<bool>,
+}
+
+impl AcceptGate {
+    /// A gate that is never closed (the Linux behaviour).
+    pub fn always_open() -> Self {
+        let (send, open) = watch::channel(true);
+        drop(send);
+        Self { open }
+    }
+
+    /// A gate the caller opens and closes through the returned sender. The
+    /// initial state applies until the first send.
+    pub fn channel(initial: bool) -> (watch::Sender<bool>, Self) {
+        let (send, open) = watch::channel(initial);
+        (send, Self { open })
+    }
+
+    pub fn is_open(&self) -> bool {
+        *self.open.borrow()
+    }
+}
+
+/// [`serve`] with an accept gate. Linux passes an always-open gate, so its
+/// behaviour is unchanged; a Windows handover closes the gate when the
+/// successor starts serving from the inherited listener.
+pub async fn serve_gated(
+    listener: TcpListener,
+    app: Router,
+    shutdown: impl Future<Output = ()>,
+    gate: AcceptGate,
+) -> io::Result<()> {
     tokio::pin!(shutdown);
     let (stop, _) = watch::channel(false);
     let mut connections: JoinSet<()> = JoinSet::new();
+    // A clone for the change future keeps the gate readable in its branch.
+    let mut observer = gate.open.clone();
+    let mut accepting = gate.is_open();
+    let mut gate_watched = true;
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
-            accepted = accept(&listener) => {
+            accepted = accept(&listener), if accepting => {
                 let (stream, _) = accepted?;
                 configure_accepted(&stream);
                 let shared = Arc::new(Mutex::new(None));
@@ -74,6 +119,12 @@ pub async fn serve(
                     stop.subscribe(),
                     shared,
                 ));
+            }
+            _ = observer.changed(), if gate_watched => {
+                accepting = gate.is_open();
+                // A dropped sender means no further transitions are coming;
+                // stop polling rather than spinning on the closed channel.
+                gate_watched = observer.has_changed().is_ok();
             }
             _ = connections.join_next(), if !connections.is_empty() => {}
         }

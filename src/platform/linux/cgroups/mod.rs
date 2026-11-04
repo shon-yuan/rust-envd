@@ -20,7 +20,6 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// Oracle iface.go:57-61. `System` stays in envd's root cgroup and is
 /// deliberately never registered, so it is unaffected by any freeze.
@@ -53,14 +52,11 @@ impl fmt::Display for ProcessType {
 /// spawns the barrier guards.
 pub const WORKLOAD_PROCESS_TYPES: [ProcessType; 2] = [ProcessType::User, ProcessType::Pty];
 
-/// Oracle freeze.go:82: the cap every whole-tree walk (the thaw discovery, the
-/// guest-freeze scan, the resume audit) is bounded by.
-pub const DEFAULT_THAW_MAX_CGROUPS: usize = 8192;
-/// Oracle freeze.go:94: the freeze sweep's own default bound.
-pub const DEFAULT_FREEZE_MAX_CGROUPS: usize = 512;
-/// Oracle freeze.go:66: the backstop window, measured in guest monotonic time
-/// so a paused VM's freeze is backed up once it resumes.
-pub const DEFAULT_THAW_WATCHDOG_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// Oracle freeze.go:82 / :94. The values live in the platform-neutral wire
+/// module (shared with Windows) and are re-exported at the historical paths.
+pub use crate::freeze_wire::{
+    DEFAULT_FREEZE_MAX_CGROUPS, DEFAULT_THAW_MAX_CGROUPS, DEFAULT_THAW_WATCHDOG_WINDOW,
+};
 
 /// Oracle iface.go:9-15 plus the errors the v2 manager surfaces. `Io` keeps
 /// the raw error so [`vanished`] can classify exactly the two errnos a removal
