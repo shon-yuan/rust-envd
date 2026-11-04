@@ -419,7 +419,12 @@ async fn serve(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         });
         daemon.set_upgrade_run(run);
     }
-    let extensions = match coorworker_envd::ext::cua::CuaExtension::from_env().await {
+    let extensions = match coorworker_envd::ext::cua::CuaExtension::from_env_with_context(
+        coorworker_envd::http::ConfigurationState::configuration(daemon.as_ref()).clone(),
+        coorworker_envd::ext::cua::LaunchContext::DesktopSession,
+    )
+    .await
+    {
         Some(extension) => {
             let extension: std::sync::Arc<dyn coorworker_envd::ext::Extension> =
                 std::sync::Arc::new(extension);

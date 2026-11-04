@@ -2,7 +2,7 @@
 """Generate the distributable dependency notice bundle for rust-envd.
 
 Enumerates every locked package in the dependency graph (via
-`cargo metadata --locked --offline`, falling back to Cargo.lock plus the
+`cargo metadata --locked --offline --all-features`, falling back to Cargo.lock plus the
 local cargo registry when metadata is unavailable), copies each crate's
 license files verbatim into third_party/licenses/<crate>-<version>/ and
 writes third_party/NOTICES.md.
@@ -93,7 +93,7 @@ def cargo_metadata_packages(repo: Path) -> tuple[list[dict], dict, str] | None:
     """Enumerate locked packages via cargo metadata. Returns None on failure."""
     try:
         proc = subprocess.run(
-            ["cargo", "metadata", "--locked", "--offline", "--format-version", "1"],
+            ["cargo", "metadata", "--locked", "--offline", "--all-features", "--format-version", "1"],
             cwd=str(repo),
             capture_output=True,
             check=True,
@@ -120,7 +120,7 @@ def cargo_metadata_packages(repo: Path) -> tuple[list[dict], dict, str] | None:
     if not root:
         fail("cargo metadata returned no workspace root package")
         sys.exit(1)
-    return pkgs, root, "cargo metadata --locked --offline"
+    return pkgs, root, "cargo metadata --locked --offline --all-features"
 
 
 def _toml_bytes_for(pkg: dict) -> bytes | None:
@@ -141,6 +141,59 @@ def _toml_bytes_for(pkg: dict) -> bytes | None:
     return None
 
 
+def dependency_paths(table: dict):
+    """Walk dependency/target/patch tables, including optional path crates."""
+    for value in table.values():
+        if not isinstance(value, dict):
+            continue
+        if isinstance(value.get("path"), str):
+            yield value["path"]
+        yield from dependency_paths(value)
+
+
+def local_packages(repo: Path) -> dict[tuple[str, str], dict]:
+    """Resolve source-less lock entries from reachable local manifests.
+
+    Reading declared paths avoids mistaking first-party crates for registry
+    packages or silently dropping vendored crates when metadata is unavailable.
+    """
+    packages = {}
+    pending = [repo.resolve()]
+    visited = set()
+    while pending:
+        directory = pending.pop()
+        if directory in visited:
+            continue
+        visited.add(directory)
+        manifest = tomllib.loads((directory / "Cargo.toml").read_text())
+        section = dict(manifest.get("package", {}))
+        for key, value in section.items():
+            if not isinstance(value, dict) or not value.get("workspace"):
+                continue
+            for ancestor in directory.parents:
+                workspace_manifest = ancestor / "Cargo.toml"
+                if not workspace_manifest.is_file():
+                    continue
+                workspace = tomllib.loads(workspace_manifest.read_text()).get("workspace", {})
+                if key in workspace.get("package", {}):
+                    section[key] = workspace["package"][key]
+                    break
+        if "name" in section:
+            entry = {
+                "name": section["name"], "version": str(section["version"]),
+                "license": section.get("license"),
+                "license_file": section.get("license-file"),
+                "repository": section.get("repository") or section.get("homepage"),
+                "manifest_dir": directory, "src_dir": directory, "tarball": None,
+            }
+            packages[(entry["name"], entry["version"])] = entry
+        for path in dependency_paths(manifest):
+            dependency = (directory / path).resolve()
+            if (dependency / "Cargo.toml").is_file():
+                pending.append(dependency)
+    return packages
+
+
 def lockfile_packages(repo: Path) -> tuple[list[dict], dict, str]:
     """Fallback: enumerate Cargo.lock via tomllib + the local cargo registry."""
     lock = repo / "Cargo.lock"
@@ -151,28 +204,28 @@ def lockfile_packages(repo: Path) -> tuple[list[dict], dict, str]:
         fail(f"cannot parse {lock}: {exc}")
         sys.exit(1)
 
-    root_toml = repo / "Cargo.toml"
     try:
-        with open(root_toml, "rb") as fh:
-            root_manifest = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        fail(f"cannot parse {root_toml}: {exc}")
+        local = local_packages(repo)
+    except (OSError, tomllib.TOMLDecodeError, KeyError) as exc:
+        fail(f"cannot resolve local package manifests: {exc}")
         sys.exit(1)
-    root = {
-        "name": root_manifest.get("package", {}).get("name", "(unknown)"),
-        "version": str(root_manifest.get("package", {}).get("version", "?")),
-        "license": root_manifest.get("package", {}).get("license"),
-        "license_file": root_manifest.get("package", {}).get("license_file"),
-        "repository": root_manifest.get("package", {}).get("repository"),
-        "src_dir": repo,
-        "tarball": None,
-    }
+    root = next((p for p in local.values() if p["manifest_dir"] == repo.resolve()), None)
+    if root is None:
+        fail(f"no root package in {repo / 'Cargo.toml'}")
+        sys.exit(1)
 
     pkgs: list[dict] = []
     for p in data.get("package", []):
-        if not p.get("source"):
-            continue  # workspace member(s), already covered by root
         name, version = p["name"], p["version"]
+        if not p.get("source"):
+            if (name, version) == (root["name"], root["version"]):
+                continue
+            entry = local.get((name, version))
+            if entry is None:
+                fail(f"cannot resolve locked path package {name}-{version}; bundle not written")
+                sys.exit(1)
+            pkgs.append(entry)
+            continue
         pkgs.append(
             {
                 "name": name,
@@ -420,10 +473,15 @@ def generate(
         fill_license_fields(pkgs)
 
     collector = Collector()
-    canonical = build_canonical_index(pkgs)
+    first_party = [pkg for pkg in pkgs if is_first_party(repo, pkg)]
+    third_party = [pkg for pkg in pkgs if not is_first_party(repo, pkg)]
+    canonical = build_canonical_index(third_party)
     collected = []
-    for pkg in sorted(pkgs, key=lambda p: (p["name"].lower(), p["version"])):
+    for pkg in sorted(third_party, key=lambda p: (p["name"].lower(), p["version"])):
         crate = f"{pkg['name']}-{pkg['version']}"
+        if any(restricted in (pkg["license"] or "").upper() for restricted in ("AGPL", "FSL")):
+            collector.add(crate, "AGPL/FSL components must not be shipped or linked")
+            continue
         if not pkg["license"] and not pkg["license_file"]:
             collector.add(
                 crate,
@@ -479,6 +537,7 @@ def generate(
         root_label=root_label,
         license_link=license_link,
         vendored_kind=vendored_kind,
+        first_party=first_party,
     )
     tree: dict[str, bytes] = {NOTICES_NAME: text.encode("utf-8")}
     for pkg, files, _synthetic in collected:
@@ -488,19 +547,35 @@ def generate(
     return text, tree, len(pkgs) + 1, len(collected)
 
 
+def local_path(repo: Path, pkg: dict) -> str | None:
+    directory = pkg.get("manifest_dir")
+    if directory is None:
+        return None
+    try:
+        return directory.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def is_first_party(repo: Path, pkg: dict) -> bool:
+    """Only the known project library shares the root MIT notice.
+
+    An arbitrary in-repo path must retain its own third-party attribution.
+    """
+    return (
+        local_path(repo, pkg) == "cua-worker"
+        and pkg["name"] == "coorworker-cua"
+        and pkg.get("license") == "MIT"
+    )
+
+
 def vendored_forks(repo: Path, collected: list[tuple[dict, dict, dict]]) -> list[tuple[str, dict]]:
-    """Packages resolved from an in-tree path (not crates.io)."""
-    root = repo.resolve()
+    """Upstream packages resolved under vendor/, excluding project libraries."""
     forks: list[tuple[str, dict]] = []
     for pkg, _files, _synthetic in collected:
-        directory = pkg.get("manifest_dir")
-        if directory is None:
-            continue
-        try:
-            relative = directory.resolve().relative_to(root)
-        except ValueError:
-            continue
-        forks.append((relative.as_posix(), pkg))
+        relative = local_path(repo, pkg)
+        if relative is not None and relative.startswith("vendor/"):
+            forks.append((relative, pkg))
     return forks
 
 
@@ -516,6 +591,7 @@ def render_notices(
     root_label: str,
     license_link: str,
     vendored_kind: str,
+    first_party: list[dict],
 ) -> str:
     own_copyright = ""
     lic = repo / "LICENSE"
@@ -555,6 +631,14 @@ def render_notices(
     if own_copyright:
         add(f"{own_copyright}")
         add("")
+    for pkg in sorted(first_party, key=lambda p: (p["name"], p["version"])):
+        add(
+            f"The project library `{pkg['name']}` {pkg['version']} in"
+            f" `{local_path(repo, pkg)}/` is also covered by the project's"
+            f" MIT License ([`LICENSE`]({license_link})). It is not a"
+            " vendored upstream crate."
+        )
+        add("")
     if vendored_kind != "cua":
         add("## Vendored upstream schemas (Apache-2.0)")
         add("")
@@ -580,20 +664,23 @@ def render_notices(
         )
         add("")
     forks = vendored_forks(repo, collected)
-    if vendored_kind == "cua":
+    cua = [(path, pkg) for path, pkg in forks if path.startswith("vendor/cua-driver/")]
+    patches = [(path, pkg) for path, pkg in forks if not path.startswith("vendor/cua-driver/")]
+    if cua:
         add("## Vendored Cua Driver crates")
         add("")
         add(
             "`vendor/cua-driver/` carries the MIT-licensed Cua Driver crates"
-            " used by the optional `coorworker-cua` worker, copied"
-            " byte-for-byte from a pinned upstream commit. Provenance, the"
-            " vendored list, and the deliberately excluded AGPL/FSL"
+            " used by the standalone `coorworker-cua` worker and the daemon's"
+            " optional `cua-desktop` feature. The pinned upstream commit,"
+            " local changes, vendored list, and deliberately excluded AGPL/FSL"
             " components are recorded in `vendor/cua-driver/PROVENANCE.md`."
+            " Those excluded components must not be shipped or linked."
             " Covered distributions must include that file and the license"
             " texts enumerated below."
         )
         add("")
-        for relative, pkg in forks:
+        for relative, pkg in cua:
             crate = f"{pkg['name']}-{pkg['version']}"
             add(
                 f"`{relative}/` is a vendored upstream crate `{pkg['name']}`"
@@ -602,17 +689,17 @@ def render_notices(
                 " also indexed below."
             )
             add("")
-    else:
+    if patches or vendored_kind != "cua":
         add("## Vendored Rust crate forks")
         add("")
-        if not forks:
+        if not patches:
             add(
                 "No in-tree crate forks are resolved by the current lockfile; this"
                 " section becomes active when a `[patch.crates-io]` path"
                 " dependency is present."
             )
             add("")
-        for relative, pkg in forks:
+        for relative, pkg in patches:
             crate = f"{pkg['name']}-{pkg['version']}"
             add(
                 f"`{relative}/` is an in-tree fork of crates.io `{pkg['name']}`"
@@ -775,18 +862,22 @@ def check_bundle(base: Path, tree: dict[str, bytes], label: str) -> int:
 
 MAIN_SCOPE = (
     "These notices cover every distribution built from this repository:"
-    " the linked `envd` daemon binaries produced from this crate, and any"
-    " guest or sandbox image that embeds such a binary. Distributing a"
+    " the linked `envd` daemon binaries produced from this crate, including"
+    " the optional `cua-desktop` variant, and any guest or sandbox image"
+    " that embeds such a binary. The dependency graph is a superset of all"
+    " root features and target platforms; the default base binary remains"
+    " desktop-free. Distributing a"
     " covered distribution requires reproducing this file, the"
     " `licenses/` tree, and the files called out in"
     " [`PACKAGING.md`](PACKAGING.md)."
 )
 WORKER_SCOPE = (
     "These notices cover the `coorworker-cua` worker binary built from"
-    " `cua-worker/`, a separate package with its own lockfile that rust-envd"
-    " supervises but does not link. Distributing the worker requires"
-    " reproducing this file and the `licenses/` tree beside it; the daemon's"
-    " bundle in `third_party/` is separate. Packaging steps are specified in"
+    " `cua-worker/`, a separate package with its own lockfile. The daemon can"
+    " supervise the standalone worker or link its library with `cua-desktop`."
+    " Distributing the worker requires reproducing this file and the"
+    " `licenses/` tree beside it; the daemon's bundle in `third_party/`"
+    " separately covers its embedded variant. Packaging steps are specified in"
     " [`../PACKAGING.md`](../PACKAGING.md)."
 )
 

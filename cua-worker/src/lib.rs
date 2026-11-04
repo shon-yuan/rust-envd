@@ -1,11 +1,9 @@
-//! The `cua` worker: Cua Driver's computer-use tool registry served as MCP
-//! over HTTP.
+//! Reusable Cua Driver MCP transport and desktop provider for rust-envd.
 //!
-//! This process is **not** the envd daemon and must not be linked into it.
-//! It owns the desktop stack (X11/AT-SPI on Linux, UI Automation on Windows),
-//! which is why rust-envd supervises it as a separate process: the daemon
-//! keeps its frozen protocol surface and its static guest build, while the
-//! `cua` extension supplies lifecycle, health, and a stable `/cua` namespace.
+//! [`mcp_router`] exposes only `/mcp` for in-process dispatch. [`app`] adds
+//! standalone worker health. The `desktop` feature (enabled by default for
+//! the worker) supplies `desktop_provider`; envd opts into that stack only
+//! in its `cua-desktop` distribution, preserving desktop-free base builds.
 //!
 //! Wire surface:
 //!
@@ -37,8 +35,9 @@ use subtle::ConstantTimeEq;
 
 /// Bearer-token check for the worker's HTTP surface.
 ///
-/// `Auth::disabled()` is valid only on a loopback bind; [`crate::main`]
-/// enforces that pairing.
+/// `Auth::disabled()` is valid for standalone workers only on a loopback bind;
+/// the binary enforces that pairing. Embedded callers enforce admission before
+/// dispatching to a router with authentication disabled.
 #[derive(Clone, Default)]
 pub struct Auth {
     token: Option<Vec<u8>>,
@@ -88,13 +87,35 @@ struct ServerState {
     auth: Auth,
 }
 
-/// Builds the worker router. The provider is Cua Driver's
-/// [`cua_driver_core::tool::ToolRegistry`] in production and a stub in tests.
+/// Builds the standalone worker router, including its health endpoint.
 pub fn app(provider: Arc<dyn ToolProvider>, auth: Auth) -> Router {
+    mcp_router(provider, auth).route("/health", get(health))
+}
+
+/// Builds only the MCP endpoint for reuse without a listener or health route.
+/// The provider is Cua Driver's [`cua_driver_core::tool::ToolRegistry`] in
+/// production and a stub in tests.
+pub fn mcp_router(provider: Arc<dyn ToolProvider>, auth: Auth) -> Router {
     Router::new()
-        .route("/health", get(health))
         .route("/mcp", post(mcp).get(method_not_allowed))
         .with_state(Arc::new(ServerState { provider, auth }))
+}
+
+/// Registers the native desktop tools for the current Linux or Windows session.
+#[cfg(feature = "desktop")]
+pub fn desktop_provider() -> Arc<dyn ToolProvider> {
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(platform_linux::register_tools())
+    }
+    #[cfg(windows)]
+    {
+        Arc::new(platform_windows::register_tools())
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        compile_error!("coorworker-cua supports Linux and Windows guests only");
+    }
 }
 
 async fn health() -> StatusCode {

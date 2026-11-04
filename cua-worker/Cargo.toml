@@ -6,10 +6,9 @@ license = "MIT"
 publish = false
 description = "Cua computer-use worker for rust-envd's cua extension"
 
-# A separate package on purpose: it links the desktop stack (X11/AT-SPI on
-# Linux, UI Automation on Windows), which the frozen envd daemon binary must
-# not carry. rust-envd supervises this process; the daemon's dependency graph
-# and its static guest build stay untouched.
+# The standalone worker enables the desktop stack by default. The envd daemon
+# opts into this library only for its cua-desktop distribution; base/static
+# daemon builds keep the desktop stack out of their activated dependency graph.
 [lib]
 name = "coorworker_cua"
 path = "src/lib.rs"
@@ -17,6 +16,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "coorworker-cua"
 path = "src/main.rs"
+required-features = ["desktop"]
+
+[[test]]
+name = "wayland_windows"
+path = "tests/wayland_windows.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:platform-linux", "dep:platform-windows"]
 
 [dependencies]
 async-trait = "0.1"
@@ -27,10 +36,10 @@ subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-platform-linux = { path = "../vendor/cua-driver/rust/crates/platform-linux" }
+platform-linux = { path = "../vendor/cua-driver/rust/crates/platform-linux", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-platform-windows = { path = "../vendor/cua-driver/rust/crates/platform-windows" }
+platform-windows = { path = "../vendor/cua-driver/rust/crates/platform-windows", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -10,6 +10,10 @@ python3 stdlib only. Fully offline except local git/cargo/rustc.
 Usage (from anywhere; the repository root is the parent of scripts/):
     python3 scripts/packaging_manifest.py --binary target/release/coorworker-envd
     python3 scripts/packaging_manifest.py --binary ... --output dist/manifest.json
+    python3 scripts/packaging_manifest.py --binary ... --artifact-kind desktop
+
+--artifact-kind and --target declare how the artifact was built; the script
+hashes the binary but does not infer its compiled features or target.
 
 A dirty working tree is refused unless --allow-dirty is passed (the manifest
 still records dirty=true in that case); distributable artifacts must be built
@@ -41,8 +45,8 @@ REQUIRED_FILES = (
     "vendor/hyper/PATCHES.md",
     "Cargo.toml",
     "Cargo.lock",
-    # The optional cua worker is a separate package with its own lockfile and
-    # notice bundle; a release that ships it carries both.
+    # The cua library is also linked by the desktop variant. Keep its manifest
+    # and standalone worker's locked notice bundle in the distribution superset.
     "third_party/cua-worker/NOTICES.md",
     "cua-worker/Cargo.toml",
     "cua-worker/Cargo.lock",
@@ -105,6 +109,10 @@ def main() -> int:
     parser.add_argument("--binary", required=True, help="built envd binary")
     parser.add_argument("--output", help="write the manifest here (default: stdout)")
     parser.add_argument(
+        "--artifact-kind", choices=("base", "desktop"), default="base",
+        help="built envd variant (default: base; desktop enables cua-desktop)",
+    )
+    parser.add_argument(
         "--target", help="rustc target triple the binary was built for"
     )
     parser.add_argument(
@@ -149,6 +157,7 @@ def main() -> int:
         )
 
     rustc = run("rustc", "-vV").splitlines()
+    features = ["cua-desktop"] if args.artifact_kind == "desktop" else []
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "generated_at": datetime.datetime.now(datetime.timezone.utc)
@@ -164,8 +173,11 @@ def main() -> int:
             "cargo": run("cargo", "--version"),
             "rustc": rustc[0] if rustc else "",
         },
+        "artifact_kind": args.artifact_kind,
+        "features": features,
         "target": args.target,
         "build_command": "cargo build --locked -j4 --release"
+        + (" --features " + ",".join(features) if features else "")
         + (f" --target {args.target}" if args.target else ""),
         "binary": file_record(binary),
         "covered_files": [file_record(REPO / name) for name in REQUIRED_FILES],

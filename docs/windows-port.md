@@ -13,6 +13,25 @@ This document scopes goal D: **a Windows guest sandbox that serves the complete
 existing envd API**, while the Linux daemon keeps its byte-level parity with the
 pinned Go oracle.
 
+## CUA desktop execution modes
+
+CUA is an additive interface, separate from the S0 contract evidence above.
+The default executable keeps desktop dependencies disabled. Build with
+`--features cua-desktop` and select `COORWORKER_CUA_MODE=embedded` to execute
+CUA inside envd in a known nonzero user session. It serves `/cua/mcp` using
+the current envd `/init` credential as Bearer; S0 keeps `X-Access-Token`.
+
+The service boot mode, including handover successors without an SCM handle,
+Session 0, and failed `ProcessIdToSessionId` lookup all refuse embedded
+initialization. Select `shared-external` for service deployments and start
+`coorworker-cua` in the target logged-in user's session. Supply matching local
+transport credentials through `CUA_ENV_TOKEN` or the helper's `--token-file`;
+clients use only the envd credential. No new user-session launcher, logon task,
+or credential-file ACL provisioning is included. Legacy mode remains available.
+See [extensions](extensions.md) for configuration, lifecycle, and limitations.
+Windows build/contract gates do not establish interactive desktop capture,
+click, typing, or application-launch acceptance.
+
 ## 1. Objective
 
 One binary crate, two execution backends:

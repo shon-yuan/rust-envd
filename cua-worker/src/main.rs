@@ -9,12 +9,9 @@
 //! matching the upstream daemon's environment contract. A non-loopback bind
 //! without a token is refused, and the token is never printed.
 
+use coorworker_cua::{app, desktop_provider, Auth};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use coorworker_cua::{app, Auth};
-use cua_driver_core::server::ToolProvider;
 
 fn main() -> std::process::ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -55,8 +52,7 @@ async fn run() -> Result<(), String> {
     };
     let has_token = auth.is_enabled();
 
-    let provider: Arc<dyn ToolProvider> = Arc::new(registry());
-    let router = app(provider, auth);
+    let router = app(desktop_provider(), auth);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|error| format!("cannot bind {listen}: {error}"))?;
@@ -76,21 +72,6 @@ async fn run() -> Result<(), String> {
         .with_graceful_shutdown(shutdown())
         .await
         .map_err(|error| format!("serve: {error}"))
-}
-
-fn registry() -> impl ToolProvider {
-    #[cfg(target_os = "linux")]
-    {
-        platform_linux::register_tools()
-    }
-    #[cfg(windows)]
-    {
-        platform_windows::register_tools()
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        compile_error!("coorworker-cua supports Linux and Windows guests only");
-    }
 }
 
 async fn shutdown() {

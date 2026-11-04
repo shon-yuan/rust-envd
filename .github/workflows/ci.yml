@@ -10,36 +10,64 @@ env:
 jobs:
   linux:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        profile: [base, desktop]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Install protoc and the X11 headers the cua worker links
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install desktop headers
+        if: matrix.profile == 'desktop'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler \
-            libx11-dev libxi-dev libxtst-dev libxfixes-dev libxrandr-dev \
-            libxcomposite-dev libxrender-dev libxext-dev libxdamage-dev \
-            libxkbcommon-dev
-      - run: cargo build --locked -j4
-      - run: cargo test --locked -j4
-      - run: cargo clippy --locked -j4 --all-targets -- -D warnings
-      - run: cargo fmt --check
-      - name: Build, test and lint the cua worker
+          sudo apt-get install -y libx11-dev libxi-dev libxtst-dev libxfixes-dev libxrandr-dev \
+            libxcomposite-dev libxrender-dev libxext-dev libxdamage-dev libxkbcommon-dev
+      - name: Build, test and lint selected daemon profile
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          features=()
+          if [ "$PROFILE" = desktop ]; then features=(--features cua-desktop); fi
+          cargo build --locked -j4 "${features[@]}"
+          cargo test --locked -j4 "${features[@]}"
+          cargo clippy --locked -j4 --all-targets "${features[@]}" -- -D warnings
+          cargo fmt --check
+      - name: Base dependency graph excludes desktop
+        if: matrix.profile == 'base'
+        run: |
+          cargo tree --locked -e normal --prefix none > /tmp/base-dependencies
+          if rg '^(coorworker-cua|cua-driver-core|platform-linux|platform-windows|x11|atspi|rquickjs) ' /tmp/base-dependencies; then exit 1; fi
+      - name: Build, test and lint standalone worker
+        if: matrix.profile == 'desktop'
         run: |
           cargo build --locked -j4 --manifest-path cua-worker/Cargo.toml --bin coorworker-cua
           cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins --tests
           cargo clippy --locked -j4 --manifest-path cua-worker/Cargo.toml --all-targets -- -D warnings
           cargo fmt --manifest-path cua-worker/Cargo.toml --check
-      - name: Fetch both lockfiles for the notice bundles
-        # The bundles cover every platform in each lockfile, and
-        # `cargo metadata --offline` needs those sources in the registry cache.
+      - name: Fetch both graphs and verify distribution notices
+        if: matrix.profile == 'desktop'
         run: |
           cargo fetch --locked
           cargo fetch --locked --manifest-path cua-worker/Cargo.toml
-      - name: License notice bundles match both lockfiles
-        run: python3 scripts/generate_notices.py --check
+          python3 -I scripts/test_distribution.py
+          python3 -I scripts/generate_notices.py --check
+
+  linux-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
+      - run: cargo build --locked -j4 --release --target x86_64-unknown-linux-musl
+      - name: Verify static base executable
+        run: |
+          file target/x86_64-unknown-linux-musl/release/coorworker-envd
+          if readelf -l target/x86_64-unknown-linux-musl/release/coorworker-envd | grep -q INTERP; then exit 1; fi
 
   windows-check:
     runs-on: ubuntu-latest
@@ -50,24 +78,28 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Check the Windows-target build
+      - name: Check Windows base daemon
         run: cargo check --locked -j4 --target x86_64-pc-windows-msvc --lib --bins
-      - name: Build the shared crate for the Windows target
+      - name: Build shared crate for Windows
         run: cargo build --locked -j4 --target x86_64-pc-windows-msvc --lib
 
   windows-test:
     runs-on: windows-latest
+    strategy:
+      matrix:
+        profile: [base, desktop]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: choco install protoc -y --no-progress
-      - name: Run the Windows backend and endpoint contract tests
-        run: cargo test --locked -j4 --lib
-      - name: Build and test the cua worker
-        # The worker selects platform-windows on this host; its worker
-        # contract tests are platform-independent, so this closes the
-        # "Windows worker unverified" gap without a desktop session.
+      - name: Test Windows base contracts
+        if: matrix.profile == 'base'
+        run: cargo test --locked -j4 --lib --test cua_context --test cua_admission --test cua_factory --test cua_ipv6
+      - name: Build and test Windows desktop contracts
+        if: matrix.profile == 'desktop'
         run: |
+          cargo build --locked -j4 --features cua-desktop
+          cargo test --locked -j4 --features cua-desktop --lib --test cua_context --test cua_admission --test cua_factory --test cua_ipv6 --test cua_embedded
           cargo build --locked -j4 --manifest-path cua-worker/Cargo.toml --bin coorworker-cua
           cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins --tests

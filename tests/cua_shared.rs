@@ -309,12 +309,12 @@ async fn real_init_install_rotation_failed_stale_and_reset_are_observed_immediat
         )
         .await;
         fixture.admission(Some("first"), StatusCode::OK).await;
-        for body in [
-            json!({"accessToken":"wrong"}),
-            json!({}),
-            json!({"accessToken":""}),
+        for (body, expected) in [
+            (json!({"accessToken":"wrong"}), StatusCode::UNAUTHORIZED),
+            (json!({}), StatusCode::UNAUTHORIZED),
+            (json!({"accessToken":""}), StatusCode::BAD_REQUEST),
         ] {
-            init(&fixture.router, body, StatusCode::UNAUTHORIZED).await;
+            init(&fixture.router, body, expected).await;
             fixture.admission(Some("first"), StatusCode::OK).await;
         }
         init(

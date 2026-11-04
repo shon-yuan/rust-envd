@@ -23,9 +23,10 @@ S2  control surface         /health, /metrics (unchanged)
    collide with a Connect `/<package>.<Service>/<Method>` path.
 3. **Layering is separate.** `app_with_*` mounts extensions *after*
    `http::layered`, so the envd frontdoor, authorization and CORS layers
-   never run for an extension request. An extension owns its own token,
-   status codes and error envelope. Reusing the `/init` access token for an
-   extension is a defect.
+   never run for an extension request. An extension owns its status codes,
+   credential policy and error envelope. The explicitly selected shared CUA
+   modes read the live protected `/init` credential; this does not apply S0
+   middleware to extensions or change S0's accepted headers.
 4. **No extension means no change.** `Extensions::empty()` is the parity
    build; mounting it is a no-op. The suite that proves S0 is the same
    suite the campaign has been running.
@@ -59,19 +60,72 @@ different things on the two daemons.
 
 | Extension | State |
 | --- | --- |
-| `cua` | shipped. `src/ext/cua.rs` supervises the separate `coorworker-cua` worker (`cua-worker/`); the MCP surface is the vendored Cua Driver registry. |
+| `cua` | Embedded execution or supervised/adopted `coorworker-cua` worker; both reuse the vendored Cua Driver registry. |
 
 ## `cua`: computer-use surface
 
-### Why a separate process
+### Shared credential and embedded execution
+
+Set `COORWORKER_CUA_MODE` explicitly to migrate from legacy deployment:
+
+| Mode | Runtime | Requirements |
+| --- | --- | --- |
+| unset / `legacy` | Existing worker supervision or adoption | Existing `BIN` / `EXTERNAL` and proxy configuration below |
+| `embedded` | MCP registry inside envd | Build with `--features cua-desktop`; run in desktop user's session |
+| `shared-external` | Adopted user-session helper | Loopback `COORWORKER_CUA_LISTEN`; nonempty matching `CUA_ENV_TOKEN` |
+
+Shared modes expose `POST /cua/mcp` on the existing envd listener. The caller
+sends `Authorization: Bearer <current envd access token>`. Before installing a
+token through `/init`, and after an authorized token reset, CUA denies all
+requests. Successful `/init` rotation immediately invalidates the old token
+for subsequent admissions. Failed or timestamp-skipped init retains the
+actual current state. Authentication occurs before body parsing, backend
+execution and accounting; admitted work may finish after rotation without
+holding the configuration lock. S0 continues accepting `X-Access-Token` and
+keeps its original fresh-boot policy and exclusions. Neither header substitutes
+for the other.
+
+```sh
+cargo build --locked -j4 --features cua-desktop
+COORWORKER_CUA_MODE=embedded target/debug/coorworker-envd --development
+```
+
+Initialize envd using its normal token provisioning procedure before connecting
+an MCP client to `/cua/mcp`. No extra worker listener or process is created.
+The desktop build links the same platform registry as the standalone worker;
+its native crashes can therefore terminate envd. The default build does not
+activate those dependencies and remains suitable for static musl guests.
+Selecting embedded mode in a base build reports unavailable rather than
+falling back to another mode.
+
+Windows SCM mode, service handover successors, Session 0, and failed session
+lookup refuse embedded initialization before the registry is constructed.
+For these deployments select `shared-external`, run the standalone helper in
+the target user's session, and supply its local transport token to envd using
+`CUA_ENV_TOKEN`. The helper can read the same value through `--token-file`.
+Provisioning the helper and securing that file are deployment responsibilities.
+The envd token is never copied to the helper. Missing or empty local transport
+credentials leave the shared extension unavailable. The helper's `/health`
+probe establishes liveness; it cannot prove a separately configured transport
+token matches, so MCP may still return 401 for a mismatch.
+
+Shared discovery reports `mode`, `auth_source: "envd"`, `auth_configured`, and
+relative `proxy_path: "/cua/mcp"`. Embedded mode has no helper URL. Health
+separates backend availability from credential readiness; neither is a GUI
+session or screenshot acceptance probe. Embedded worker gauges/restart
+counters stay zero. Backend/readiness gauges and tool counters describe the
+shared endpoint; rejected credentials do not increment tool-call counters.
+`/cua/info`, `/cua/health`, and `/cua/metrics` remain credential-free metadata
+and belong on a trusted listener or behind deployment access controls.
+Invalid explicit modes never downgrade to legacy authentication.
+
+### Legacy separate process
 
 The Cua Driver desktop stack (X11/AT-SPI on Linux, UI Automation on Windows)
-cannot live inside the envd daemon binary. On Linux the X11 crates resolve
-`libX11` through `pkg-config` at build time, so the static musl guest build
-would break; on Windows the daemon runs as an SCM service in session 0 and
-cannot drive the interactive desktop. The worker is therefore a separate
-`coorworker-cua` binary that rust-envd starts and supervises, or — when the
-worker has to live in another session — adopts and probes.
+is excluded from the default daemon dependency graph. A separate
+`coorworker-cua` binary remains useful for that lightweight build, native crash
+isolation, and Windows services that execute outside the interactive session.
+The following configuration describes the unchanged legacy mode.
 
 ```text
 guest / host
@@ -224,8 +278,9 @@ loopback with no token, auth is disabled and the worker says so on startup.
 
 ### Build
 
-The worker is its own package (it carries its own lockfile and target
-directory); the daemon never links it:
+The standalone worker is its own package with a separate lockfile and target
+directory. The default daemon excludes its desktop dependencies; the optional
+`cua-desktop` build links its reusable library:
 
 ```sh
 cargo build --locked --bin coorworker-envd
@@ -303,7 +358,39 @@ from `cua-worker/Cargo.lock` by `scripts/generate_notices.py`); packages that
 ship no license file use the upstream Cua Driver license or the checked-in
 SPDX texts in `scripts/license-overrides/`.
 
-### Evidence
+### Shared-mode acceptance and dependency audit
+
+On 2026-11-04, an isolated Xvfb desktop and a real desktop-enabled envd
+process completed MCP initialization, discovery of 63 tools, and
+`get_desktop_state` returning an 800×600 PNG. No worker child existed before
+the call. CUA rejected requests before `/init`; S0 still required
+`X-Access-Token`. This probe did not access the real user's desktop.
+
+Shared-mode tests cover live token installation/rotation/reset, failed and
+stale init, header separation, admission before body/backend/accounting,
+configuration-lock release, helper credential isolation, embedded MCP,
+limits/timeouts, and Windows service/session policy. Final Linux daemon suites
+passed: base 881 tests and desktop 885 tests, each with 0 failures and 24
+ignored tests. Shared-module coverage was 278/283 lines (98.23%) and 37/37
+functions (100%); this is not whole-project or branch coverage. Strict Clippy,
+formatting and the Windows base MSVC crosscheck passed locally. Native Windows desktop/service
+acceptance is pending. The current static build attempt failed because
+`x86_64-linux-musl-gcc` was unavailable; the desktop-free base dependency graph
+was verified separately. CI now defines base/desktop and static build lanes;
+that configuration alone is not a successful CI run.
+
+The local `cargo audit --no-fetch` result is **not clean**: 3 vulnerabilities,
+7 unmaintained warnings and 11 unsound warnings. The optional desktop graph
+uses the existing worker's zstd 0.13.4 and zstd-safe 7.4.0. Source review found
+no uses of the affected borrowed-context constructors (RUSTSEC-2026-0391),
+seekable feature/API (RUSTSEC-2026-0398), or write-decoder output path
+(RUSTSEC-2026-0403). Theme decompression is reachable through authenticated
+MCP and uses a fresh read decoder; this is a specific API reachability
+assessment, not a clean dependency audit. The preexisting Tokio 1.53.2
+RUSTSEC-2026-0386 warning remains unresolved; Linux uses `AsyncFd`, so it is
+not classified as unreachable. Other warnings were not exhaustively assessed.
+
+### Earlier worker and enumeration evidence
 
 - Worker contract tests: 9 passed, plus 5 Linux worker/MCP integration
   regressions (`cargo test --manifest-path cua-worker/Cargo.toml --lib --bins

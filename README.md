@@ -18,8 +18,8 @@ carrying connect-go error-text parity; its changes are recorded in
 `vendor/connectrpc/PATCHES.md`. `vendor/hyper/` is an MIT in-tree fork of
 `hyper` 1.12.0 carrying Go `net/http`'s HTTP/1.1 trailer write path and
 chunked-body limits; its changes are recorded in `vendor/hyper/PATCHES.md`.
-`vendor/cua-driver/` contains MIT-licensed Cua Driver crates used only by the
-optional `coorworker-cua` worker (provenance in
+`vendor/cua-driver/` contains MIT-licensed Cua Driver crates used by the
+optional desktop build and `coorworker-cua` worker (provenance in
 `vendor/cua-driver/PROVENANCE.md`); the AGPL perception crates and the FSL
 `cua-spacesd` are excluded.
 The distributable notice bundle
@@ -79,28 +79,37 @@ daemon itself runs in an existing Windows VM.
 ## Extensions
 
 The official envd surface above is the compatibility contract and stays
-frozen. Additive surfaces are mounted under their own first path segment with
-their own authentication, after the envd frontdoor/authorization layers, so
-they cannot shadow an envd route or inherit its token. A build with no
-extension registered has exactly the same router as the parity daemon.
+frozen. Extensions are mounted under their own first path segment after the
+envd frontdoor/authorization layers. They own their authentication policy;
+the opt-in shared CUA modes read the current protected envd credential without
+changing S0's headers, exceptions, or errors. With no extension configured,
+the router remains the parity daemon.
 
-The seam is shipped (`src/ext/mod.rs`, `tests/extensions.rs`). The first
-extension is `cua`: a computer-use MCP surface (`/cua/...`, `POST /mcp`)
-served by the separate `coorworker-cua` worker, which rust-envd starts and
-supervises when `COORWORKER_CUA_BIN` is set, or adopts and probes when
-`COORWORKER_CUA_EXTERNAL` is set (the Windows service shape, where the worker
-belongs to the interactive session). When
-`COORWORKER_CUA_PROXY_TOKEN` is set as well, envd also mounts `POST /cua/mcp`
-and forwards to the loopback worker, so a remote caller needs no second port.
-The supervisor retries a crashing worker with jittered exponential backoff and
-stops after `COORWORKER_CUA_MAX_RESTARTS` consecutive failures (default 8,
-`0` = unlimited); adopted workers report observed recoveries instead of
-inventing restart counts. `/cua/metrics` also carries proxy-only tool-call
-counters. The worker is a separate binary
-because the desktop stack cannot be linked into the frozen daemon (X11 on
-Linux, the interactive session on Windows); with no worker configured the
-router is exactly the parity daemon. The contract, configuration, worker
-interface and licensing boundary are in [`docs/extensions.md`](docs/extensions.md).
+CUA supports these deployment modes:
+
+| `COORWORKER_CUA_MODE` | Execution | Client credential |
+| --- | --- | --- |
+| unset or `legacy` | Existing supervised/adopted `coorworker-cua` worker | Existing worker/proxy tokens |
+| `embedded` | Inside envd, in the desktop user's session | Current envd `/init` token as Bearer |
+| `shared-external` | Deployment-managed user-session helper | Current envd `/init` token as Bearer |
+
+Build the desktop executable with `cargo build --locked -j4 --features cua-desktop`.
+The default build keeps desktop dependencies disabled and supports static musl
+packaging. Embedded mode serves `POST /cua/mcp` on envd's own listener, with no
+worker child or extra port. CUA stays closed until an envd token is installed;
+rotation and reset affect subsequent requests. S0 still uses `X-Access-Token`.
+
+Windows service launches, service handover successors, session zero, and
+unknown sessions cannot initialize embedded desktop execution. Use
+`shared-external` there: start `coorworker-cua` in the logged-in session and
+supply matching local transport credentials via `CUA_ENV_TOKEN` (or the
+helper's `--token-file`). The external client needs only the envd credential;
+the envd credential is never sent to the helper.
+
+Legacy `COORWORKER_CUA_BIN`, `COORWORKER_CUA_EXTERNAL`, proxy tokens, restart
+budgets, and observed recoveries retain their existing behavior. Shared modes
+are explicit migration choices. Runtime discovery, readiness, metrics, setup,
+and licensing details are in [`docs/extensions.md`](docs/extensions.md).
 
 ## Differences from the Go daemon
 

@@ -4,9 +4,9 @@ This file and the `licenses/` directory beside it constitute the distributable d
 
 ## Scope
 
-These notices cover the `coorworker-cua` worker binary built from `cua-worker/`, a separate package with its own lockfile that rust-envd supervises but does not link. Distributing the worker requires reproducing this file and the `licenses/` tree beside it; the daemon's bundle in `third_party/` is separate. Packaging steps are specified in [`../PACKAGING.md`](../PACKAGING.md).
+These notices cover the `coorworker-cua` worker binary built from `cua-worker/`, a separate package with its own lockfile. The daemon can supervise the standalone worker or link its library with `cua-desktop`. Distributing the worker requires reproducing this file and the `licenses/` tree beside it; the daemon's bundle in `third_party/` separately covers its embedded variant. Packaging steps are specified in [`../PACKAGING.md`](../PACKAGING.md).
 
-Enumerated from the pinned dependency graph via cargo metadata --locked --offline: 502 packages total including this crate; the 501 third-party crates indexed below carry the remaining linked-license obligations. Regenerate with `python3 scripts/generate_notices.py`; verify a checkout with `python3 scripts/generate_notices.py --check`.
+Enumerated from the pinned dependency graph via cargo metadata --locked --offline --all-features: 502 packages total including this crate; the 501 third-party crates indexed below carry the remaining linked-license obligations. Regenerate with `python3 scripts/generate_notices.py`; verify a checkout with `python3 scripts/generate_notices.py --check`.
 
 ## This project (MIT)
 
@@ -16,7 +16,7 @@ Copyright (c) 2026 shon-yuan
 
 ## Vendored Cua Driver crates
 
-`vendor/cua-driver/` carries the MIT-licensed Cua Driver crates used by the optional `coorworker-cua` worker, copied byte-for-byte from a pinned upstream commit. Provenance, the vendored list, and the deliberately excluded AGPL/FSL components are recorded in `vendor/cua-driver/PROVENANCE.md`. Covered distributions must include that file and the license texts enumerated below.
+`vendor/cua-driver/` carries the MIT-licensed Cua Driver crates used by the standalone `coorworker-cua` worker and the daemon's optional `cua-desktop` feature. The pinned upstream commit, local changes, vendored list, and deliberately excluded AGPL/FSL components are recorded in `vendor/cua-driver/PROVENANCE.md`. Those excluded components must not be shipped or linked. Covered distributions must include that file and the license texts enumerated below.
 
 `vendor/cua-driver/rust/crates/cua-cursor-motion/` is a vendored upstream crate `cua-cursor-motion` 0.38.0 (MIT). Its license text is under `licenses/cua-cursor-motion-0.38.0/` and is also indexed below.
 

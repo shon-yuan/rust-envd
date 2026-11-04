@@ -44,6 +44,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 url = "=2.5.8"
+coorworker-cua = { path = "cua-worker", optional = true, default-features = false, features = ["desktop"] }
 
 # Linux backends: nix/libc syscalls, inotify watchers, xattr metadata, MMDS TLS.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -73,6 +74,7 @@ windows-sys = { version = "=0.61.2", default-features = false, features = [
   "Win32_System_Memory",
   "Win32_System_Pipes",
   "Win32_System_ProcessStatus",
+  "Win32_System_RemoteDesktop",
   "Win32_System_Services",
   "Win32_System_SystemInformation",
   "Win32_System_SystemServices",
@@ -92,6 +94,7 @@ tokio = { version = "1", features = ["sync", "test-util"] }
 
 [features]
 client = ["connectrpc/client"]
+cua-desktop = ["dep:coorworker-cua"]
 
 # In-tree fork of connectrpc 0.9.1 (Apache-2.0; see vendor/connectrpc/PATCHES.md)
 # carrying the connect-go error-text parity required by the pinned oracle.

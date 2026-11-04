@@ -300,6 +300,11 @@ impl Access {
         Ok(())
     }
 
+    /// Reports credential readiness without exposing protected bytes.
+    pub(crate) fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
     /// Only an installed matching token can bypass an MMDS lookup.
     pub fn matches_current_token(&self, request_token: Option<&str>) -> bool {
         request_token.is_some_and(|token| self.token_matches(token))

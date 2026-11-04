@@ -12,9 +12,9 @@
 //! * **Layering is separated.** Extensions are merged *after* the envd
 //!   layers ([`crate::http::layered`]) are applied, so the envd frontdoor,
 //!   authorization and CORS middleware never run for an extension request.
-//!   An extension owns its own authentication, status codes and framing;
-//!   reusing the `/init` access token for an extension is a defect, not a
-//!   convenience.
+//!   An extension owns its authentication policy, status codes and framing.
+//!   Opt-in shared CUA authentication reads the live protected `/init` state
+//!   without changing S0 middleware or its accepted headers.
 //! * **Evidence is separated.** The differential gates compare S0 only. An
 //!   extension is verified by its own contract tests and, where an upstream
 //!   client exists, by that client's conformance run. A green extension run

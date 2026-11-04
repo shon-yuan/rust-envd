@@ -1,12 +1,12 @@
-//! The `cua` extension: supervision and discovery for the computer-use worker.
+//! The `cua` extension: embedded desktop execution or worker supervision.
 //!
-//! The worker is a separate process by construction (see
-//! [`coorworker_cua`](https://github.com/shon-yuan/rust-envd)): it links the
-//! desktop stack that the frozen envd daemon must not carry, and on Windows it
-//! must run in the interactive session rather than in the service's session 0.
-//! This extension therefore does not link Cua Driver. It spawns the worker,
-//! answers liveness for it, and publishes the endpoint a gateway or ToolHost
-//! should dial.
+//! Shared modes use live protected envd credentials and one `/cua/mcp` entry
+//! point. The optional `cua-desktop` build embeds the reusable worker library
+//! for Linux and Windows user sessions. Base static builds exclude that stack;
+//! Windows services use a separate helper in the interactive session. Explicit
+//! shared mode selection and request admission live in [`shared`].
+//!
+//! The following worker configuration describes the compatible legacy mode.
 //!
 //! Enabled with `COORWORKER_CUA_BIN`; the listen address defaults to
 //! `127.0.0.1:3211` and can be set with `COORWORKER_CUA_LISTEN`. The
@@ -38,7 +38,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use serde_json::json;
@@ -271,7 +271,11 @@ fn parse_max_attempts(value: Option<std::ffi::OsString>) -> Result<u32, String> 
 /// Supervises one `coorworker-cua` process, or watches one it does not own.
 pub struct CuaExtension {
     state: Arc<CuaState>,
+    shared: Option<Arc<shared::Shared>>,
 }
+
+mod shared;
+pub use shared::LaunchContext;
 
 impl CuaExtension {
     /// Spawns the worker and waits until its loopback listener accepts, up to
@@ -324,7 +328,10 @@ impl CuaExtension {
             )
             .await;
         });
-        Self { state }
+        Self {
+            state,
+            shared: None,
+        }
     }
 
     /// Adopts a worker envd does not own. The worker is expected to be started
@@ -340,7 +347,10 @@ impl CuaExtension {
         let state = shared_state(listen, proxy_token, status);
         let watched = Arc::clone(&state);
         tokio::spawn(async move { watch(listen, watched).await });
-        Self { state }
+        Self {
+            state,
+            shared: None,
+        }
     }
 
     /// `Some` when the worker is configured: `COORWORKER_CUA_BIN` spawns one,
@@ -392,6 +402,7 @@ impl CuaExtension {
     /// is the point: `/cua/health` says why instead of the surface vanishing.
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
+            shared: None,
             state: Arc::new(CuaState {
                 status: Mutex::new(WorkerStatus::stopped(reason)),
                 mcp_url: format!("http://{DEFAULT_LISTEN}/mcp"),
@@ -698,6 +709,9 @@ impl Extension for CuaExtension {
     }
 
     fn router(&self) -> Router {
+        if let Some(shared) = &self.shared {
+            return shared.router();
+        }
         let mut router = Router::new()
             .route("/health", get(health))
             .route("/info", get(info))
@@ -781,6 +795,17 @@ async fn info(State(state): State<Arc<CuaState>>) -> Response {
 /// path: the S2 `/metrics` document is the oracle's JSON wire format and stays
 /// byte-identical, so extension counters never enter it.
 async fn metrics(State(state): State<Arc<CuaState>>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        metrics_text(&state, true),
+    )
+        .into_response()
+}
+
+fn metrics_text(state: &CuaState, worker_enabled: bool) -> String {
     let (running, restarts, observed_restarts, budget_exhausted) = match state.status.lock() {
         Ok(status) => (
             status.running,
@@ -807,17 +832,10 @@ async fn metrics(State(state): State<Arc<CuaState>>) -> Response {
          # HELP coorworker_envd_cua_worker_budget_exhausted 1 when the supervisor stopped relaunching after its failure budget.\n\
          # TYPE coorworker_envd_cua_worker_budget_exhausted gauge\n\
          coorworker_envd_cua_worker_budget_exhausted {}\n{tool_metrics}",
-        if running { 1 } else { 0 },
+        if running && worker_enabled { 1 } else { 0 },
         if budget_exhausted { 1 } else { 0 },
     );
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
-        )],
-        body,
-    )
-        .into_response()
+    body
 }
 
 /// Streams one MCP request to the loopback worker.
@@ -927,6 +945,12 @@ struct Forwarded {
     body: Bytes,
 }
 
+fn worker_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 async fn forward(state: &CuaState, headers: &HeaderMap, body: Bytes) -> Result<Forwarded, String> {
     let uri = state
         .mcp_url
@@ -934,6 +958,7 @@ async fn forward(state: &CuaState, headers: &HeaderMap, body: Bytes) -> Result<F
         .map_err(|error| format!("invalid worker endpoint: {error}"))?;
     let host = uri
         .host()
+        .map(worker_host)
         .ok_or_else(|| "worker endpoint has no host".to_owned())?
         .to_owned();
     let port = uri.port_u16().unwrap_or(80);
@@ -980,18 +1005,12 @@ async fn forward(state: &CuaState, headers: &HeaderMap, body: Bytes) -> Result<F
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let collected = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|error| format!("reading the worker response failed: {error}"))?
-        .to_bytes();
-    if collected.len() > PROXY_RESPONSE_LIMIT {
-        return Err(format!(
-            "worker response is {} bytes, past the {PROXY_RESPONSE_LIMIT}-byte limit",
-            collected.len()
-        ));
-    }
+    let collected = axum::body::to_bytes(
+        axum::body::Body::new(response.into_body()),
+        PROXY_RESPONSE_LIMIT,
+    )
+    .await
+    .map_err(|_| "worker response exceeds limit or could not be read".to_owned())?;
     Ok(Forwarded {
         status,
         content_type,
@@ -1031,6 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn a_running_worker_is_healthy_and_discoverable() {
         let extension = CuaExtension {
+            shared: None,
             state: Arc::new(CuaState {
                 status: Mutex::new(WorkerStatus::running()),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
@@ -1067,6 +1087,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_worker_is_unhealthy_not_fatal() {
         let extension = CuaExtension {
+            shared: None,
             state: Arc::new(CuaState {
                 status: Mutex::new(WorkerStatus::stopped("cannot spawn /missing")),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
@@ -1079,6 +1100,12 @@ mod tests {
             extension.health(),
             Health::unhealthy("cannot spawn /missing")
         );
+    }
+
+    #[test]
+    fn ipv6_worker_host_is_normalized_before_socket_resolution() {
+        assert_eq!(worker_host("[::1]"), "::1");
+        assert_eq!(worker_host("127.0.0.1"), "127.0.0.1");
     }
 
     #[test]
@@ -1270,8 +1297,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_adopted_worker_that_stops_serving_is_unhealthy() {
-        let listen = free_listen();
-        let stub = worker_stub(listen, StatusCode::SERVICE_UNAVAILABLE).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let app = Router::new().route("/health", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        let stub = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         let extension = CuaExtension::adopt(listen, None).await;
         let health = extension.health();
         assert_eq!(health.state, crate::ext::HealthState::Unhealthy);
@@ -1282,6 +1313,7 @@ mod tests {
     #[tokio::test]
     async fn health_reports_the_restart_count() {
         let extension = CuaExtension {
+            shared: None,
             state: Arc::new(CuaState {
                 status: Mutex::new(WorkerStatus {
                     running: false,
@@ -1315,6 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn health_reports_an_exhausted_restart_budget() {
         let extension = CuaExtension {
+            shared: None,
             state: Arc::new(CuaState {
                 status: Mutex::new(WorkerStatus {
                     running: false,
@@ -1346,6 +1379,7 @@ mod tests {
     async fn metrics_report_worker_state_and_restarts() {
         fn router_with(status: WorkerStatus) -> Router {
             Extensions::new(vec![Arc::new(CuaExtension {
+                shared: None,
                 state: Arc::new(CuaState {
                     status: Mutex::new(status),
                     mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
@@ -1508,6 +1542,7 @@ mod tests {
 
     async fn proxied(mcp_url: String, proxy: &[u8], worker_token: Option<&[u8]>) -> CuaExtension {
         CuaExtension {
+            shared: None,
             state: Arc::new(CuaState {
                 status: Mutex::new(WorkerStatus::running()),
                 mcp_url,
@@ -1532,6 +1567,7 @@ mod tests {
     async fn the_proxy_route_exists_only_with_a_token_and_checks_it() {
         // Without a configured token there is no route at all, not an open one.
         let plain = CuaExtension {
+            shared: None,
             state: Arc::new(CuaState {
                 status: Mutex::new(WorkerStatus::running()),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),
@@ -1641,6 +1677,7 @@ mod tests {
     #[tokio::test]
     async fn the_proxy_refuses_a_dead_worker() {
         let extension = CuaExtension {
+            shared: None,
             state: Arc::new(CuaState {
                 status: Mutex::new(WorkerStatus::stopped("worker exited with exit status: 1")),
                 mcp_url: "http://127.0.0.1:1/mcp".to_owned(),

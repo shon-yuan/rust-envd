@@ -15,7 +15,7 @@ use tower::ServiceExt;
 fn provider() -> Arc<dyn ToolProvider> {
     Arc::new(StaticProvider::new(json!({
         "tools": [{
-            "name": "echo",
+            "name": "health_report",
             "description": "echo the supplied arguments without desktop access",
             "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}}
         }]
@@ -52,11 +52,7 @@ async fn mcp_router_excludes_health_and_unrelated_routes() {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "GET {path}");
     }
-    let (status, body) = request(
-        router,
-        Request::get("/mcp").body(Body::empty()).unwrap(),
-    )
-    .await;
+    let (status, body) = request(router, Request::get("/mcp").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert!(body.is_empty());
 }
@@ -77,13 +73,15 @@ async fn standalone_app_retains_health_and_mcp() {
         Request::post("/mcp")
             .header("content-type", "application/json")
             .header("authorization", "Bearer worker-secret")
-            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            ))
             .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["result"]["tools"][0]["name"], "echo");
+    assert_eq!(body["result"]["tools"][0]["name"], "health_report");
 }
 
 #[tokio::test]
@@ -105,7 +103,10 @@ async fn mcp_router_initializes_lists_and_calls_the_supplied_provider() {
     assert_eq!(body["jsonrpc"], "2.0");
     assert_eq!(body["id"], "init");
     assert!(body["result"]["protocolVersion"].is_string(), "{body}");
-    assert!(body["result"]["capabilities"]["tools"].is_object(), "{body}");
+    assert!(
+        body["result"]["capabilities"]["tools"].is_object(),
+        "{body}"
+    );
 
     let (status, body) = rpc(
         router.clone(),
@@ -118,14 +119,17 @@ async fn mcp_router_initializes_lists_and_calls_the_supplied_provider() {
 
     let (status, body) = rpc(
         router,
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"message":"hello"}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"health_report","arguments":{"message":"hello"}}}"#,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["id"], 3);
     assert_eq!(body["result"]["isError"], false);
     assert_eq!(body["result"]["content"][0]["type"], "text");
-    assert_eq!(body["result"]["content"][0]["text"], r#"echo:{"message":"hello"}"#);
+    assert_eq!(
+        body["result"]["content"][0]["text"],
+        r#"health_report:{"message":"hello"}"#
+    );
 }
 
 #[tokio::test]
@@ -165,11 +169,7 @@ async fn mcp_router_preserves_worker_bearer_authentication() {
         if let Some((name, value)) = header {
             builder = builder.header(name, value);
         }
-        let (status, body) = request(
-            router.clone(),
-            builder.body(Body::from("{")).unwrap(),
-        )
-        .await;
+        let (status, body) = request(router.clone(), builder.body(Body::from("{")).unwrap()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(body.is_empty());
     }
@@ -179,13 +179,15 @@ async fn mcp_router_preserves_worker_bearer_authentication() {
             router.clone(),
             Request::post("/mcp")
                 .header(name, "Bearer worker-secret")
-                .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#))
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                ))
                 .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{name}");
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["result"]["tools"][0]["name"], "echo");
+        assert_eq!(body["result"]["tools"][0]["name"], "health_report");
     }
 }
 

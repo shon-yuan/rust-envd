@@ -324,23 +324,28 @@ async fn serve(
             daemon.set_upgrade_run(install);
         }
     }
-    // A Windows service runs in session 0 and cannot inject into the
-    // interactive desktop, so it must not spawn the cua worker. It can still
-    // adopt one the logged-in session started: loopback is shared, and the
-    // extension only probes and proxies.
-    let cua = if service.is_some() {
-        let extension = crate::ext::cua::CuaExtension::from_env_external_only().await;
-        if extension.is_none() && std::env::var_os("COORWORKER_CUA_BIN").is_some() {
-            eprintln!(
-                "cua extension disabled in service mode: spawning the worker from session 0 \
-                 cannot reach the interactive desktop; set COORWORKER_CUA_EXTERNAL and start \
-                 the worker in the logged-in session"
-            );
-        }
-        extension
-    } else {
-        crate::ext::cua::CuaExtension::from_env().await
-    };
+    // Check boot identity as well as the actual session: an SCM successor can
+    // lack a service handle and must still never initialize the desktop stack.
+    let mut session = 0;
+    // SAFETY: current PID is valid and session points to writable u32 storage.
+    let session_known = unsafe {
+        windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+            windows_sys::Win32::System::Threading::GetCurrentProcessId(),
+            &mut session,
+        )
+    } != 0;
+    // Resume uses Service as a boot-guard shortcut for console successors too.
+    // SCM attachment identifies a service here; a detached service successor
+    // stays excluded by its inherited Session 0 (or a failed session lookup).
+    let context = crate::ext::cua::LaunchContext::for_windows(
+        service.is_some(),
+        session_known.then_some(session),
+    );
+    let cua = crate::ext::cua::CuaExtension::from_env_with_context(
+        crate::http::ConfigurationState::configuration(daemon.as_ref()).clone(),
+        context,
+    )
+    .await;
     let extensions = match cua {
         Some(extension) => {
             let extension: std::sync::Arc<dyn crate::ext::Extension> =
