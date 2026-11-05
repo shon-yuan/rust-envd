@@ -18,8 +18,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install build and dependency-check tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ripgrep
       - name: Install desktop headers
         if: matrix.profile == 'desktop'
         run: |

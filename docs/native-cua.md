@@ -117,6 +117,12 @@ on Rust 1.98.1, base all-target strict Clippy passed on Rust 1.99.0, and the
 The scoped coverage table above was refreshed from that run. A targeted code
 review found no blocking defect in the correction.
 
+The next remote desktop run passed build, tests, strict Clippy and formatting,
+then failed the dependency-graph gate because the runner did not provide `rg`.
+The shared Linux prerequisite step now explicitly installs `ripgrep`. Both
+profiles' graph checks must be rerun with that tool present: the base guard's
+`if rg ...` could otherwise treat a missing command as an absent dependency.
+
 ## Acceptance limits
 
 This is local implementation and verification evidence. Native Windows
