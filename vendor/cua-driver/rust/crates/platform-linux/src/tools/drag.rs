@@ -396,7 +396,7 @@ impl Tool for DragTool {
             }
         }
         if desktop_frame {
-            let mapped = tokio::task::spawn_blocking(move || {
+            let mapped = cua_driver_core::work_scope::spawn_blocking(move || {
                 Ok::<_, anyhow::Error>((
                     desktop_to_window_local(xid, from_x, from_y)?,
                     desktop_to_window_local(xid, to_x, to_y)?,
@@ -580,10 +580,12 @@ impl Tool for DragTool {
         let screen_from = if let Some((from, _)) = wayland_points {
             Some((from.point.0 as f64, from.point.1 as f64))
         } else {
-            tokio::task::spawn_blocking(move || window_local_to_screen(xid, from_x, from_y))
-                .await
-                .ok()
-                .and_then(|result| result.ok())
+            cua_driver_core::work_scope::spawn_blocking(move || {
+                window_local_to_screen(xid, from_x, from_y)
+            })
+            .await
+            .ok()
+            .and_then(|result| result.ok())
         };
         if let Some((sx_from, sy_from)) = screen_from {
             overlay_glide_to_for(&cursor_id, sx_from, sy_from).await;
@@ -671,7 +673,7 @@ impl Tool for DragTool {
         }
 
         if delivery.is_foreground() {
-            let screen_points = tokio::task::spawn_blocking(move || {
+            let screen_points = cua_driver_core::work_scope::spawn_blocking(move || {
                 Ok::<_, anyhow::Error>((
                     window_local_to_screen(xid, from_x, from_y)?,
                     window_local_to_screen(xid, to_x, to_y)?,
@@ -742,7 +744,7 @@ impl Tool for DragTool {
         // synthetic XSendEvent gesture below); the target's screen points are
         // resolved once and the agent cursor tracks the glide.
         if crate::input::real_pointer_input_available() {
-            let screen_points = tokio::task::spawn_blocking(move || {
+            let screen_points = cua_driver_core::work_scope::spawn_blocking(move || {
                 Ok::<_, anyhow::Error>((
                     window_local_to_screen(xid, from_x, from_y)?,
                     window_local_to_screen(xid, to_x, to_y)?,
@@ -875,8 +877,10 @@ impl Tool for DragTool {
                 match motion_result {
                     Ok(Ok(())) => {
                         if let Ok(Ok((sx, sy))) =
-                            tokio::task::spawn_blocking(move || window_local_to_screen(xid, ix, iy))
-                                .await
+                            cua_driver_core::work_scope::spawn_blocking(move || {
+                                window_local_to_screen(xid, ix, iy)
+                            })
+                            .await
                         {
                             self.state
                                 .cursor_registry
@@ -922,8 +926,10 @@ impl Tool for DragTool {
         );
 
         if result.is_ok() {
-            if let Ok(Ok((sx_to, sy_to))) =
-                tokio::task::spawn_blocking(move || window_local_to_screen(xid, to_x, to_y)).await
+            if let Ok(Ok((sx_to, sy_to))) = cua_driver_core::work_scope::spawn_blocking(move || {
+                window_local_to_screen(xid, to_x, to_y)
+            })
+            .await
             {
                 crate::overlay::send_command_for(
                     cursor_id.clone(),

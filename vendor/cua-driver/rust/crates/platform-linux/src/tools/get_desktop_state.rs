@@ -49,7 +49,7 @@ impl Tool for GetDesktopStateTool {
         let max_image_dimension = input.max_image_dimension;
         let capture_service = self.state.capture_service.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let result = cua_driver_core::work_scope::spawn_blocking(move || -> anyhow::Result<_> {
             // Capture the full display at native size first. When the
             // compositor consumes logical input coordinates, normalize the
             // image below so screenshot pixels still land exactly.

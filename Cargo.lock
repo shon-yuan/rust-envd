@@ -922,20 +922,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
-name = "coorworker-cua"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "cua-driver-core",
- "platform-linux",
- "platform-windows",
- "serde_json",
- "subtle",
- "tokio",
-]
-
-[[package]]
 name = "coorworker-envd"
 version = "0.1.0"
 dependencies = [
@@ -948,7 +934,7 @@ dependencies = [
  "bytes",
  "connectrpc",
  "connectrpc-build",
- "coorworker-cua",
+ "cua-driver-core",
  "flate2",
  "form_urlencoded",
  "futures-util",
@@ -960,11 +946,14 @@ dependencies = [
  "hyper",
  "hyper-util",
  "inotify",
+ "jsonschema",
  "libc",
  "mime_guess",
  "multer",
  "nix 0.29.0",
  "percent-encoding",
+ "platform-linux",
+ "platform-windows",
  "region",
  "rustls-native-certs",
  "seckey",

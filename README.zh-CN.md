@@ -21,13 +21,13 @@
 - `vendor/hyper/` 是仓库内维护的 `hyper` 1.12.0 分支，采用 MIT，
   实现了 Go `net/http` 的 HTTP/1.1 trailer 写入路径和分块请求体限制；修改记录见
   `vendor/hyper/PATCHES.md`。
-- `vendor/cua-driver/` 包含采用 MIT 许可证的 Cua Driver crate，供可选桌面构建和
-  `coorworker-cua` worker 使用；来源记录见 `vendor/cua-driver/PROVENANCE.md`。
+- `vendor/cua-driver/` 包含采用 MIT 许可证的 Cua Driver crate，供 envd 的进程内桌面
+  registry 使用；来源记录见 `vendor/cua-driver/PROVENANCE.md`。
   不包含采用 AGPL 的 perception crate 和采用 FSL 的 `cua-spacesd`。
 
 可分发的第三方声明包包括 [`third_party/NOTICES.md`](third_party/NOTICES.md) 和
-`third_party/licenses/`；worker 的独立声明包位于 `third_party/cua-worker/`。
-声明包与发布清单的生成流程见 [`third_party/PACKAGING.md`](third_party/PACKAGING.md)。
+`third_party/licenses/`。声明包与发布清单的生成流程见
+[`third_party/PACKAGING.md`](third_party/PACKAGING.md)。
 依赖安全更新、仍存在的维护告警，以及 Linux 升级交接的文件描述符所有权迁移，记录在
 [`docs/dependency-security.md`](docs/dependency-security.md)。
 
@@ -57,7 +57,7 @@ Windows x86_64 是受支持的客户机目标平台，已在 Windows 11 上测�
 cargo build --locked --bin coorworker-envd
 ```
 
-验收证据：[依赖维护回归](docs/windows-dependency-regression.md)在 Windows 11 上原生执行，
+历史 Windows 证据：[依赖维护回归](docs/windows-dependency-regression.md)在 Windows 11 上原生执行，
 测试提交为 `c3cb81a`。321 项库测试、基础构建的 5 项或桌面构建的 9 项集成测试，
 以及独立 worker 的 16 项测试均通过。官方 E2B Python SDK 2.62.1 使用自身的编解码器、
 生成客户端和 `CommandHandle` 驱动实际客户机，通过 27/27 项测试；测试脚本位于 agent 仓库的
@@ -72,42 +72,56 @@ Windows 客户机没有 POSIX shell，因此以 `invalid_argument` 拒绝该调�
 [`docs/windows-port.md`](docs/windows-port.md)。在 Cloud Hypervisor/Hyper-V 下启动 Windows
 的客户机镜像流水线仍是独立的待完成工作；守护进程本身已可在现有 Windows VM 中运行。
 
-## 扩展
+## 原生 CUA
 
-上述官方 envd 接口是保持冻结的兼容性契约。扩展在 envd 入口与授权层之后，
-挂载到各自独立的一级路径下，并自行定义认证策略。显式启用的共享 CUA 模式读取当前受保护的
-envd 凭据，不改变 S0 的请求头、例外规则或错误行为。未配置扩展时，路由仍为兼容性守护进程。
+上述官方 envd 接口保持冻结。已实现的[原生 CUA 契约](docs/native-cua.md)在现有
+envd 监听端口上增加四项 REST 接口，纳入 S0 路由与认证栈：
 
-CUA 支持以下部署模式：
+| 接口 | 用途 |
+| --- | --- |
+| `GET /cua/tools` | 返回工具列表，字段为 `name`、`description` 和 `input_schema`。 |
+| `POST /cua/call` | 执行 `{"name":"…","arguments":{…}}`，返回 `success`、`content` 和可选的 `data`。 |
+| `GET /cua/health` | 被动报告运行时可用性与原因，不探测或操作桌面。 |
+| `GET /cua/metrics` | 提供有界的 Prometheus 工具计数、延迟与运行时就绪指标。 |
 
-| `COORWORKER_CUA_MODE` | 执行方式 | 客户端凭据 |
-| --- | --- | --- |
-| 未设置或 `legacy` | 沿用受监督或由 envd 接入的独立 `coorworker-cua` worker | 原有 worker/proxy token |
-| `embedded` | 在桌面用户会话中的 envd 进程内执行 | 当前 envd `/init` token，以 Bearer 形式发送 |
-| `shared-external` | 由部署方管理的用户会话 helper | 当前 envd `/init` token，以 Bearer 形式发送 |
+所有 CUA 路由，包括未知的 `/cua` 路径，都要求 envd 已完成初始化，并提供非空的当前
+`X-Access-Token`。Bearer、Basic 和文件签名均不能替代该请求头。认证先于请求体解码；
+现有 CORS 预检行为与 S0 认证例外保持不变。凭据轮换影响后续请求；已获准执行的操作
+可以在轮换后完成。调用请求体只能包含 `name` 和对象类型的 `arguments`，无需 JSON-RPC
+信封或初始化握手。图片字段使用 `mime_type`，工具失败使用 `success:false`，传输错误
+使用 S0 的 `code`/`message` JSON 错误信封。原生 `data` 保留驱动的原始结构化诊断；
+工具失败且没有结构化数据时，提供 `{"code":"tool_error"}`。工具列表不公布驱动的标准化
+输出 schema，因为它不能描述所有原始诊断数据。
 
-桌面可执行文件的构建命令为 `cargo build --locked -j4 --features cua-desktop`。
-Windows 原生桌面构建和独立 worker 构建还需要安装与所选工具集匹配的 MSVC v143 x64/x86
-Spectre 缓解库，详见[构建前置条件](third_party/PACKAGING.md#canonical-build)。
-默认构建不启用桌面依赖，并支持静态 musl 打包。
+唯一执行引擎是 envd 直接链接的进程内 vendored 桌面 registry。没有扩展挂载框架、MCP
+端点、worker、helper 传输或执行模式选择。`/cua/mcp`、`/cua/info` 和独立
+`coorworker-cua` 启动均已移除。请从启动环境中删除旧的 `COORWORKER_CUA_*` 配置和
+`CUA_ENV_TOKEN`；生产启动会拒绝这些变量，并给出迁移错误。
 
-embedded 模式在 envd 自身的监听端口上提供 `POST /cua/mcp`，不创建 worker 子进程或额外端口。
-安装 envd token 之前，CUA 拒绝访问；凭据轮换和经授权的重置会影响后续请求。
-Windows 原生 DPAPI provisioning 路径支持轮换，但空元数据不能授权在线清空凭据：
-`/init {}` 返回 401，并保留当前 token。详见
-[原生 CUA 验收限制](docs/windows-cua-acceptance.md#native-live-reset-limitation)。
-S0 仍使用 `X-Access-Token`。
+普通构建 `cargo build --locked -j4` 默认启用 `cua-desktop`。Linux 桌面构建需要
+X11、XInput、XTest、XFixes、XRandR、XComposite、XRender、XExt、XDamage 和 xkbcommon
+的开发头文件。Windows 桌面构建需要与工具集匹配的 MSVC v143 x64/x86 Spectre 缓解库。
+桌面依赖保持可选：使用 `--no-default-features` 构建无桌面依赖的基础版或静态客户机，
+通过认证后的 CUA 操作将报告不可用。
 
-Windows 服务启动、服务交接的后继进程、Session 0 和会话未知的进程均不能初始化 embedded 桌面执行。
-这些场景应使用 `shared-external`：在已登录的用户会话中启动 `coorworker-cua`，
-通过 `CUA_ENV_TOKEN` 提供匹配的本地传输凭据；helper 也可通过 `--token-file` 读取该凭据。
-外部客户端只需 envd 凭据，envd 凭据不会发送给 helper。
-[Windows 原生 CUA 验收](docs/windows-cua-acceptance.md)在一次性 Windows 11 副本中验证了
-embedded 截图、输入和窗口操作，以及实际 SCM/helper 生命周期、恢复和凭据边界。
+Linux 和已确认的 Windows 桌面用户会话可使用 registry。Windows SCM 服务进程、Session 0、
+处于 Session 0 的服务交接后继进程以及会话未知的进程，在构造 registry 之前即报告 CUA
+不可用，不启动或连接 helper；S0 文件系统与进程服务继续可用。模型与供应商密钥属于
+AgentHost。
 
-旧模式的 `COORWORKER_CUA_BIN`、`COORWORKER_CUA_EXTERNAL`、proxy token、重启预算和
-观测到的恢复行为保持不变。共享模式需要显式选择迁移。运行时发现、就绪状态、指标、配置和
-许可证详情见 [`docs/extensions.md`](docs/extensions.md)。
+集成后的原生 API 已通过本地验证：默认配置 907 项测试、基础配置 881 项测试通过，
+均为零失败，各有 24 项 doctest 被忽略。最终两种配置的全目标严格 Clippy、格式检查、Windows
+基础版 MSVC 库与二进制交叉检查、17 项分发检查、第三方声明核对和重新构建均通过。
+桌面配置包含 15 项完成性回归，覆盖超时、断开连接、panic 后的有限工作，以及 I/O 在截止时间
+后恢复的情况。最终 Rust 复查已关闭截止时间问题，并与代码和安全复查结果一并记录。
+已观察到的 Linux 冒烟结果为 63 项工具、一个 envd 进程、一个监听端口，旧 MCP、JSON-RPC
+和旧配置均被拒绝，未执行桌面操作；最终重新构建后的重复验证也通过。此证据不包含新 API 的 Windows
+原生桌面或在线 S0 验收、新 musl 构建、新 Go/SDK 对比、远程 CI 或真实桌面操作；也不声明
+已提交、推送、合并或部署。详见[本地验证记录](docs/native-cua.md#verified-local-state)。
+
+此前的 [Windows CUA 验收](docs/windows-cua-acceptance.md)记录旧版本的进程内截图、输入、
+窗口操作及 SCM/helper 恢复；其中的 DPAPI 轮换与在线重置限制仍属于历史证据。当前协议
+细节、限制、迁移说明及明确限定版本范围的旧证据见 [`docs/extensions.md`](docs/extensions.md)。
 
 ## 与 Go 守护进程的差异
 
@@ -189,7 +203,7 @@ cargo run -j4 --locked -p coorworker-envd -- --development --listen 127.0.0.1:0
 ```sh
 CC_x86_64_unknown_linux_musl=/usr/bin/clang \
 CFLAGS_x86_64_unknown_linux_musl='-ffreestanding -nostdlibinc -DRING_CORE_NOSTDLIBINC=1' \
-cargo build -j4 --locked -p coorworker-envd \
+cargo build -j4 --locked -p coorworker-envd --no-default-features \
   --target x86_64-unknown-linux-musl --release --bin coorworker-envd
 ```
 

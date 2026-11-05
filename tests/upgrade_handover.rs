@@ -166,7 +166,7 @@ fn freeze_options(max_wait: Duration) -> FreezeOptions {
 /// home is the process runtime's retention cache.
 mod terminated {
     use super::*;
-    use coorworker_envd::process::{ProcessRuntime, RuntimeError};
+    use coorworker_envd::process::ProcessRuntime;
     use coorworker_envd::proto::process as pb;
 
     fn runtime() -> ProcessRuntime {
@@ -332,10 +332,6 @@ mod terminated {
             remaining_ms,
         }
     }
-
-    // Silence the unused-import warning path for RuntimeError in this module.
-    #[allow(dead_code)]
-    fn _runtime_error_is_imported(_: RuntimeError) {}
 }
 
 /// Oracle freeze.go:1001-1043 (GuestFrozenPaths/SetGuestFrozenPaths),

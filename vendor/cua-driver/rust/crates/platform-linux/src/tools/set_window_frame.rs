@@ -89,7 +89,7 @@ impl Tool for SetWindowFrameTool {
         };
         let window_id = input.window_id;
         let pid = input.pid;
-        let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = cua_driver_core::work_scope::spawn_blocking(move || {
             let before = crate::x11::list_windows(Some(pid))
                 .into_iter()
                 .find(|window| window.xid == window_id)

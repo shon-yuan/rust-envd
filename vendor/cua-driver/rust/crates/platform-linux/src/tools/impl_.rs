@@ -960,7 +960,7 @@ pub(crate) async fn prove_token_element(
         return Ok(None);
     };
     let (xid, identity) = (*window_id, element.identity.clone());
-    let proof = tokio::task::spawn_blocking(move || {
+    let proof = cua_driver_core::work_scope::spawn_blocking(move || {
         crate::atspi::require_window_element(
             pid,
             xid,
@@ -1833,8 +1833,14 @@ pub(crate) fn background_keyboard_refusal(atspi_ok: bool) -> ToolResult {
 }
 
 pub(crate) fn atspi_up() -> bool {
-    let probe = std::thread::spawn(crate::health_report::probe_a11y_bus);
-    crate::wayland::is_wayland() || probe.join().unwrap_or(false)
+    if crate::wayland::is_wayland() {
+        return true;
+    }
+    std::thread::spawn(cua_driver_core::work_scope::bind_current(
+        crate::health_report::probe_a11y_bus,
+    ))
+    .join()
+    .unwrap_or(false)
 }
 
 pub(crate) fn unavailable_gtk_keyboard_background(
@@ -2825,7 +2831,7 @@ pub(crate) async fn wm_chord_background(
 /// (`_NET_CLOSE_WINDOW` -> `WM_DELETE_WINDOW`) and watch it go.
 async fn close_window_background(pid: u32, xid: u64, display: &str) -> ToolResult {
     let before: Vec<crate::x11::WindowInfo> =
-        tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
+        cua_driver_core::work_scope::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
             .await
             .unwrap_or_default();
     let title = before
@@ -2833,7 +2839,9 @@ async fn close_window_background(pid: u32, xid: u64, display: &str) -> ToolResul
         .find(|w| w.xid == xid)
         .map(|w| w.title.clone())
         .unwrap_or_default();
-    let sent = tokio::task::spawn_blocking(move || crate::x11::close_window(xid, pid)).await;
+    let sent =
+        cua_driver_core::work_scope::spawn_blocking(move || crate::x11::close_window(xid, pid))
+            .await;
     match sent {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -2853,15 +2861,17 @@ async fn close_window_background(pid: u32, xid: u64, display: &str) -> ToolResul
     let mut closed = false;
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let viewable =
-            tokio::task::spawn_blocking(move || crate::x11::window_is_viewable(xid)).await;
+        let viewable = cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::x11::window_is_viewable(xid)
+        })
+        .await;
         if matches!(viewable, Ok(false)) {
             closed = true;
             break;
         }
     }
     let after: Vec<crate::x11::WindowInfo> =
-        tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
+        cua_driver_core::work_scope::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
             .await
             .unwrap_or_default();
     let new_windows: Vec<&crate::x11::WindowInfo> = after
@@ -3156,7 +3166,7 @@ pub(crate) fn spawn_isolated_hyprland(
     )
     .map_err(isolated_hyprland_refusal)?;
     let (guard, cancellation) = crate::wayland::hyprland_input::ActionCancellation::invocation();
-    let dispatch = tokio::task::spawn_blocking(move || {
+    let dispatch = cua_driver_core::work_scope::spawn_blocking(move || {
         let _lifecycle = lifecycle;
         work(cancellation)
     });
@@ -3280,7 +3290,11 @@ pub(crate) async fn focus_hyprland_foreground(
         if activation.is_error == Some(true) {
             return Err(activation);
         }
-        match tokio::task::spawn_blocking(move || crate::atspi::focus_token(pid, &element)).await {
+        match cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::atspi::focus_token(pid, &element)
+        })
+        .await
+        {
             Ok(Ok(true)) => {}
             _ => return Err(foreground_hyprland_refusal("AT-SPI child focus failed")),
         }
@@ -3878,7 +3892,7 @@ async fn overlay_glide_to_target_for(cursor_id: &str, sx: f64, sy: f64, target: 
 /// snapshot converts the action's points, places the overlay and sizes the
 /// virtual pointer, so they cannot disagree about the monitor layout.
 pub(crate) async fn desktop_input_space() -> anyhow::Result<crate::wayland::DesktopInputSpace> {
-    tokio::task::spawn_blocking(|| {
+    cua_driver_core::work_scope::spawn_blocking(|| {
         crate::interaction::admit_lock(
             crate::interaction::policy::Scope::DesktopInput,
             crate::interaction::facts::Fact::Unknown("desktop input addresses no window".into()),
@@ -4025,7 +4039,7 @@ pub(crate) async fn announce_keyboard_target(
         return;
     }
     let cursor_id = resolve_cursor_key(args);
-    let target = tokio::task::spawn_blocking(move || {
+    let target = cua_driver_core::work_scope::spawn_blocking(move || {
         explicit_keyboard_cursor_target(pid, xid, element.as_ref(), pixel_target)
             .or_else(|| (xid != 0).then(|| keyboard_window_center(xid)).flatten())
     })
@@ -4062,7 +4076,7 @@ pub(crate) async fn position_named_session_keyboard_cursor(
             .get(&cursor_id)
             .and_then(|cursor| cursor.x.zip(cursor.y))
     });
-    let explicit = tokio::task::spawn_blocking(move || {
+    let explicit = cua_driver_core::work_scope::spawn_blocking(move || {
         explicit_keyboard_cursor_target(pid, xid, element.as_ref(), pixel_target)
     })
     .await
@@ -4073,7 +4087,7 @@ pub(crate) async fn position_named_session_keyboard_cursor(
         && explicit.is_none()
         && cursor_overlay::keyboard_cursor_target(None, remembered, None, None).is_none()
     {
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::work_scope::spawn_blocking(move || {
             let center = keyboard_window_center(xid);
             let pointer = center.is_none().then(current_pointer_position).flatten();
             (center, pointer)
@@ -4288,8 +4302,10 @@ pub(crate) async fn focus_nested_inject_target(
 ) -> Result<(), ToolResult> {
     if let Some(element) = element {
         let index = element.index;
-        return match tokio::task::spawn_blocking(move || crate::atspi::focus_token(pid, &element))
-            .await
+        return match cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::atspi::focus_token(pid, &element)
+        })
+        .await
         {
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) => Err(ToolResult::error(format!(
@@ -4301,7 +4317,7 @@ pub(crate) async fn focus_nested_inject_target(
         };
     }
     if let Some((x, y)) = pixel {
-        return match tokio::task::spawn_blocking(move || {
+        return match cua_driver_core::work_scope::spawn_blocking(move || {
             crate::wayland::inject_click(pid, window_id, x, y, 1, 1)
         })
         .await

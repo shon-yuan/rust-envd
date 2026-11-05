@@ -4,7 +4,7 @@
 //! no Python, `pyatspi`, or GObject-introspection typelibs are needed at
 //! runtime. The zbus calls are async, so each public entry point drives a
 //! small shared Tokio runtime via `block_on` (callers already invoke these
-//! from `tokio::task::spawn_blocking`, so blocking here is safe).
+//! from `cua_driver_core::work_scope::spawn_blocking`, so blocking here is safe).
 //!
 //! Element indices match the markdown produced by [`walk_tree`]: a depth-first,
 //! pre-order traversal of the target application's windows, numbering the
@@ -103,7 +103,7 @@ async fn bounded_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'sta
     if budget.is_zero() {
         return None;
     }
-    match tokio::time::timeout(budget, tokio::task::spawn_blocking(f)).await {
+    match tokio::time::timeout(budget, cua_driver_core::work_scope::spawn_blocking(f)).await {
         Ok(Ok(value)) => Some(value),
         _ => None,
     }
@@ -328,9 +328,9 @@ fn wait_for_listener_startup(
     let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("cua-atspi-listener".into())
-        .spawn(move || {
+        .spawn(cua_driver_core::work_scope::bind_current(move || {
             let _ = completed_tx.send(connect());
-        })
+        }))
         .map_err(|error| anyhow!("could not spawn AT-SPI listener initialization: {error}"))?;
 
     match completed_rx.recv_timeout(timeout) {
@@ -1909,13 +1909,14 @@ async fn collect_visited_bounded_opts<'a>(
                     // open menu is a mapped override-redirect window of this
                     // pid, and its entries' screen extents lie inside it.
                     if pid_popups.is_none() {
-                        let popups =
-                            tokio::task::spawn_blocking(crate::input::mapped_popup_windows)
-                                .await
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|popup| popup.pid.is_none_or(|popup_pid| popup_pid == pid))
-                                .collect::<Vec<_>>();
+                        let popups = cua_driver_core::work_scope::spawn_blocking(
+                            crate::input::mapped_popup_windows,
+                        )
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|popup| popup.pid.is_none_or(|popup_pid| popup_pid == pid))
+                        .collect::<Vec<_>>();
                         pid_popups = Some(popups);
                     }
                     if let Some(popups) = pid_popups.as_ref().filter(|popups| !popups.is_empty()) {
@@ -2658,9 +2659,11 @@ pub(super) fn walk_tree_bounded_with_timeout(
 /// non-zero and to round-trip back from the caller.
 pub fn list_windows(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo> {
     if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::spawn(move || list_windows_blocking(filter_pid))
-            .join()
-            .unwrap_or_default();
+        return std::thread::spawn(cua_driver_core::work_scope::bind_current(move || {
+            list_windows_blocking(filter_pid)
+        }))
+        .join()
+        .unwrap_or_default();
     }
     list_windows_blocking(filter_pid)
 }

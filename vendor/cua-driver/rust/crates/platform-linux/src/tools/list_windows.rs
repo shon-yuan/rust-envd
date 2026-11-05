@@ -36,7 +36,7 @@ impl Tool for ListWindowsTool {
         use cua_driver_core::tool_args::ArgsExt;
         let filter_pid = args.opt_u64("pid").map(|v| v as u32);
         let on_screen_only = args.bool_or("on_screen_only", false);
-        let mut windows = match tokio::task::spawn_blocking(move || {
+        let mut windows = match cua_driver_core::work_scope::spawn_blocking(move || {
             crate::wayland::try_list_windows_dispatch(filter_pid)
         })
         .await

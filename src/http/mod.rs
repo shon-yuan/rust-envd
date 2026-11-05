@@ -6,6 +6,7 @@
 //! daemon configuration (`/health`, `/envs`). Both daemons mount these through
 //! [`layered`], so the wire behaviour is literally the same code on each.
 pub mod cors;
+pub mod cua;
 pub mod frontdoor;
 
 use crate::configuration::Configuration;
@@ -112,6 +113,23 @@ pub async fn authorize<S: ConfigurationState>(
     next: Next,
 ) -> Response {
     let configuration = state.configuration().lock().await;
+    if cua::namespace(request.uri().path()) {
+        let mut tokens = request.headers().get_all("x-access-token").iter();
+        let token = tokens.next().and_then(|value| value.to_str().ok());
+        let admitted = tokens.next().is_none()
+            && token.is_some_and(|value| !value.contains(','))
+            && configuration.access.initialized()
+            && configuration.access.has_token()
+            && configuration.access.matches_current_token(token);
+        drop(configuration);
+        if !admitted {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "CUA requires initialized envd credentials",
+            );
+        }
+        return next.run(request).await;
+    }
     let result = configuration.access.authorize(
         request.method().as_str(),
         request.uri().path(),

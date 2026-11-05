@@ -31,9 +31,7 @@ use tokio::sync::watch;
 use windows_sys::Win32::Foundation::ERROR_FAILED_SERVICE_CONTROLLER_CONNECT;
 
 use crate::cli::{parse_args, usage, Args, CliError, COMMIT, VERSION};
-use crate::daemon::{
-    app_with_execution_and_extensions, app_with_filesystem_and_extensions, Daemon,
-};
+use crate::daemon::{app_with_execution, app_with_filesystem, Daemon};
 use crate::exec_context::Defaults;
 use crate::http1::{serve_gated, AcceptGate};
 use crate::platform::port::scan::Scanner;
@@ -88,6 +86,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         println!("{COMMIT}");
         return Ok(());
     }
+    crate::cua::validate_environment()?;
     // A development daemon is never a service and never a handover target:
     // its upgrade choreography stays unwired, so it can never freeze host
     // workload or replace itself.
@@ -250,7 +249,21 @@ async fn serve(
         .local_addr()
         .map_err(|error| fail(&sink, error.to_string()))?;
 
-    let mut daemon = Daemon::new();
+    // SCM attachment and the actual process session must both be checked before
+    // constructing any desktop registry, including for detached successors.
+    let mut session = 0;
+    // SAFETY: the current PID is valid and session points to writable storage.
+    let session_known = unsafe {
+        windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+            windows_sys::Win32::System::Threading::GetCurrentProcessId(),
+            &mut session,
+        )
+    } != 0;
+    let context = crate::cua::DesktopContext::for_windows(
+        service.is_some(),
+        session_known.then_some(session),
+    );
+    let mut daemon = Daemon::new().with_cua(Arc::new(crate::cua::CuaService::for_context(context)));
     // Go init.go:437 steps the system clock on /init; only a guest takes this
     // builder, so a development daemon can never touch the host clock. A
     // timestamped /init still answers its correction header with the step
@@ -324,44 +337,9 @@ async fn serve(
             daemon.set_upgrade_run(install);
         }
     }
-    // Check boot identity as well as the actual session: an SCM successor can
-    // lack a service handle and must still never initialize the desktop stack.
-    let mut session = 0;
-    // SAFETY: current PID is valid and session points to writable u32 storage.
-    let session_known = unsafe {
-        windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(
-            windows_sys::Win32::System::Threading::GetCurrentProcessId(),
-            &mut session,
-        )
-    } != 0;
-    // Resume uses Service as a boot-guard shortcut for console successors too.
-    // SCM attachment identifies a service here; a detached service successor
-    // stays excluded by its inherited Session 0 (or a failed session lookup).
-    let context = crate::ext::cua::LaunchContext::for_windows(
-        service.is_some(),
-        session_known.then_some(session),
-    );
-    let cua = crate::ext::cua::CuaExtension::from_env_with_context(
-        crate::http::ConfigurationState::configuration(daemon.as_ref()).clone(),
-        context,
-    )
-    .await;
-    let extensions = match cua {
-        Some(extension) => {
-            let extension: std::sync::Arc<dyn crate::ext::Extension> =
-                std::sync::Arc::new(extension);
-            crate::ext::Extensions::new(vec![extension]).unwrap_or_else(|error| {
-                eprintln!("cua extension disabled: {error}");
-                crate::ext::Extensions::empty()
-            })
-        }
-        None => crate::ext::Extensions::empty(),
-    };
     let app = match &runtime {
-        Some(runtime) => {
-            app_with_execution_and_extensions(daemon.clone(), runtime.clone(), &extensions)
-        }
-        None => app_with_filesystem_and_extensions(daemon.clone(), &extensions),
+        Some(runtime) => app_with_execution(daemon.clone(), runtime.clone()),
+        None => app_with_filesystem(daemon.clone()),
     };
     let shutdown: Pin<Box<dyn Future<Output = ()> + Send>> = match &service {
         Some(handle) => Box::pin(wait_for_stop(handle.subscribe())),

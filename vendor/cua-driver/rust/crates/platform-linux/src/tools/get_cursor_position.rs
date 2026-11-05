@@ -38,12 +38,13 @@ impl Tool for GetCursorPositionTool {
         // Hyprland reports the real pointer over IPC; return it in the
         // desktop-frame coordinates that get_desktop_state and desktop actions use.
         if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-            let position = tokio::task::spawn_blocking(|| -> anyhow::Result<(i32, i32)> {
-                let (x, y) = crate::wayland::hyprland::cursor_position()?;
-                Ok(crate::wayland::hyprland::desktop_frame()?
-                    .from_layout(x.round() as i32, y.round() as i32))
-            })
-            .await;
+            let position =
+                cua_driver_core::work_scope::spawn_blocking(|| -> anyhow::Result<(i32, i32)> {
+                    let (x, y) = crate::wayland::hyprland::cursor_position()?;
+                    Ok(crate::wayland::hyprland::desktop_frame()?
+                        .from_layout(x.round() as i32, y.round() as i32))
+                })
+                .await;
             // The synthetic registry below holds layout coordinates, not the
             // desktop frame, so a failed compositor query is an error here.
             return match position {
@@ -72,7 +73,7 @@ impl Tool for GetCursorPositionTool {
                 ).with_structured(json!({ "source": "synthetic", "available": false })),
             };
         }
-        let result = tokio::task::spawn_blocking(|| {
+        let result = cua_driver_core::work_scope::spawn_blocking(|| {
             use x11rb::connection::Connection;
             use x11rb::protocol::xproto::ConnectionExt as _;
             use x11rb::rust_connection::RustConnection;

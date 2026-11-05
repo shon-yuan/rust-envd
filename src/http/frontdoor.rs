@@ -123,6 +123,22 @@ fn empty(status: StatusCode) -> Response {
 
 pub(crate) async fn gate(request: Request, next: Next) -> Response {
     let method = request.method().as_str();
+    if super::cua::namespace(request.uri().path()) {
+        let allowed = match request.uri().path() {
+            "/cua/tools" | "/cua/health" | "/cua/metrics" => "GET",
+            "/cua/call" => "POST",
+            _ => return super::json_error(StatusCode::NOT_FOUND, "unknown CUA route"),
+        };
+        if method != allowed {
+            let mut response =
+                super::json_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+            response
+                .headers_mut()
+                .insert(header::ALLOW, HeaderValue::from_static(allowed));
+            return response;
+        }
+        return next.run(request).await;
+    }
     // `routeHTTP` resolves the method before it touches the tree: an unknown
     // method is the no-methods `MethodNotAllowedHandler` — a 405 with no
     // `Allow` — whatever the path is (`mux.go:476-480`).

@@ -64,7 +64,7 @@ async fn parallel_drag_inject(args: &Value) -> ToolResult {
                 .and_then(|v| v.as_str())
                 .unwrap_or("left"),
         ) as u32;
-        let app = match tokio::task::spawn_blocking(move || {
+        let app = match cua_driver_core::work_scope::spawn_blocking(move || {
             crate::wayland::inject_target_for_window(xid)
         })
         .await
@@ -82,7 +82,11 @@ async fn parallel_drag_inject(args: &Value) -> ToolResult {
         });
     }
     let n = drags.len();
-    match tokio::task::spawn_blocking(move || crate::wayland::inject_parallel_drags(&drags)).await {
+    match cua_driver_core::work_scope::spawn_blocking(move || {
+        crate::wayland::inject_parallel_drags(&drags)
+    })
+    .await
+    {
         Ok(Ok(())) => ToolResult::text(format!(
             "Ran {n} concurrent drags (multi-cursor via cua-compositor)."
         )),
@@ -140,7 +144,11 @@ impl Tool for ParallelMouseDragTool {
                  or run the target under X11.",
             );
         }
-        match tokio::task::spawn_blocking(crate::input::check_parallel_pointer_support).await {
+        match cua_driver_core::work_scope::spawn_blocking(
+            crate::input::check_parallel_pointer_support,
+        )
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return ToolResult::error(e.to_string()),
             Err(e) => return ToolResult::error(format!("Task error: {e}")),
@@ -219,14 +227,15 @@ impl Tool for ParallelMouseDragTool {
                 .unwrap_or(if is_fn { 1500 } else { 500 });
 
             // One translate gives the window origin; the path is a pure offset.
-            let origin =
-                match tokio::task::spawn_blocking(move || window_local_to_screen(xid, 0.0, 0.0))
-                    .await
-                {
-                    Ok(Ok(o)) => o,
-                    Ok(Err(e)) => return ToolResult::error(e.to_string()),
-                    Err(e) => return ToolResult::error(format!("Task error: {e}")),
-                };
+            let origin = match cua_driver_core::work_scope::spawn_blocking(move || {
+                window_local_to_screen(xid, 0.0, 0.0)
+            })
+            .await
+            {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => return ToolResult::error(e.to_string()),
+                Err(e) => return ToolResult::error(format!("Task error: {e}")),
+            };
             let path: Vec<(i32, i32)> = local
                 .iter()
                 .map(|(lx, ly)| {

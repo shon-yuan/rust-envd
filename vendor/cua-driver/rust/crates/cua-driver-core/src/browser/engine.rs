@@ -691,9 +691,9 @@ impl BrowserEngine {
                             if let Some(protected) = grant.protected_consent.as_ref() {
                                 protected.revoke();
                             }
-                            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                            if tokio::runtime::Handle::try_current().is_ok() {
                                 let engine = engine.clone();
-                                runtime.spawn(async move {
+                                crate::work_scope::spawn(async move {
                                     // A normal session end parks the already-consented
                                     // socket for the next approved session, unless the
                                     // driver is turning remote debugging back off.

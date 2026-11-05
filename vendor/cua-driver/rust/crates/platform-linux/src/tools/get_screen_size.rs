@@ -36,7 +36,7 @@ impl Tool for GetScreenSizeTool {
         if let Err(result) = parse_typed_input::<GetScreenSizeInput>("get_screen_size", args) {
             return result;
         }
-        let result = tokio::task::spawn_blocking(|| {
+        let result = cua_driver_core::work_scope::spawn_blocking(|| {
             if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
                 // Shared manifest admission needs content-free display
                 // metadata even when this native desktop has no X11 DISPLAY.

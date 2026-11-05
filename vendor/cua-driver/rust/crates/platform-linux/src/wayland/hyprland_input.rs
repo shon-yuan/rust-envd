@@ -2719,7 +2719,7 @@ mod tests {
         let (finished, done) = tokio::sync::oneshot::channel();
         let call = tokio::spawn(async move {
             let (_guard, cancellation) = ActionCancellation::invocation();
-            tokio::task::spawn_blocking(move || {
+            cua_driver_core::work_scope::spawn_blocking(move || {
                 started.send(()).unwrap();
                 let result = queued
                     .lock(&cancellation)
@@ -2792,7 +2792,7 @@ mod tests {
         });
         let call = tokio::spawn(async move {
             let (_guard, cancellation) = ActionCancellation::invocation();
-            tokio::task::spawn_blocking(move || {
+            cua_driver_core::work_scope::spawn_blocking(move || {
                 client.cancellation = cancellation;
                 let mut slot = Some(client);
                 let result = dispatch_in_slot(

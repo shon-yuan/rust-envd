@@ -254,10 +254,11 @@ async fn attach_focused_cell(mut result: ToolResult, pid: u32) -> ToolResult {
     if result.is_error == Some(true) {
         return result;
     }
-    let focused = tokio::task::spawn_blocking(move || crate::atspi::focused_control(pid))
-        .await
-        .ok()
-        .flatten();
+    let focused =
+        cua_driver_core::work_scope::spawn_blocking(move || crate::atspi::focused_control(pid))
+            .await
+            .ok()
+            .flatten();
     let Some((role, name)) = focused.filter(|(role, name)| {
         let role = role.to_ascii_lowercase();
         (role.contains("cell") || role == "table cell") && !name.trim().is_empty()
@@ -463,7 +464,7 @@ impl ClickTool {
         modifiers: &[String],
     ) -> ToolResult {
         let observed_for_state = observed.clone();
-        let decided = tokio::task::spawn_blocking(move || {
+        let decided = cua_driver_core::work_scope::spawn_blocking(move || {
             decide_foreground_element_placement(pid, &observed_for_state, xid_hint, placement)
         })
         .await;
@@ -488,7 +489,7 @@ impl ClickTool {
                 let (sx, sy, redirect_note) = if let Some(oref) = owned_ref {
                     let (pid_c, oref_c, sx_i, sy_i) =
                         (pid, oref, sx.round() as i32, sy.round() as i32);
-                    let ownership = tokio::task::spawn_blocking(move || {
+                    let ownership = cua_driver_core::work_scope::spawn_blocking(move || {
                         crate::atspi::native::hit_test::point_ownership(
                             pid_c, xid, &oref_c, sx_i, sy_i,
                         )
@@ -1057,18 +1058,20 @@ impl Tool for ClickTool {
             let placed = token.clone();
             let placement = tokio::time::timeout(
                 ELEMENT_AX_BUDGET,
-                tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
-                    let (cx, cy) = element_screen_center(pid, &placed, xid_hint)?;
-                    let xid = xid_hint
-                        .or_else(|| {
-                            crate::x11::list_windows(Some(pid))
-                                .into_iter()
-                                .next()
-                                .map(|w| w.xid)
-                        })
-                        .unwrap_or(0);
-                    Ok((xid, cx, cy))
-                }),
+                cua_driver_core::work_scope::spawn_blocking(
+                    move || -> anyhow::Result<(u64, f64, f64)> {
+                        let (cx, cy) = element_screen_center(pid, &placed, xid_hint)?;
+                        let xid = xid_hint
+                            .or_else(|| {
+                                crate::x11::list_windows(Some(pid))
+                                    .into_iter()
+                                    .next()
+                                    .map(|w| w.xid)
+                            })
+                            .unwrap_or(0);
+                        Ok((xid, cx, cy))
+                    },
+                ),
             )
             .await;
             let placement = match placement {
@@ -1145,7 +1148,7 @@ impl Tool for ClickTool {
             let menu_entry_on_screen = real_pointer && element_is_menu_role(&observed.role) && {
                 // A bounded D-Bus round-trip: off the runtime thread.
                 let observed_for_state = observed.clone();
-                let showing = tokio::task::spawn_blocking(move || {
+                let showing = cua_driver_core::work_scope::spawn_blocking(move || {
                     crate::atspi::element_showing_observed(&observed_for_state)
                 })
                 .await;
@@ -1179,7 +1182,7 @@ impl Tool for ClickTool {
                 let guard_pid = (!delivery.is_foreground()).then_some(pid);
                 let ax_result = match tokio::time::timeout(
                     ELEMENT_AX_BUDGET,
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::work_scope::spawn_blocking(move || {
                         // Background: an AT-SPI action can open a menu (GTK/VCL
                         // grab the keyboard and activate the toplevel) or map a
                         // dialog mutter then focuses. Snapshot, act, restore.
@@ -1256,7 +1259,7 @@ impl Tool for ClickTool {
                         "an exact window_id or window-bound element token is required",
                     );
                 };
-                let point = tokio::task::spawn_blocking(move || {
+                let point = cua_driver_core::work_scope::spawn_blocking(move || {
                     resolve_element_local_coords(pid, &token, Some(xid))
                 })
                 .await;
@@ -1491,7 +1494,11 @@ impl Tool for ClickTool {
             }
         }
         if desktop_frame {
-            match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await {
+            match cua_driver_core::work_scope::spawn_blocking(move || {
+                desktop_to_window_local(xid, x, y)
+            })
+            .await
+            {
                 Ok(Ok((lx, ly))) => {
                     x = lx;
                     y = ly;
@@ -1522,7 +1529,7 @@ impl Tool for ClickTool {
         {
             Some((sx as f64, sy as f64))
         } else {
-            tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y))
+            cua_driver_core::work_scope::spawn_blocking(move || window_local_to_screen(xid, x, y))
                 .await
                 .ok()
                 .and_then(|r| r.ok())
@@ -1563,7 +1570,7 @@ impl Tool for ClickTool {
                 );
             }
             if button == 1 && count == 1 {
-                let semantic = tokio::task::spawn_blocking(move || {
+                let semantic = cua_driver_core::work_scope::spawn_blocking(move || {
                     crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
                 })
                 .await;

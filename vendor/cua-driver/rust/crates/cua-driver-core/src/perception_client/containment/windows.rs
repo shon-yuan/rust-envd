@@ -716,7 +716,7 @@ impl Process {
         // The blocking waiter owns a duplicate so cancellation may drop and
         // close `Process` without closing a handle under WaitForSingleObject.
         let process = OwnedHandle::duplicate_io(self.process as Handle)?;
-        let code = tokio::task::spawn_blocking(move || unsafe {
+        let code = crate::work_scope::spawn_blocking(move || unsafe {
             let status = WaitForSingleObject(process.get(), INFINITE);
             classify_wait_status(status, std::io::Error::last_os_error)?;
             let mut code = 0_u32;

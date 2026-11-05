@@ -129,7 +129,7 @@ impl Tool for HotkeyTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || {
+                let windows = cua_driver_core::work_scope::spawn_blocking(move || {
                     crate::x11::list_windows(if pid == 0 { None } else { Some(pid) })
                 })
                 .await
@@ -330,7 +330,7 @@ impl Tool for HotkeyTool {
             }
             let mut chord = mods.clone();
             chord.push(key.clone());
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::wayland::inject_hotkey(pid, xid, &chord)
             })
             .await;
@@ -351,7 +351,7 @@ impl Tool for HotkeyTool {
             && is_chromium_embedder(pid)
         {
             if let Some(element) = token.clone() {
-                let coordinates = tokio::task::spawn_blocking(move || {
+                let coordinates = cua_driver_core::work_scope::spawn_blocking(move || {
                     resolve_element_local_coords(pid, &element, Some(xid))
                 })
                 .await;
@@ -372,8 +372,10 @@ impl Tool for HotkeyTool {
         // does it inside `background_key_route`, under the focus guard.
         if let Some(element) = token.clone().filter(|_| delivery.is_foreground()) {
             let element_index = element.index;
-            let focused =
-                tokio::task::spawn_blocking(move || crate::atspi::focus_token(pid, &element)).await;
+            let focused = cua_driver_core::work_scope::spawn_blocking(move || {
+                crate::atspi::focus_token(pid, &element)
+            })
+            .await;
             match focused {
                 Ok(Ok(true)) => {}
                 Ok(Ok(false)) => {

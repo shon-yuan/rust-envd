@@ -45,17 +45,13 @@ REQUIRED_FILES = (
     "vendor/hyper/PATCHES.md",
     "Cargo.toml",
     "Cargo.lock",
-    # The cua library is also linked by the desktop variant. Keep its manifest
-    # and standalone worker's locked notice bundle in the distribution superset.
-    "third_party/cua-worker/NOTICES.md",
-    "cua-worker/Cargo.toml",
-    "cua-worker/Cargo.lock",
+    # Direct optional desktop dependencies are covered by the root lockfile.
     "vendor/cua-driver/LICENSE",
     "vendor/cua-driver/PROVENANCE.md",
 )
 LICENSES_DIR = "third_party/licenses"
-WORKER_LICENSES_DIR = "third_party/cua-worker/licenses"
-MANIFEST_SCHEMA = 1
+# Schema 2 covers the single active graph; schema 1 also had worker_license_tree.
+MANIFEST_SCHEMA = 2
 
 
 def fail(message: str) -> None:
@@ -109,8 +105,8 @@ def main() -> int:
     parser.add_argument("--binary", required=True, help="built envd binary")
     parser.add_argument("--output", help="write the manifest here (default: stdout)")
     parser.add_argument(
-        "--artifact-kind", choices=("base", "desktop"), default="base",
-        help="built envd variant (default: base; desktop enables cua-desktop)",
+        "--artifact-kind", choices=("base", "desktop"), default="desktop",
+        help="built envd variant (default: desktop; base disables default features)",
     )
     parser.add_argument(
         "--target", help="rustc target triple the binary was built for"
@@ -130,9 +126,8 @@ def main() -> int:
         fail(f"--binary is not a file: {binary}")
 
     missing = [name for name in REQUIRED_FILES if not (REPO / name).is_file()]
-    for directory in (LICENSES_DIR, WORKER_LICENSES_DIR):
-        if not (REPO / directory).is_dir():
-            missing.append(directory + "/")
+    if not (REPO / LICENSES_DIR).is_dir():
+        missing.append(LICENSES_DIR + "/")
     if missing:
         fail("missing covered file(s): " + ", ".join(missing))
 
@@ -177,12 +172,11 @@ def main() -> int:
         "features": features,
         "target": args.target,
         "build_command": "cargo build --locked -j4 --release"
-        + (" --features " + ",".join(features) if features else "")
+        + (" --no-default-features" if args.artifact_kind == "base" else "")
         + (f" --target {args.target}" if args.target else ""),
         "binary": file_record(binary),
         "covered_files": [file_record(REPO / name) for name in REQUIRED_FILES],
         "license_tree": tree_record(REPO / LICENSES_DIR),
-        "worker_license_tree": tree_record(REPO / WORKER_LICENSES_DIR),
         "notice_check": "ok",
     }
 

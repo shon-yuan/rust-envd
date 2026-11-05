@@ -94,7 +94,7 @@ impl Tool for ScrollTool {
             };
             let ticks = sign * amount as i32;
             let dir_disp = direction.as_str();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::input::send_wheel_synthesized(sx, sy, ticks, horizontal)
             })
             .await;
@@ -134,7 +134,7 @@ impl Tool for ScrollTool {
         let hwnd = match hwnd_opt {
             Some(h) => h,
             None => {
-                let windows = tokio::task::spawn_blocking({
+                let windows = cua_driver_core::work_scope::spawn_blocking({
                     let admitted = admitted.clone();
                     move || {
                         let _admission = &admitted;
@@ -180,7 +180,7 @@ impl Tool for ScrollTool {
                 None
             };
             let direction_for_uia = direction.clone();
-            let uia_result = tokio::task::spawn_blocking({
+            let uia_result = cua_driver_core::work_scope::spawn_blocking({
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
@@ -304,7 +304,7 @@ impl Tool for ScrollTool {
                 };
                 Some(bitmap_to_screen(hwnd, x, y))
             } else {
-                tokio::task::spawn_blocking({
+                cua_driver_core::work_scope::spawn_blocking({
                     let admitted = admitted.clone();
                     move || {
                         let _admission = &admitted;
@@ -330,7 +330,7 @@ impl Tool for ScrollTool {
             };
             let dir_disp = direction.clone();
             let tick_disp = ticks.abs();
-            let result = tokio::task::spawn_blocking({
+            let result = cua_driver_core::work_scope::spawn_blocking({
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
@@ -348,7 +348,7 @@ impl Tool for ScrollTool {
             };
         }
 
-        let result = tokio::task::spawn_blocking({
+        let result = cua_driver_core::work_scope::spawn_blocking({
             let admitted = admitted.clone();
             move || -> anyhow::Result<()> {
                 let _admission = &admitted;

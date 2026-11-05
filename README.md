@@ -20,14 +20,13 @@ carrying connect-go error-text parity; its changes are recorded in
 `vendor/connectrpc/PATCHES.md`. `vendor/hyper/` is an MIT in-tree fork of
 `hyper` 1.12.0 carrying Go `net/http`'s HTTP/1.1 trailer write path and
 chunked-body limits; its changes are recorded in `vendor/hyper/PATCHES.md`.
-`vendor/cua-driver/` contains MIT-licensed Cua Driver crates used by the
-optional desktop build and `coorworker-cua` worker (provenance in
+`vendor/cua-driver/` contains MIT-licensed Cua Driver crates for envd's
+in-process desktop registry (provenance in
 `vendor/cua-driver/PROVENANCE.md`); the AGPL perception crates and the FSL
 `cua-spacesd` are excluded.
 The distributable notice bundle
-([`third_party/NOTICES.md`](third_party/NOTICES.md), `third_party/licenses/`;
-the worker's separate bundle is under `third_party/cua-worker/`) and the
-release manifest procedure are specified in
+([`third_party/NOTICES.md`](third_party/NOTICES.md), `third_party/licenses/`)
+and release manifest procedure are specified in
 [`third_party/PACKAGING.md`](third_party/PACKAGING.md).
 Dependency security updates, remaining maintenance warnings and the Linux
 handover ownership migration are recorded in
@@ -66,7 +65,7 @@ executable:
 cargo build --locked --bin coorworker-envd
 ```
 
-Evidence: the [dependency maintenance regression](docs/windows-dependency-regression.md)
+Historical Windows evidence: the [dependency maintenance regression](docs/windows-dependency-regression.md)
 runs natively on Windows 11 at commit `c3cb81a`: 321 library tests plus 5 base
 or 9 desktop integration tests, and 16 standalone-worker tests passed. The
 official E2B Python SDK 2.62.1 drives a live guest through its own codec,
@@ -83,50 +82,71 @@ The full API matrix, semantics, native evidence log and open decisions are in
 Hypervisor/Hyper-V (the guest image pipeline) is separate open work; the
 daemon itself runs in an existing Windows VM.
 
-## Extensions
+## Native CUA
 
-The official envd surface above is the compatibility contract and stays
-frozen. Extensions are mounted under their own first path segment after the
-envd frontdoor/authorization layers. They own their authentication policy;
-the opt-in shared CUA modes read the current protected envd credential without
-changing S0's headers, exceptions, or errors. With no extension configured,
-the router remains the parity daemon.
+The official envd surface above remains frozen. The implemented
+[native CUA contract](docs/native-cua.md) adds four REST routes on the existing
+envd listener, inside the S0 routing and authentication stack:
 
-CUA supports these deployment modes:
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /cua/tools` | List tools with `name`, `description` and `input_schema`. |
+| `POST /cua/call` | Execute `{"name":"…","arguments":{…}}`; return `success`, `content` and optional `data`. |
+| `GET /cua/health` | Report passive runtime availability and reason without touching the desktop. |
+| `GET /cua/metrics` | Expose bounded Prometheus tool counters, latency and runtime readiness. |
 
-| `COORWORKER_CUA_MODE` | Execution | Client credential |
-| --- | --- | --- |
-| unset or `legacy` | Existing supervised/adopted `coorworker-cua` worker | Existing worker/proxy tokens |
-| `embedded` | Inside envd, in the desktop user's session | Current envd `/init` token as Bearer |
-| `shared-external` | Deployment-managed user-session helper | Current envd `/init` token as Bearer |
+Every CUA route, including unknown `/cua` paths, requires completed envd
+initialization and a nonempty current `X-Access-Token`. Bearer, Basic and file
+signatures cannot substitute for that header. Authentication precedes body
+decoding; existing CORS preflight behavior and S0 authentication exceptions
+remain unchanged. Token rotation affects subsequent requests; an admitted
+action can finish after rotation. Calls use the native JSON body above, with
+exactly `name` and object-valued `arguments`; there is no JSON-RPC envelope or
+initialization handshake. Images use `mime_type`, tool failures use
+`success:false`, and transport errors use S0's `code`/`message` JSON envelope.
+Native `data` preserves raw driver diagnostics, with `{"code":"tool_error"}`
+for a failure without structured data. Discovery omits the vendor's normalized
+output schema because it does not describe all raw diagnostic payloads.
 
-Build the desktop executable with `cargo build --locked -j4 --features cua-desktop`.
-Native Windows desktop and standalone-worker builds also require the MSVC v143
-x64/x86 Spectre-mitigated libraries matching the selected toolset; see the
-[build prerequisites](third_party/PACKAGING.md#canonical-build).
-The default build keeps desktop dependencies disabled and supports static musl
-packaging. Embedded mode serves `POST /cua/mcp` on envd's own listener, with no
-worker child or extra port. CUA stays closed until an envd token is installed;
-rotation and authorized reset affect subsequent requests. Native Windows
-DPAPI provisioning supports rotation, but empty metadata cannot authorize a live
-reset; `/init {}` returns 401 and preserves the token. See the
-[native CUA acceptance](docs/windows-cua-acceptance.md#native-live-reset-limitation).
-S0 still uses `X-Access-Token`.
+The only execution engine is the in-process vendored desktop registry, linked
+directly by envd. There is no extension mounting framework, MCP endpoint,
+worker, helper transport or execution-mode selector. `/cua/mcp`, `/cua/info`
+and independent `coorworker-cua` startup are removed. Remove old
+`COORWORKER_CUA_*` configuration and `CUA_ENV_TOKEN` from the launch
+environment: production startup rejects them with a migration error.
 
-Windows service launches, service handover successors, session zero, and
-unknown sessions cannot initialize embedded desktop execution. Use
-`shared-external` there: start `coorworker-cua` in the logged-in session and
-supply matching local transport credentials via `CUA_ENV_TOKEN` (or the
-helper's `--token-file`). The external client needs only the envd credential;
-the envd credential is never sent to the helper. The
-[native Windows CUA acceptance](docs/windows-cua-acceptance.md) establishes
-embedded capture/input/window operations and actual SCM/helper lifecycle,
-recovery and credential boundaries in a disposable Windows 11 copy.
+The ordinary `cargo build --locked -j4` enables `cua-desktop` by default.
+Linux desktop builds need the X11/XInput/XTest/XFixes/XRandR/XComposite/XRender/
+XExt/XDamage and xkbcommon development headers. Windows desktop builds require
+matching MSVC v143 x64/x86 Spectre-mitigated libraries. Desktop dependencies
+remain optional: `--no-default-features` builds the desktop-free base/static
+guest; authenticated CUA operations then report unavailable.
 
-Legacy `COORWORKER_CUA_BIN`, `COORWORKER_CUA_EXTERNAL`, proxy tokens, restart
-budgets, and observed recoveries retain their existing behavior. Shared modes
-are explicit migration choices. Runtime discovery, readiness, metrics, setup,
-and licensing details are in [`docs/extensions.md`](docs/extensions.md).
+Linux and known Windows desktop user sessions are eligible for the registry.
+Windows SCM-attached processes, Session 0, service handover successors in
+Session 0, and unknown sessions report CUA unavailable before constructing a
+registry. They do not contact or launch a helper; S0 filesystem and process
+services continue serving. Model/provider credentials belong in AgentHost.
+
+Local verification of the integrated native API passed: default 907 tests and
+base 881 tests, zero failures, with 24 doctests ignored in each
+configuration. Final strict Clippy for default and base across all targets,
+formatting, the Windows base MSVC library/binary crosscheck, 17 distribution
+checks, notices verification and the rebuild passed. The desktop matrix includes 15 completion
+regressions covering finite work after timeout, disconnect and panic, including
+resumed I/O after expiry. The final Rust recheck closed the deadline finding
+alongside code/security follow-up. Observed Linux smoke found 63 tools, one
+envd process and one listener, rejected old MCP/JSON-RPC/configuration, and
+performed no desktop actions; the final rebuilt repetition passed. Windows
+native desktop/live S0 execution, a fresh musl build, fresh Go/SDK comparison,
+remote CI and real desktop actions are outside this evidence; no commit, push,
+merge or deployment is claimed. See [the local verification record](docs/native-cua.md#verified-local-state).
+
+The earlier [Windows CUA acceptance](docs/windows-cua-acceptance.md) records
+embedded capture/input/window actions and SCM/helper recovery at an older
+revision. Its DPAPI rotation and live-reset limitation remain historical
+evidence. Current protocol details, limits, migration guidance and explicitly
+scoped older evidence are in [`docs/extensions.md`](docs/extensions.md).
 
 ## Differences from the Go daemon
 
@@ -225,7 +245,7 @@ on the kernel command line. Build the static guest binary first:
 ```sh
 CC_x86_64_unknown_linux_musl=/usr/bin/clang \
 CFLAGS_x86_64_unknown_linux_musl='-ffreestanding -nostdlibinc -DRING_CORE_NOSTDLIBINC=1' \
-cargo build -j4 --locked -p coorworker-envd \
+cargo build -j4 --locked -p coorworker-envd --no-default-features \
   --target x86_64-unknown-linux-musl --release --bin coorworker-envd
 ```
 

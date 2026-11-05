@@ -31,7 +31,7 @@ impl Tool for GetAccessibilityTreeTool {
         })
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
-        let (procs, windows) = tokio::task::spawn_blocking(|| {
+        let (procs, windows) = cua_driver_core::work_scope::spawn_blocking(|| {
             (
                 crate::proc_fs::list_processes(),
                 visible_live_desktop_windows(crate::wayland::list_windows_dispatch(None)),

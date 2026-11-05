@@ -30,7 +30,7 @@ jobs:
           PROFILE: ${{ matrix.profile }}
         run: |
           features=()
-          if [ "$PROFILE" = desktop ]; then features=(--features cua-desktop); fi
+          if [ "$PROFILE" = base ]; then features=(--no-default-features); fi
           cargo build --locked -j4 "${features[@]}"
           cargo test --locked -j4 "${features[@]}"
           cargo clippy --locked -j4 --all-targets "${features[@]}" -- -D warnings
@@ -38,22 +38,21 @@ jobs:
       - name: Base dependency graph excludes desktop
         if: matrix.profile == 'base'
         run: |
-          cargo tree --locked -e normal --prefix none > /tmp/base-dependencies
+          cargo tree --locked --no-default-features -e normal --prefix none > /tmp/base-dependencies
           if rg '^(coorworker-cua|cua-driver-core|platform-linux|platform-windows|x11|atspi|rquickjs) ' /tmp/base-dependencies; then exit 1; fi
-      - name: Build, test and lint standalone worker
+      - name: Default dependency graph includes embedded desktop
         if: matrix.profile == 'desktop'
         run: |
-          cargo build --locked -j4 --manifest-path cua-worker/Cargo.toml --bin coorworker-cua
-          cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins --tests
-          cargo clippy --locked -j4 --manifest-path cua-worker/Cargo.toml --all-targets -- -D warnings
-          cargo fmt --manifest-path cua-worker/Cargo.toml --check
-      - name: Fetch both graphs and verify distribution notices
+          cargo tree --locked -e normal --prefix none > /tmp/default-dependencies
+          rg '^cua-driver-core ' /tmp/default-dependencies
+          rg '^platform-linux ' /tmp/default-dependencies
+          if rg '^coorworker-cua ' /tmp/default-dependencies; then exit 1; fi
+      - name: Fetch root graph and verify distribution notices
         if: matrix.profile == 'desktop'
         run: |
           cargo fetch --locked
-          cargo fetch --locked --manifest-path cua-worker/Cargo.toml
-          python3 -I scripts/test_distribution.py
-          python3 -I scripts/generate_notices.py --check
+          python3 -I -B scripts/test_distribution.py
+          python3 -I -B scripts/generate_notices.py --check
 
   linux-static:
     runs-on: ubuntu-latest
@@ -63,7 +62,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
-      - run: cargo build --locked -j4 --release --target x86_64-unknown-linux-musl
+      - run: cargo build --locked -j4 --no-default-features --release --target x86_64-unknown-linux-musl
       - name: Verify static base executable
         run: |
           file target/x86_64-unknown-linux-musl/release/coorworker-envd
@@ -79,9 +78,9 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Check Windows base daemon
-        run: cargo check --locked -j4 --target x86_64-pc-windows-msvc --lib --bins
+        run: cargo check --locked -j4 --no-default-features --target x86_64-pc-windows-msvc --lib --bins
       - name: Build shared crate for Windows
-        run: cargo build --locked -j4 --target x86_64-pc-windows-msvc --lib
+        run: cargo build --locked -j4 --no-default-features --target x86_64-pc-windows-msvc --lib
 
   windows-test:
     runs-on: windows-latest
@@ -95,11 +94,9 @@ jobs:
         run: choco install protoc -y --no-progress
       - name: Test Windows base contracts
         if: matrix.profile == 'base'
-        run: cargo test --locked -j4 --lib --test cua_context --test cua_admission --test cua_factory --test cua_ipv6
+        run: cargo test --locked -j4 --no-default-features --lib --test cua_native
       - name: Build and test Windows desktop contracts
         if: matrix.profile == 'desktop'
         run: |
-          cargo build --locked -j4 --features cua-desktop
-          cargo test --locked -j4 --features cua-desktop --lib --test cua_context --test cua_admission --test cua_factory --test cua_ipv6 --test cua_embedded
-          cargo build --locked -j4 --manifest-path cua-worker/Cargo.toml --bin coorworker-cua
-          cargo test --locked -j4 --manifest-path cua-worker/Cargo.toml --lib --bins --tests
+          cargo build --locked -j4
+          cargo test --locked -j4 --lib --test cua_native --test cua_wayland --test cua_completion

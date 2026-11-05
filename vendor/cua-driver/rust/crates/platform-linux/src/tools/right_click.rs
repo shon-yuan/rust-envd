@@ -108,16 +108,19 @@ impl Tool for RightClickTool {
             let idx = token.index;
             let xid_hint = window_id_resolved;
             let target = token.clone();
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
-                checked_element_local_coords(pid, &target, xid_hint)
-            })
+            let result = cua_driver_core::work_scope::spawn_blocking(
+                move || -> anyhow::Result<(u64, f64, f64)> {
+                    checked_element_local_coords(pid, &target, xid_hint)
+                },
+            )
             .await;
             return match result {
                 Ok(Ok((xid, lx, ly))) => {
-                    if let Ok(Ok(((sx, sy), rect))) = tokio::task::spawn_blocking(move || {
-                        element_screen_center_and_rect(pid, &token, Some(xid))
-                    })
-                    .await
+                    if let Ok(Ok(((sx, sy), rect))) =
+                        cua_driver_core::work_scope::spawn_blocking(move || {
+                            element_screen_center_and_rect(pid, &token, Some(xid))
+                        })
+                        .await
                     {
                         crate::overlay::send_command_for(
                             cursor_id.clone(),
@@ -228,7 +231,11 @@ impl Tool for RightClickTool {
             y *= ratio;
         }
         if desktop_frame {
-            match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await {
+            match cua_driver_core::work_scope::spawn_blocking(move || {
+                desktop_to_window_local(xid, x, y)
+            })
+            .await
+            {
                 Ok(Ok((lx, ly))) => {
                     x = lx;
                     y = ly;
@@ -255,7 +262,7 @@ impl Tool for RightClickTool {
         {
             Some((sx as f64, sy as f64))
         } else {
-            tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y))
+            cua_driver_core::work_scope::spawn_blocking(move || window_local_to_screen(xid, x, y))
                 .await
                 .ok()
                 .and_then(|r| r.ok())

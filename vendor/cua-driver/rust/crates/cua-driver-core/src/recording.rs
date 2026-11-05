@@ -266,14 +266,14 @@ fn run_state_hook(
     let worker_abandoned = abandoned.clone();
     let spawned = std::thread::Builder::new()
         .name("cua-recording-state".into())
-        .spawn(move || {
+        .spawn(crate::work_scope::bind_current(move || {
             let result = hook(window_id, pid, budget);
             if worker_abandoned.swap(true, Ordering::SeqCst) {
                 release_abandoned_state_capture(key);
             } else {
                 let _ = sender.send(result);
             }
-        });
+        }));
     if spawned.is_err() {
         return StateCapture::unavailable("capture_failed");
     }

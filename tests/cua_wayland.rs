@@ -1,6 +1,6 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "cua-desktop"))]
 
-//! Exercise the shipped worker over MCP, with no connection to the host desktop.
+//! Exercise the shipped envd native CUA API without connecting to the host desktop.
 //! Workspace projections follow Hyprland v0.56.2 src/debug/HyprCtl.cpp and
 //! v0.57.0 src/ipc/s1/Commands.cpp (getMonitorData/getWindowData).
 
@@ -18,6 +18,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const SIGNATURE: &str = "0123456789abcdef_1700000000_123456789";
+const TOKEN: &str = "wayland-native-test-credential";
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct PrivateDir(PathBuf);
@@ -26,7 +27,7 @@ impl PrivateDir {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = PathBuf::from(format!(
-            "/tmp/cww-{}-{}",
+            "/tmp/cew-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -192,16 +193,16 @@ fn serve_ipc(mut stream: UnixStream, script: &Mutex<Script>) -> io::Result<()> {
     stream.write_all(reply.as_bytes())
 }
 
-struct Worker {
+struct Envd {
     child: Child,
-    stderr: Option<JoinHandle<()>>,
+    stdout: Option<JoinHandle<()>>,
     address: SocketAddr,
 }
 
-impl Worker {
+impl Envd {
     fn start(root: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_coorworker-cua"))
-            .args(["--listen", "127.0.0.1:0"])
+        let mut child = Command::new(env!("CARGO_BIN_EXE_coorworker-envd"))
+            .args(["--development", "--listen", "127.0.0.1:0"])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", root.join("home"))
@@ -212,70 +213,83 @@ impl Worker {
             .env("TOKIO_WORKER_THREADS", "2")
             .current_dir(root)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
         let (ready, receiver) = mpsc::channel();
         let reader = thread::spawn(move || {
-            for line in BufReader::new(stderr).lines() {
+            for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if let Some(address) = line
-                    .strip_prefix("coorworker-cua: MCP on http://")
-                    .and_then(|rest| rest.split('/').next())
+                    .strip_prefix("envd listening ")
                     .and_then(|address| address.parse::<SocketAddr>().ok())
                 {
                     let _ = ready.send(address);
                 }
             }
         });
-        // Own the process before waiting, so a readiness failure also cleans up.
-        let mut worker = Self {
+        // Own the process before waiting, so readiness and /init failures clean up.
+        let mut envd = Self {
             child,
-            stderr: Some(reader),
+            stdout: Some(reader),
             address: "127.0.0.1:0".parse().unwrap(),
         };
-        worker.address = receiver
+        envd.address = receiver
             .recv_timeout(Duration::from_secs(10))
-            .expect("worker did not print its actual MCP listening address");
-        worker
+            .expect("envd did not print its actual listening address");
+        let body = envd.post("/init", json!({"accessToken": TOKEN}), None, 204);
+        assert!(body.is_empty(), "unexpected /init body: {body}");
+        envd
     }
 
-    fn rpc(&self, method: &str, params: Value) -> Value {
-        let request = json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params});
-        let body = request.to_string();
+    fn post(&self, path: &str, payload: Value, token: Option<&str>, status: u16) -> String {
+        let body = payload.to_string();
         let mut stream = TcpStream::connect_timeout(&self.address, IO_TIMEOUT).unwrap();
         stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
-        write!(stream, "POST /mcp HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            self.address, body.len(), body).unwrap();
+        write!(stream, "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            self.address, body.len()).unwrap();
+        if let Some(token) = token {
+            write!(stream, "X-Access-Token: {token}\r\n").unwrap();
+        }
+        write!(stream, "\r\n{body}").unwrap();
         let mut bytes = Vec::new();
         stream.take(1024 * 1024).read_to_end(&mut bytes).unwrap();
         let response = String::from_utf8(bytes).unwrap();
         let (headers, body) = response
             .split_once("\r\n\r\n")
             .expect("HTTP response headers");
-        assert!(headers.starts_with("HTTP/1.1 200 "), "{response}");
-        let value: Value = serde_json::from_str(body).expect("JSON HTTP response");
-        assert_eq!(value["id"], 1, "{value}");
-        assert!(value.get("error").is_none(), "JSON-RPC error: {value}");
-        value["result"].clone()
+        assert!(
+            headers.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{path}: {response}"
+        );
+        body.to_owned()
     }
 
     fn list(&self, arguments: Value) -> Value {
-        self.rpc(
-            "tools/call",
+        let body = self.post(
+            "/cua/call",
             json!({"name":"list_windows", "arguments":arguments}),
-        )
+            Some(TOKEN),
+            200,
+        );
+        let value: Value = serde_json::from_str(&body).expect("native JSON HTTP response");
+        assert!(value["success"].is_boolean(), "{value}");
+        assert!(value["content"].is_array(), "{value}");
+        for legacy in ["jsonrpc", "id", "result", "isError", "structuredContent"] {
+            assert!(value.get(legacy).is_none(), "legacy {legacy}: {value}");
+        }
+        value
     }
 }
 
-impl Drop for Worker {
+impl Drop for Envd {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(reader) = self.stderr.take() {
+        if let Some(reader) = self.stdout.take() {
             let _ = reader.join();
         }
     }
@@ -283,7 +297,7 @@ impl Drop for Worker {
 
 struct Fixture {
     // Drop the child before its private listeners, and listeners before paths.
-    worker: Worker,
+    envd: Envd,
     compositor: Compositor,
     _dir: PrivateDir,
 }
@@ -292,17 +306,9 @@ impl Fixture {
     fn new(monitors: Value, clients: Value) -> Self {
         let dir = PrivateDir::new();
         let compositor = Compositor::new(&dir.0, monitors, clients);
-        let worker = Worker::start(&dir.0);
-        let initialized = worker.rpc(
-            "initialize",
-            json!({
-                "protocolVersion":"2025-06-18", "capabilities":{},
-                "clientInfo":{"name":"wayland-windows-fixture", "version":"1"}
-            }),
-        );
-        assert!(initialized["protocolVersion"].is_string(), "{initialized}");
+        let envd = Envd::start(&dir.0);
         Self {
-            worker,
+            envd,
             compositor,
             _dir: dir,
         }
@@ -339,10 +345,10 @@ fn client(address: &str, workspace: Value) -> Value {
 }
 
 fn windows(result: &Value) -> Vec<Value> {
-    assert_ne!(result["isError"], true, "{result}");
-    result["structuredContent"]["windows"]
+    assert_eq!(result["success"], true, "{result}");
+    result["data"]["windows"]
         .as_array()
-        .unwrap_or_else(|| panic!("missing structured windows: {result}"))
+        .unwrap_or_else(|| panic!("missing native windows data: {result}"))
         .clone()
 }
 
@@ -377,34 +383,30 @@ fn legacy_numeric_workspaces_preserve_ids_geometry_and_tool_filters() {
         client("0x200000010", json!({"id":2,"name":"2"}))
     ]);
     let fixture = Fixture::new(old_monitors(), clients.clone());
-    let all = windows(&fixture.worker.list(json!({})));
+    let all = windows(&fixture.envd.list(json!({})));
     assert_eq!(ids(&all), [0x100000010, 0x200000010]);
     assert_geometry(&all[0], 0x100000010);
     assert_geometry(&all[1], 0x200000010);
     assert_eq!(all[0]["is_on_screen"], true);
     assert_eq!(all[1]["is_on_screen"], false);
     assert_eq!(
-        ids(&windows(
-            &fixture.worker.list(json!({"on_screen_only":true}))
-        )),
+        ids(&windows(&fixture.envd.list(json!({"on_screen_only":true})))),
         [0x100000010]
     );
 
     // Both owners are live; filtering cannot pass merely by dropping dead PIDs.
     let mut other_owner = clients.clone();
-    other_owner[1]["pid"] = json!(fixture.worker.child.id());
+    other_owner[1]["pid"] = json!(fixture.envd.child.id());
     fixture.compositor.replace(old_monitors(), other_owner);
     assert_eq!(
         ids(&windows(
-            &fixture.worker.list(json!({"pid":std::process::id()}))
+            &fixture.envd.list(json!({"pid":std::process::id()}))
         )),
         [0x100000010]
     );
     assert_eq!(
         ids(&windows(
-            &fixture
-                .worker
-                .list(json!({"pid":fixture.worker.child.id()}))
+            &fixture.envd.list(json!({"pid":fixture.envd.child.id()}))
         )),
         [0x200000010]
     );
@@ -413,7 +415,7 @@ fn legacy_numeric_workspaces_preserve_ids_geometry_and_tool_filters() {
         json!([clients[1].clone(), clients[0].clone()]),
     );
     assert_eq!(
-        ids(&windows(&fixture.worker.list(json!({})))),
+        ids(&windows(&fixture.envd.list(json!({})))),
         [0x100000010, 0x200000010]
     );
     fixture.compositor.assert_no_fallback();
@@ -431,7 +433,7 @@ fn hyprland_057_uses_workspace_addresses_and_accepts_absent_special_workspace() 
         client("0x400000010", other)
     ]);
     let fixture = Fixture::new(monitor(numbered(), absent_special()), clients.clone());
-    let all = windows(&fixture.worker.list(json!({})));
+    let all = windows(&fixture.envd.list(json!({})));
     assert_eq!(
         ids(&all),
         [0x100000010, 0x200000010, 0x300000010, 0x400000010],
@@ -445,9 +447,7 @@ fn hyprland_057_uses_workspace_addresses_and_accepts_absent_special_workspace() 
     );
     assert_geometry(&all[0], 0x100000010);
     assert_eq!(
-        ids(&windows(
-            &fixture.worker.list(json!({"on_screen_only":true}))
-        )),
+        ids(&windows(&fixture.envd.list(json!({"on_screen_only":true})))),
         [0x100000010]
     );
 
@@ -456,7 +456,7 @@ fn hyprland_057_uses_workspace_addresses_and_accepts_absent_special_workspace() 
         .replace(monitor(named, special), clients.clone());
     let visible = windows(
         &fixture
-            .worker
+            .envd
             .list(json!({"pid":std::process::id(), "on_screen_only":true})),
     );
     assert_eq!(
@@ -474,7 +474,7 @@ fn hyprland_057_uses_workspace_addresses_and_accepts_absent_special_workspace() 
         ),
         hidden,
     );
-    assert!(windows(&fixture.worker.list(json!({"on_screen_only":true}))).is_empty());
+    assert!(windows(&fixture.envd.list(json!({"on_screen_only":true}))).is_empty());
     fixture.compositor.assert_no_fallback();
 }
 
@@ -483,7 +483,7 @@ fn genuine_empty_desktop_is_a_successful_empty_list() {
     let fixture = Fixture::new(old_monitors(), json!([]));
     for monitors in [old_monitors(), json!([])] {
         fixture.compositor.replace(monitors, json!([]));
-        let result = fixture.worker.list(json!({}));
+        let result = fixture.envd.list(json!({}));
         assert!(windows(&result).is_empty());
         assert!(result["content"][0]["text"]
             .as_str()
@@ -499,17 +499,15 @@ fn genuine_empty_desktop_is_a_successful_empty_list() {
 
 fn assert_enumeration_error(result: &Value, context: &str) {
     assert_eq!(
-        result["isError"], true,
-        "{context}: authoritative Hyprland failure must be an MCP tool error: {result}"
+        result["success"], false,
+        "{context}: authoritative Hyprland failure must be a native tool error: {result}"
     );
-    let structured = &result["structuredContent"];
+    let data = &result["data"];
     assert!(
-        structured["code"]
-            .as_str()
-            .is_some_and(|code| !code.is_empty()),
-        "{context}: expected a structured error code: {result}"
+        data["code"].as_str().is_some_and(|code| !code.is_empty()),
+        "{context}: expected an error code in native data: {result}"
     );
-    assert!(structured.get("windows").is_none(), "{context}: {result}");
+    assert!(data.get("windows").is_none(), "{context}: {result}");
     let text = result["content"][0]["text"].as_str().expect("error text");
     assert!(
         !text.is_empty() && !text.contains("Found 0 windows"),
@@ -522,21 +520,21 @@ fn assert_enumeration_error(result: &Value, context: &str) {
 }
 
 #[test]
-fn absent_hyprland_ipc_is_an_mcp_error_without_backend_fallback() {
+fn absent_hyprland_ipc_is_a_native_error_without_backend_fallback() {
     let fixture = Fixture::new(old_monitors(), json!([]));
     fs::remove_file(&fixture.compositor.ipc_path).unwrap();
-    let result = fixture.worker.list(json!({}));
+    let result = fixture.envd.list(json!({}));
     assert_enumeration_error(&result, "missing IPC socket");
     fixture.compositor.assert_no_fallback();
 }
 
 #[test]
-fn malformed_json_and_missing_required_identity_are_mcp_errors() {
+fn malformed_json_and_missing_required_identity_are_native_errors() {
     let valid_clients = json!([client("0x100000010", json!({"id":1,"name":"1"}))]);
     let fixture = Fixture::new(old_monitors(), valid_clients.clone());
     // Establish a previous successful snapshot: an authoritative failure must
     // neither return stale windows nor fall back to an unrelated provider.
-    assert_eq!(windows(&fixture.worker.list(json!({}))).len(), 1);
+    assert_eq!(windows(&fixture.envd.list(json!({}))).len(), 1);
     let mut missing_address = valid_clients.clone();
     missing_address[0]
         .as_object_mut()
@@ -589,8 +587,8 @@ fn malformed_json_and_missing_required_identity_are_mcp_errors() {
     let mut failures = Vec::new();
     for (context, monitors, clients) in cases {
         fixture.compositor.raw_replies(monitors, clients);
-        let result = fixture.worker.list(json!({}));
-        // Collect every RED signature in one run instead of stopping at row 1.
+        let result = fixture.envd.list(json!({}));
+        // Collect every regression signature instead of stopping at row 1.
         if std::panic::catch_unwind(|| assert_enumeration_error(&result, context)).is_err() {
             failures.push(format!("{context}: {result}"));
         }

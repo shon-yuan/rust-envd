@@ -3363,7 +3363,7 @@ impl Drop for Delivered {
 fn release_abandoned(action: Arc<action::Action>, presses: Vec<(u8, u8)>) -> Result<()> {
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (done, finished) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    std::thread::spawn(cua_driver_core::work_scope::bind_current(move || {
         let _desktop = action;
         let released = (|| -> Result<()> {
             let (conn, _) = RustConnection::connect(None)?;
@@ -3374,7 +3374,7 @@ fn release_abandoned(action: Arc<action::Action>, presses: Vec<(u8, u8)>) -> Res
             Ok(())
         })();
         let _ = done.send(released);
-    });
+    }));
     finished.recv_timeout(ABANDONED_RELEASE_WAIT).map_err(|_| {
         anyhow!("the X server did not take the releases within {ABANDONED_RELEASE_WAIT:?}")
     })?
@@ -5530,7 +5530,7 @@ mod path_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn uinput_creation_panic_is_contained_and_daemon_worker_remains_usable() {
-        let failed = tokio::task::spawn_blocking(|| {
+        let failed = cua_driver_core::work_scope::spawn_blocking(|| {
             guarded_uinput_creation::<()>("panic", |_| panic!("synthetic evdev panic"))
         })
         .await
@@ -5539,7 +5539,7 @@ mod path_tests {
         assert!(is_uinput_unavailable(&error));
         assert!(error.to_string().contains("device creation panicked"));
 
-        let subsequent = tokio::task::spawn_blocking(|| {
+        let subsequent = cua_driver_core::work_scope::spawn_blocking(|| {
             guarded_uinput_creation("subsequent", |name| Ok(name.to_owned()))
         })
         .await

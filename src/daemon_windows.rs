@@ -71,6 +71,7 @@ use crate::platform::windows::resource::{FreezeLease, WindowsResourceBackend};
 
 pub struct Daemon {
     state: Arc<Mutex<Configuration>>,
+    cua: Arc<crate::cua::CuaService>,
     init_lock: Arc<Mutex<()>>,
     watchers: crate::platform::WatcherRegistry,
     filesystem_logger: crate::logs::Logger,
@@ -239,6 +240,9 @@ impl Daemon {
         }
         Self {
             state: Arc::new(Mutex::new(configuration)),
+            cua: Arc::new(crate::cua::CuaService::unavailable(
+                "desktop runtime not configured",
+            )),
             init_lock: Arc::new(Mutex::new(())),
             watchers: crate::platform::WatcherRegistry::new(),
             filesystem_logger: crate::logs::Logger::none(),
@@ -435,70 +439,50 @@ impl Daemon {
     }
 }
 
-/// The production surface and the contract tests share one path: every known
-/// Connect procedure is served by the shared process and filesystem routers,
-/// and an unknown procedure gets the Connect router's 404 `unimplemented`.
-pub fn app(state: Arc<Daemon>) -> Router {
-    app_with_extensions(state, &crate::ext::Extensions::empty())
+impl crate::http::cua::CuaState for Daemon {
+    fn cua(&self) -> &Arc<crate::cua::CuaService> {
+        &self.cua
+    }
 }
 
-/// Mounts extensions on top of the plain envd router.
-///
-/// The merge happens after [`crate::http::layered`], so the envd frontdoor,
-/// authorization and CORS layers do not run for extension requests. An empty
-/// set is a no-op and leaves the S0 router exactly as the daemon built it.
-pub fn app_with_extensions(state: Arc<Daemon>, extensions: &crate::ext::Extensions) -> Router {
-    let router = match state.process_runtime() {
+impl Daemon {
+    pub fn with_cua(self, cua: Arc<crate::cua::CuaService>) -> Self {
+        Self { cua, ..self }
+    }
+}
+
+/// Serve process and filesystem services, retaining filesystem-only fallback
+/// when the Windows process runtime cannot be initialized.
+pub fn app(state: Arc<Daemon>) -> Router {
+    match state.process_runtime() {
         Ok(runtime) => app_with_execution(state, runtime),
         Err(error) => {
-            eprintln!(
-                "process procedures stay unavailable: {error}; keeping the router's 404 \
-                 unimplemented fallback"
-            );
+            eprintln!("process procedures stay unavailable: {error}; keeping filesystem services");
             app_with_filesystem(state)
         }
-    };
-    extensions.mount(router)
+    }
 }
 
 pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
-    app_with_filesystem_and_extensions(state, &crate::ext::Extensions::empty())
-}
-
-pub fn app_with_filesystem_and_extensions(
-    state: Arc<Daemon>,
-    extensions: &crate::ext::Extensions,
-) -> Router {
     let rpc = crate::filesystem_rpc::router(state.clone());
-    extensions.mount(crate::http::layered(
+    crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
-    ))
+    )
 }
 
-/// Mounts the shared process Connect adapter in front of the filesystem
-/// router. Both routers are merged into the one `transport::rpc_service`
-/// fallback, so auth, the frontdoor, framing and status codes are the Linux
-/// code path; only the runtime object behind [`ProcessRuntimeApi`] is
-/// Windows-specific.
+/// Both platforms share process/ filesystem routing and middleware; only the
+/// runtime object behind ProcessRuntimeApi differs.
 pub fn app_with_execution(
     state: Arc<Daemon>,
     runtime: Arc<dyn crate::process_api::ProcessRuntimeApi>,
 ) -> Router {
-    app_with_execution_and_extensions(state, runtime, &crate::ext::Extensions::empty())
-}
-
-pub fn app_with_execution_and_extensions(
-    state: Arc<Daemon>,
-    runtime: Arc<dyn crate::process_api::ProcessRuntimeApi>,
-    extensions: &crate::ext::Extensions,
-) -> Router {
     let rpc = crate::rpc::process::router(state.clone(), runtime)
         .merge(crate::filesystem_rpc::router(state.clone()));
-    extensions.mount(crate::http::layered(
+    crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
-    ))
+    )
 }
 
 fn http_routes(state: Arc<Daemon>) -> Router {
@@ -520,6 +504,10 @@ fn http_routes(state: Arc<Daemon>) -> Router {
         .route("/fsfreeze", any(fsfreeze))
         .route("/fsthaw", any(fsthaw))
         .route("/upgrade", any(crate::upgrade_http::upgrade::<Daemon>))
+        .route("/cua/tools", any(crate::http::cua::tools::<Daemon>))
+        .route("/cua/call", any(crate::http::cua::call::<Daemon>))
+        .route("/cua/health", any(crate::http::cua::health::<Daemon>))
+        .route("/cua/metrics", any(crate::http::cua::metrics::<Daemon>))
         .with_state(state)
 }
 

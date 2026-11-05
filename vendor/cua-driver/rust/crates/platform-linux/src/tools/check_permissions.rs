@@ -25,7 +25,7 @@ impl Tool for CheckPermissionsTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         // Check X11 connectivity (required for window enumeration and input injection).
-        let x11_ok = tokio::task::spawn_blocking(|| {
+        let x11_ok = cua_driver_core::work_scope::spawn_blocking(|| {
             x11rb::rust_connection::RustConnection::connect(None).is_ok()
         })
         .await
@@ -36,9 +36,10 @@ impl Tool for CheckPermissionsTool {
         // /run/user heuristic false-passed exactly the headless/container case
         // (/run/user exists, but no a11y bus → empty trees). Probe for real.
         let dbus_address = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
-        let atspi_ok = tokio::task::spawn_blocking(crate::health_report::probe_a11y_bus)
-            .await
-            .unwrap_or(false);
+        let atspi_ok =
+            cua_driver_core::work_scope::spawn_blocking(crate::health_report::probe_a11y_bus)
+                .await
+                .unwrap_or(false);
 
         let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
         let atspi_status = if atspi_ok {

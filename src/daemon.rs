@@ -105,6 +105,7 @@ impl crate::process_api::ProcessRpcState for Daemon {
 
 pub struct Daemon {
     state: Arc<Mutex<Configuration>>,
+    cua: Arc<crate::cua::CuaService>,
     init_lock: Arc<Mutex<()>>,
     memory: MemoryProtection,
     /// Oracle store.go:64-68/:169. Defaults to a no-op-manager-backed freezer
@@ -505,6 +506,9 @@ impl Daemon {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(Configuration::new())),
+            cua: Arc::new(crate::cua::CuaService::unavailable(
+                "desktop runtime not configured",
+            )),
             init_lock: Arc::new(Mutex::new(())),
             watchers: crate::filesystem::watchers::WatcherRegistry::new(),
             freezer: Arc::new(crate::cgroups::freeze::WorkloadFreezer::new(Arc::new(
@@ -544,50 +548,38 @@ impl Daemon {
     }
 }
 
-pub fn app(state: Arc<Daemon>) -> Router {
-    app_with_extensions(state, &crate::ext::Extensions::empty())
+impl crate::http::cua::CuaState for Daemon {
+    fn cua(&self) -> &Arc<crate::cua::CuaService> {
+        &self.cua
+    }
 }
 
-/// Mounts extensions on top of the plain envd router.
-///
-/// The merge happens after [`crate::http::layered`], so the envd frontdoor,
-/// authorization and CORS layers do not run for extension requests. An empty
-/// set is a no-op and leaves the S0 router exactly as [`app`] built it.
-pub fn app_with_extensions(state: Arc<Daemon>, extensions: &crate::ext::Extensions) -> Router {
-    extensions.mount(crate::http::layered(http_routes(state.clone()), state))
+impl Daemon {
+    pub fn with_cua(self, cua: Arc<crate::cua::CuaService>) -> Self {
+        Self { cua, ..self }
+    }
+}
+
+pub fn app(state: Arc<Daemon>) -> Router {
+    crate::http::layered(http_routes(state.clone()), state)
 }
 
 pub fn app_with_filesystem(state: Arc<Daemon>) -> Router {
-    app_with_filesystem_and_extensions(state, &crate::ext::Extensions::empty())
-}
-
-pub fn app_with_filesystem_and_extensions(
-    state: Arc<Daemon>,
-    extensions: &crate::ext::Extensions,
-) -> Router {
     let rpc = crate::filesystem_rpc::router(state.clone());
-    extensions.mount(crate::http::layered(
+    crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
-    ))
+    )
 }
 
 pub fn app_with_execution(state: Arc<Daemon>, runtime: crate::process::ProcessRuntime) -> Router {
-    app_with_execution_and_extensions(state, runtime, &crate::ext::Extensions::empty())
-}
-
-pub fn app_with_execution_and_extensions(
-    state: Arc<Daemon>,
-    runtime: crate::process::ProcessRuntime,
-    extensions: &crate::ext::Extensions,
-) -> Router {
     let runtime: Arc<dyn crate::process_api::ProcessRuntimeApi> = Arc::new(runtime);
     let rpc = crate::rpc::process::router(state.clone(), runtime)
         .merge(crate::filesystem_rpc::router(state.clone()));
-    extensions.mount(crate::http::layered(
+    crate::http::layered(
         http_routes(state.clone()).fallback_service(crate::transport::rpc_service(rpc)),
         state,
-    ))
+    )
 }
 
 /// The Linux route table. The shared layers and the two platform-neutral
@@ -614,6 +606,10 @@ fn http_routes(state: Arc<Daemon>) -> Router {
             "/files/compose",
             any(crate::files_compose::compose::<Daemon>),
         )
+        .route("/cua/tools", any(crate::http::cua::tools::<Daemon>))
+        .route("/cua/call", any(crate::http::cua::call::<Daemon>))
+        .route("/cua/health", any(crate::http::cua::health::<Daemon>))
+        .route("/cua/metrics", any(crate::http::cua::metrics::<Daemon>))
         .with_state(state)
 }
 

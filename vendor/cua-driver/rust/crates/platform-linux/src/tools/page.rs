@@ -27,9 +27,11 @@ impl PageBackend for LinuxPageBackend {
     async fn get_text(&self, pid: i32, window_id: u64) -> anyhow::Result<PageReadResult> {
         let pid_u = pid as u32;
         let xid = window_id;
-        let result = tokio::task::spawn_blocking(move || crate::atspi::walk_tree(pid_u, xid, None))
-            .await
-            .map_err(|e| anyhow::anyhow!("AT-SPI walk task failed: {e}"))?;
+        let result = cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::atspi::walk_tree(pid_u, xid, None)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("AT-SPI walk task failed: {e}"))?;
         Ok(PageReadResult::text(extract_text_from_markdown(
             &result.tree_markdown,
         )))
@@ -45,9 +47,11 @@ impl PageBackend for LinuxPageBackend {
         let pid_u = pid as u32;
         let xid = window_id;
         let selector = css_selector.to_owned();
-        let result = tokio::task::spawn_blocking(move || crate::atspi::walk_tree(pid_u, xid, None))
-            .await
-            .map_err(|e| anyhow::anyhow!("AT-SPI walk task failed: {e}"))?;
+        let result = cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::atspi::walk_tree(pid_u, xid, None)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("AT-SPI walk task failed: {e}"))?;
 
         if selector.contains("[data-") {
             anyhow::bail!(
