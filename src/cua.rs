@@ -239,11 +239,18 @@ impl CuaService {
             count.fetch_add(1, Ordering::Relaxed);
         }
         let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
-        let _ = self
-            .latency_nanos
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_add(nanos))
-            });
+        let mut current = self.latency_nanos.load(Ordering::Relaxed);
+        loop {
+            match self.latency_nanos.compare_exchange_weak(
+                current,
+                current.saturating_add(nanos),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
         self.completed.fetch_add(1, Ordering::Relaxed);
     }
 

@@ -78,12 +78,13 @@ matrix. These fixtures do not operate the real desktop.
 
 | Root module | Covered / instrumented lines | Line coverage |
 | --- | --- | --- |
-| `src/cua.rs` | 185 / 194 | 95.36% |
+| `src/cua.rs` | 187 / 197 | 94.92% |
 | `src/cua/desktop.rs` | 195 / 200 | 97.50% |
 | `src/http/cua.rs` | 104 / 115 | 90.43% |
 
-These final post-deadline-fix measurements cover only the listed files, not
-the whole project or branches. The coverage run executed all 289 library tests,
+These final post-deadline-fix and post-atomic-correction measurements cover
+only the listed files, not the whole project or branches. The coverage run
+executed all 289 library tests,
 15 completion regressions, 17 native API contracts and five Wayland fixtures
 without filtering; all passed. Dependency coverage exports were empty, so no
 numeric `work_scope` coverage is claimed.
@@ -103,6 +104,19 @@ passed. The cached-advisory-database audit reported zero vulnerabilities and sev
 unmaintained-dependency warnings; those warnings remain declared, and the
 cache does not establish advisory freshness.
 
+## CI toolchain correction
+
+The first remote Linux base run passed its tests but failed strict Clippy on
+Rust 1.99.1 because `AtomicU64::fetch_update` became deprecated; the initial
+local matrix used Rust 1.98.1. The latency accumulator now uses a
+`compare_exchange_weak` retry loop, preserving the existing saturating sum and
+relaxed ordering on both compiler versions. No lint allowance or toolchain pin
+was added. After the correction, default/base all-target strict Clippy passed
+on Rust 1.98.1, base all-target strict Clippy passed on Rust 1.99.0, and the
+289 library, 15 completion, 17 native and five Wayland tests passed again.
+The scoped coverage table above was refreshed from that run. A targeted code
+review found no blocking defect in the correction.
+
 ## Acceptance limits
 
 This is local implementation and verification evidence. Native Windows
@@ -112,7 +126,8 @@ compiler was available, so this migration has no fresh local static musl build.
 No fresh Go differential or official SDK conformance campaign was run.
 Historical acceptance documents retain their older revision scopes.
 
-No remote CI run, commit, push, merge, deployment or real desktop action is
-claimed by this record. Further interactive acceptance must use an isolated
-fixture; do not access the real desktop, commit, push, merge or deploy as part
-of this migration.
+Delivery and subsequent remote CI results are tracked in
+[PR #5](https://github.com/shon-yuan/rust-envd/pull/5). This local verification
+record does not establish remote CI success, deployment or real desktop action.
+Further interactive acceptance must use an isolated fixture; real desktop
+access is outside this migration's authorization.
