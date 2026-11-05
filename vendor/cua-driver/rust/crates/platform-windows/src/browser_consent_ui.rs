@@ -452,7 +452,7 @@ pub async fn handle(
     loop {
         prove_window_owner(request.window_id, pid)?;
         let hwnd = request.window_id;
-        let tree = tokio::task::spawn_blocking(move || {
+        let tree = cua_driver_core::work_scope::spawn_blocking(move || {
             ConsentNodes(crate::uia::walk_tree(hwnd, None).nodes)
         })
         .await
@@ -612,7 +612,7 @@ mod tests {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let scan = tokio::task::spawn_blocking(move || {
+        let scan = cua_driver_core::work_scope::spawn_blocking(move || {
             let ptr = Box::into_raw(Box::new(OwnedReference {
                 vtable: &VTABLE,
                 released: Some(dropped_tx),

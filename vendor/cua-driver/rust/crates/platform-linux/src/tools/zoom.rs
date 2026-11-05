@@ -93,7 +93,7 @@ impl Tool for ZoomTool {
             y2 * screenshot.scale,
         );
         let state = self.state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::work_scope::spawn_blocking(move || {
             // Route through the Wayland-aware window capture dispatcher so
             // pure-Wayland sessions surface a typed "per-window capture not
             // supported yet" error instead of accidentally calling the

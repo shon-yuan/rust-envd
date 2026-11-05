@@ -1450,7 +1450,7 @@ async fn native_loopback_listeners(
     allowed_pids: &[u32],
 ) -> Result<Vec<(u16, u32)>, BrowserRefusal> {
     let allowed_pids = allowed_pids.to_vec();
-    tokio::task::spawn_blocking(move || windows_loopback_listeners(&allowed_pids))
+    cua_driver_core::work_scope::spawn_blocking(move || windows_loopback_listeners(&allowed_pids))
         .await
         .map_err(|error| {
             BrowserRefusal::new(
@@ -1463,17 +1463,18 @@ async fn native_loopback_listeners(
 async fn raw_loopback_listeners_for_process_tree(
     root_pid: u32,
 ) -> Result<Vec<(u16, u32)>, BrowserRefusal> {
-    let allowed_pids =
-        tokio::task::spawn_blocking(move || crate::win32::list_descendants(root_pid))
-            .await
-            .map_err(|error| {
-                BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("could not inspect browser process tree: {error}"),
-                )
-            })?;
+    let allowed_pids = cua_driver_core::work_scope::spawn_blocking(move || {
+        crate::win32::list_descendants(root_pid)
+    })
+    .await
+    .map_err(|error| {
+        BrowserRefusal::new(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("could not inspect browser process tree: {error}"),
+        )
+    })?;
     let observed = native_loopback_listeners(&allowed_pids).await?;
-    tokio::task::spawn_blocking(move || {
+    cua_driver_core::work_scope::spawn_blocking(move || {
         observed
             .into_iter()
             .filter(|(_port, owner_pid)| process_identity(*owner_pid).is_ok())
@@ -1491,7 +1492,7 @@ async fn raw_loopback_listeners_for_process_tree(
 async fn loopback_listeners_for_process_tree(
     root_pid: u32,
 ) -> Result<Vec<(u16, u32)>, BrowserRefusal> {
-    let tree = tokio::task::spawn_blocking(move || {
+    let tree = cua_driver_core::work_scope::spawn_blocking(move || {
         let processes = crate::win32::list_processes();
         lifetime_scoped_descendants_from_processes(root_pid, &processes, |pid| {
             process_identity(pid).ok().map(|identity| identity.0)
@@ -1513,7 +1514,7 @@ async fn loopback_listeners_for_process_tree(
 
     let observed = native_loopback_listeners(&tree.pids).await?;
     let expected_starts = tree.started_at;
-    tokio::task::spawn_blocking(move || {
+    cua_driver_core::work_scope::spawn_blocking(move || {
         retain_identity_matched_listeners(observed, &expected_starts, |pid| {
             process_identity(pid).ok().map(|identity| identity.0)
         })
@@ -1528,17 +1529,18 @@ async fn loopback_listeners_for_process_tree(
 }
 
 async fn loopback_listeners_for_exact_pid(pid: u32) -> Result<Vec<(u16, u32)>, BrowserRefusal> {
-    let expected_started =
-        tokio::task::spawn_blocking(move || process_identity(pid).map(|identity| identity.0))
-            .await
-            .map_err(|error| {
-                BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("could not inspect browser process identity: {error}"),
-                )
-            })??;
+    let expected_started = cua_driver_core::work_scope::spawn_blocking(move || {
+        process_identity(pid).map(|identity| identity.0)
+    })
+    .await
+    .map_err(|error| {
+        BrowserRefusal::new(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("could not inspect browser process identity: {error}"),
+        )
+    })??;
     let observed = native_loopback_listeners(&[pid]).await?;
-    tokio::task::spawn_blocking(move || {
+    cua_driver_core::work_scope::spawn_blocking(move || {
         retain_identity_matched_listeners(
             observed,
             &HashMap::from([(pid, expected_started)]),
@@ -1671,7 +1673,7 @@ async fn exact_browser_endpoints_for_pid(
 }
 
 async fn root_can_use_embedded_descendant_endpoint(pid: u32) -> Result<bool, BrowserRefusal> {
-    tokio::task::spawn_blocking(move || {
+    cua_driver_core::work_scope::spawn_blocking(move || {
         let (_started, executable) = process_identity(pid)?;
         Ok(executable.is_some_and(|path| allows_embedded_descendant_endpoint(&path)))
     })
@@ -1689,7 +1691,7 @@ async fn embedded_browser_endpoints_once(
 ) -> Result<Vec<(u16, String, u32)>, BrowserRefusal> {
     let mut endpoints = Vec::new();
     for (port, listener_pid) in loopback_listeners_for_process_tree(pid).await? {
-        let is_webview_runtime = tokio::task::spawn_blocking(move || {
+        let is_webview_runtime = cua_driver_core::work_scope::spawn_blocking(move || {
             process_identity(listener_pid)
                 .ok()
                 .and_then(|identity| identity.1)
@@ -2092,7 +2094,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
                 format!("pid {pid} is outside the Windows process-id range"),
             )
         })?;
-        let name = tokio::task::spawn_blocking(move || {
+        let name = cua_driver_core::work_scope::spawn_blocking(move || {
             crate::win32::list_processes()
                 .into_iter()
                 .find(|process| process.pid == pid_u32)
@@ -2181,7 +2183,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
                 format!("pid {pid} is outside the Windows process-id range"),
             )
         })?;
-        let window = tokio::task::spawn_blocking(move || {
+        let window = cua_driver_core::work_scope::spawn_blocking(move || {
             crate::win32::find_window_by_pid_and_handle(pid_u32, window_id)
         })
         .await
@@ -2223,7 +2225,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
                 format!("pid {pid} is outside the Windows process-id range"),
             )
         })?;
-        let windows = tokio::task::spawn_blocking(move || {
+        let windows = cua_driver_core::work_scope::spawn_blocking(move || {
             crate::win32::list_windows_via_win32(Some(pid_u32))
                 .into_iter()
                 .map(|window| window.hwnd)
@@ -2368,18 +2370,19 @@ impl BrowserPlatform for WindowsBrowserPlatform {
         // transient identity-reproof failure must not make an old exact-pid
         // listener appear newly created after the approved setup action.
         let listeners_before = unfiltered_loopback_ports_for_exact_pid(pid_u32).await?;
-        let handle =
-            tokio::task::spawn_blocking(move || crate::browser_setup_ui::enable(hwnd, descriptor))
-                .await
-                .map_err(|error| {
-                    BrowserRefusal::new(
-                        BrowserRefusalCode::BrowserRouteUnavailable,
-                        format!(
-                            "could not inspect {}'s remote-debugging setup UI: {error}",
-                            descriptor.product_name
-                        ),
-                    )
-                })??;
+        let handle = cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::browser_setup_ui::enable(hwnd, descriptor)
+        })
+        .await
+        .map_err(|error| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!(
+                    "could not inspect {}'s remote-debugging setup UI: {error}",
+                    descriptor.product_name
+                ),
+            )
+        })??;
         let opened_setup_page = handle.opened_setup_page;
         let enabled_remote_debugging = handle.enabled_remote_debugging;
         let setup_was_already_enabled = !enabled_remote_debugging;
@@ -2493,14 +2496,15 @@ impl BrowserPlatform for WindowsBrowserPlatform {
         let endpoint = match endpoint_result {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                let error = tokio::task::spawn_blocking(move || handle.abort(error))
-                    .await
-                    .map_err(|join_error| {
-                        BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRouteUnavailable,
-                            format!("could not roll back browser setup: {join_error}"),
-                        )
-                    })?;
+                let error =
+                    cua_driver_core::work_scope::spawn_blocking(move || handle.abort(error))
+                        .await
+                        .map_err(|join_error| {
+                            BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRouteUnavailable,
+                                format!("could not roll back browser setup: {join_error}"),
+                            )
+                        })?;
                 return Err(error);
             }
         };
@@ -2522,7 +2526,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
         &self,
         request: ExistingProfileSetupRequest,
     ) -> Result<bool, BrowserRefusal> {
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::work_scope::spawn_blocking(move || {
             crate::browser_setup_ui::commit_pending(request.window_id)
         })
         .await
@@ -2564,7 +2568,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
         request: ExistingProfileSetupRequest,
         error: BrowserRefusal,
     ) -> BrowserRefusal {
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::work_scope::spawn_blocking(move || {
             crate::browser_setup_ui::abort_pending(request.window_id, error)
         })
         .await
@@ -2591,7 +2595,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
             )
         })?;
         let (start_time, executable) =
-            tokio::task::spawn_blocking(move || process_identity(pid_u32))
+            cua_driver_core::work_scope::spawn_blocking(move || process_identity(pid_u32))
                 .await
                 .map_err(|error| {
                     BrowserRefusal::new(

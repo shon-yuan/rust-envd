@@ -45,7 +45,7 @@ impl Default for LinuxBrowserPlatform {
 
 async fn x11_native_window(pid: i64, window_id: u64) -> Option<(NativeWindowInfo, bool)> {
     let pid_u32 = u32::try_from(pid).ok()?;
-    tokio::task::spawn_blocking(move || {
+    cua_driver_core::work_scope::spawn_blocking(move || {
         select_x11_window(pid, window_id, crate::x11::list_windows(Some(pid_u32)))
     })
     .await
@@ -108,7 +108,7 @@ fn run_existing_profile_cleanup<T: Send + 'static>(
 ) -> Result<T, BrowserRefusal> {
     std::thread::Builder::new()
         .name("cua-browser-cleanup".into())
-        .spawn(cleanup)
+        .spawn(cua_driver_core::work_scope::bind_current(cleanup))
         .map_err(|error| {
             BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
@@ -561,7 +561,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 format!("pid {pid} is outside the Linux process-id range"),
             )
         })?;
-        let (process, executable) = tokio::task::spawn_blocking(move || {
+        let (process, executable) = cua_driver_core::work_scope::spawn_blocking(move || {
             let process = crate::proc_fs::list_processes()
                 .into_iter()
                 .find(|process| process.pid == pid_u32);
@@ -618,7 +618,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         })?;
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             if crate::wayland::hyprland::is_session() {
-                let window = tokio::task::spawn_blocking(move || {
+                let window = cua_driver_core::work_scope::spawn_blocking(move || {
                     crate::wayland::hyprland::window_for_address(window_id)
                 })
                 .await
@@ -706,7 +706,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                     },
                 });
             }
-            let window = tokio::task::spawn_blocking(move || {
+            let window = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::wayland::list_windows_dispatch(Some(pid_u32))
                     .into_iter()
                     .find(|window| window.xid == window_id)
@@ -766,16 +766,18 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         })?;
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             if crate::wayland::hyprland::is_session() {
-                let windows = tokio::task::spawn_blocking(crate::wayland::hyprland::list_windows)
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .ok_or_else(|| {
-                        BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRouteUnavailable,
-                            "Hyprland could not attest browser window cardinality",
-                        )
-                    })?;
+                let windows = cua_driver_core::work_scope::spawn_blocking(
+                    crate::wayland::hyprland::list_windows,
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .ok_or_else(|| {
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        "Hyprland could not attest browser window cardinality",
+                    )
+                })?;
                 // Count every mapped client owned by the PID, including hidden
                 // and off-workspace clients; visibility cannot prove uniqueness.
                 return Ok(Some(hyprland_is_only_owned_window(
@@ -798,7 +800,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                     // generic AT-SPI-only Wayland session, that is sufficient
                     // to attest singleton native-window cardinality for an
                     // embedded Chromium endpoint.
-                    let owned = tokio::task::spawn_blocking(move || {
+                    let owned = cua_driver_core::work_scope::spawn_blocking(move || {
                         crate::wayland::list_windows_dispatch(Some(pid_u32))
                             .into_iter()
                             .filter(|window| window.pid == Some(pid_u32))
@@ -830,14 +832,15 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         &self,
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
-        let ports = tokio::task::spawn_blocking(move || loopback_ports_for_pid(pid))
-            .await
-            .map_err(|error| {
-                BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("listener inspection task failed: {error}"),
-                )
-            })??;
+        let ports =
+            cua_driver_core::work_scope::spawn_blocking(move || loopback_ports_for_pid(pid))
+                .await
+                .map_err(|error| {
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("listener inspection task failed: {error}"),
+                    )
+                })??;
         for port in ports {
             if let Some(ws_url) = browser_websocket_url(port).await {
                 return Ok(Some(OwnedEndpoint {
@@ -863,14 +866,15 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         if let Some(endpoint) = active_port_endpoint(pid)? {
             return Ok(Some(endpoint));
         }
-        let ports = tokio::task::spawn_blocking(move || loopback_ports_for_pid(pid))
-            .await
-            .map_err(|error| {
-                BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("listener inspection task failed: {error}"),
-                )
-            })??;
+        let ports =
+            cua_driver_core::work_scope::spawn_blocking(move || loopback_ports_for_pid(pid))
+                .await
+                .map_err(|error| {
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("listener inspection task failed: {error}"),
+                    )
+                })??;
         let mut discovered = Vec::new();
         for port in ports {
             if let Some(ws_url) = browser_websocket_url(port).await {
@@ -917,14 +921,15 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             }
             return Ok(Some(endpoint));
         }
-        let ports = tokio::task::spawn_blocking(move || loopback_ports_for_pid(pid))
-            .await
-            .map_err(|error| {
-                BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("listener inspection task failed: {error}"),
-                )
-            })??;
+        let ports =
+            cua_driver_core::work_scope::spawn_blocking(move || loopback_ports_for_pid(pid))
+                .await
+                .map_err(|error| {
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("listener inspection task failed: {error}"),
+                    )
+                })??;
         if !ports.contains(&port) {
             return Ok(None);
         }
@@ -971,16 +976,17 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         // Wayland session with no compositor window list — that same proof fails
         // and setup refuses with a reason that names the cause.
         let window_id = request.window_id;
-        let listeners_before =
-            tokio::task::spawn_blocking(move || loopback_ports_for_pid(request.pid))
-                .await
-                .map_err(|error| {
-                    BrowserRefusal::new(
-                        BrowserRefusalCode::BrowserRouteUnavailable,
-                        format!("listener inspection task failed: {error}"),
-                    )
-                })??;
-        let handle = tokio::task::spawn_blocking(move || {
+        let listeners_before = cua_driver_core::work_scope::spawn_blocking(move || {
+            loopback_ports_for_pid(request.pid)
+        })
+        .await
+        .map_err(|error| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("listener inspection task failed: {error}"),
+            )
+        })??;
+        let handle = cua_driver_core::work_scope::spawn_blocking(move || {
             crate::browser_setup_ui::enable(pid_u32, window_id, descriptor)
         })
         .await
@@ -1006,7 +1012,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 Ok(None) => {}
                 Err(error) => break Err(error),
             }
-            let ports = match tokio::task::spawn_blocking(move || {
+            let ports = match cua_driver_core::work_scope::spawn_blocking(move || {
                 loopback_ports_for_pid(request.pid)
             })
             .await
@@ -1107,14 +1113,15 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 if enabled_remote_debugging
                     && error.code == BrowserRefusalCode::BrowserRequiresSetup =>
             {
-                let closed = tokio::task::spawn_blocking(move || handle.close_for_success())
-                    .await
-                    .map_err(|join_error| {
-                        BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRouteUnavailable,
-                            format!("could not finish browser setup cleanup: {join_error}"),
-                        )
-                    })??;
+                let closed =
+                    cua_driver_core::work_scope::spawn_blocking(move || handle.close_for_success())
+                        .await
+                        .map_err(|join_error| {
+                            BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRouteUnavailable,
+                                format!("could not finish browser setup cleanup: {join_error}"),
+                            )
+                        })??;
                 return Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserRequiresSetup,
                     format!(
@@ -1140,14 +1147,15 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 })));
             }
             Err(error) => {
-                let error = tokio::task::spawn_blocking(move || handle.abort(error))
-                    .await
-                    .map_err(|join_error| {
-                        BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRouteUnavailable,
-                            format!("could not roll back browser setup: {join_error}"),
-                        )
-                    })?;
+                let error =
+                    cua_driver_core::work_scope::spawn_blocking(move || handle.abort(error))
+                        .await
+                        .map_err(|join_error| {
+                            BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRouteUnavailable,
+                                format!("could not roll back browser setup: {join_error}"),
+                            )
+                        })?;
                 return Err(error);
             }
         };
@@ -1175,7 +1183,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 "the approved browser pid is outside the Linux process-id range",
             )
         })?;
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::work_scope::spawn_blocking(move || {
             crate::browser_setup_ui::commit_pending(pid, request.window_id)
         })
         .await
@@ -1223,7 +1231,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         let Ok(pid) = u32::try_from(request.pid) else {
             return error;
         };
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::work_scope::spawn_blocking(move || {
             crate::browser_setup_ui::abort_pending(pid, request.window_id, error)
         })
         .await
@@ -1243,14 +1251,15 @@ impl BrowserPlatform for LinuxBrowserPlatform {
     }
 
     async fn process_fingerprint(&self, pid: i64) -> Result<ProcessFingerprint, BrowserRefusal> {
-        let (start_time, executable) = tokio::task::spawn_blocking(move || process_identity(pid))
-            .await
-            .map_err(|error| {
-                BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("process fingerprint task failed: {error}"),
-                )
-            })??;
+        let (start_time, executable) =
+            cua_driver_core::work_scope::spawn_blocking(move || process_identity(pid))
+                .await
+                .map_err(|error| {
+                    BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("process fingerprint task failed: {error}"),
+                    )
+                })??;
         Ok(ProcessFingerprint {
             pid,
             start_time: Some(start_time),

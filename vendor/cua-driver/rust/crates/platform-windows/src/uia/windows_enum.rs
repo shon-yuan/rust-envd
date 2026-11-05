@@ -106,11 +106,11 @@ where
     let worker_cancelled = permit.timeout_flag();
     let spawn = thread::Builder::new()
         .name(format!("cua-uia-{stage}"))
-        .spawn(move || {
+        .spawn(cua_driver_core::work_scope::bind_current(move || {
             let _permit = permit;
             let result = f(worker_cancelled);
             let _ = tx.send(result);
-        });
+        }));
 
     if let Err(e) = spawn {
         // The unspawned closure, and with it the permit, is already dropped,

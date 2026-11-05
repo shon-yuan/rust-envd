@@ -1,5 +1,4 @@
-/target
-/cua-worker/target
+**/target/
 /envd_descriptor.bin
 /.archify
 /core.*

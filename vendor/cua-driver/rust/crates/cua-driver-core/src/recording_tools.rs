@@ -660,7 +660,8 @@ impl Tool for InstallFfmpegTool {
 
         let display = plan.display();
         let result =
-            tokio::task::spawn_blocking(move || crate::ffmpeg_install::run_install(&plan)).await;
+            crate::work_scope::spawn_blocking(move || crate::ffmpeg_install::run_install(&plan))
+                .await;
         match result {
             Ok(Ok((cmd_ok, output))) => match crate::video_ffmpeg::find_ffmpeg() {
                 Some(path) => ToolResult::text(format!("✅ ffmpeg installed via `{display}`."))

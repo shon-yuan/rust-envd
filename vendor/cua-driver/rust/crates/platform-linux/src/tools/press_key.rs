@@ -203,7 +203,7 @@ impl Tool for PressKeyTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || {
+                let windows = cua_driver_core::work_scope::spawn_blocking(move || {
                     crate::x11::list_windows(if pid == 0 { None } else { Some(pid) })
                 })
                 .await
@@ -363,13 +363,13 @@ impl Tool for PressKeyTool {
             let result = match press_key_chord(&mods, &key) {
                 None => {
                     let key_w = key.clone();
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::work_scope::spawn_blocking(move || {
                         crate::wayland::inject_press_key(pid, xid, &key_w)
                     })
                     .await
                 }
                 Some(chord) => {
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::work_scope::spawn_blocking(move || {
                         crate::wayland::inject_hotkey(pid, xid, &chord)
                     })
                     .await

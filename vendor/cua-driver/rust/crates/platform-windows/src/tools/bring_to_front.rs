@@ -52,10 +52,11 @@ impl Tool for BringToFrontTool {
         let hwnd = match hwnd_opt {
             Some(h) => h,
             None => {
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = cua_driver_core::work_scope::spawn_blocking(move || {
+                    crate::win32::list_windows(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.hwnd,
                     None => {
@@ -71,8 +72,8 @@ impl Tool for BringToFrontTool {
         // trick mirrors `send_key_synthesized` (input/keyboard.rs:313-345)
         // and is validated by `flash-repro/16-edge-launch-fg.ps1` for the
         // Edge launch focus-steal recovery case.
-        let outcome =
-            tokio::task::spawn_blocking(move || -> Result<(u64, u64, bool, bool), String> {
+        let outcome = cua_driver_core::work_scope::spawn_blocking(
+            move || -> Result<(u64, u64, bool, bool), String> {
                 use windows::Win32::Foundation::HWND;
                 use windows::Win32::Graphics::Dwm::DwmFlush;
                 use windows::Win32::UI::WindowsAndMessaging::{
@@ -151,8 +152,9 @@ impl Tool for BringToFrontTool {
                     let _ = unsafe { DwmFlush() };
                 }
                 Ok((prev_fg_addr, now_fg.0 as u64, raised, was_minimized))
-            })
-            .await;
+            },
+        )
+        .await;
 
         match outcome {
             Ok(Ok((prev, now, raised, restored))) => {

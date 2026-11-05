@@ -1,5 +1,8 @@
 //! Persistent session-bus transport for synchronous compositor helpers.
 //! A separate runtime also serves callers already inside Tokio without nested block_on.
+#[path = "deadline.rs"]
+mod deadline;
+
 use std::sync::{mpsc, OnceLock};
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -34,10 +37,13 @@ pub(super) fn call(
     let method = method.to_owned();
     let args = args.to_vec();
     let (tx, rx) = mpsc::sync_channel(1);
-    runtime().spawn(async move {
-        let result = tokio::time::timeout(timeout, async {
+    runtime().spawn(cua_driver_core::work_scope::bind_future(async move {
+        let result = deadline::before_deadline(deadline, async {
             let connection = {
                 let mut shared = CONNECTION.lock().await;
+                if deadline::is_expired(deadline) {
+                    return Err(Failure::Transport);
+                }
                 if shared.is_none() {
                     *shared = Some(
                         Connection::session()
@@ -47,6 +53,9 @@ pub(super) fn call(
                 }
                 shared.as_ref().ok_or(Failure::Transport)?.clone()
             };
+            if deadline::is_expired(deadline) {
+                return Err(Failure::Transport);
+            }
             invoke(&connection, &destination, &path, &method, &args).await
         })
         .await
@@ -59,7 +68,7 @@ pub(super) fn call(
             CONNECTION.lock().await.take();
         }
         let _ = tx.send(result.ok());
-    });
+    }));
     rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .ok()
         .flatten()

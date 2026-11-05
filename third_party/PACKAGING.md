@@ -1,11 +1,11 @@
 # Packaging — what a covered distribution must include
 
 A **covered distribution** of this project is any linked `envd` binary built
-from this crate (both the default **base** and optional **desktop** variant),
-any guest or sandbox image that embeds such a binary, and the optional
-standalone `coorworker-cua` worker built from `cua-worker/`. The desktop daemon
-enables `cua-desktop` and links the worker library in process. The base daemon
-remains desktop-free. Every covered distribution must ship:
+from this crate (both the default **desktop** and explicit **base** variant)
+plus any guest or sandbox image that embeds such a binary. The desktop daemon
+enables `cua-desktop` and directly links the optional `cua-driver-core`,
+`platform-linux`, and `platform-windows` dependencies for native embedded CUA.
+The base daemon remains desktop-free. Every covered distribution must ship:
 
 | # | Artifact | Why |
 |---|----------|-----|
@@ -17,22 +17,29 @@ remains desktop-free. Every covered distribution must ship:
 | 6 | The Go Authors' BSD-3-Clause notice for `src/platform/linux/mmds/go_url.rs` | Required for binary redistribution; the notice is reproduced in `third_party/NOTICES.md` ("Copyright 2009 The Go Authors."), so including item 4 satisfies it. Source distributions must also keep the notice in the file header itself. |
 | 7 | `vendor/connectrpc/LICENSE` + `vendor/connectrpc/PATCHES.md`, and `vendor/hyper/LICENSE` + `vendor/hyper/PATCHES.md` | The in-tree `connectrpc` 0.9.1 (Apache-2.0) and `hyper` 1.12.0 (MIT) forks selected by `[patch.crates-io]`; each license text is also enumerated under `licenses/`, and each `PATCHES.md` records the upstream revision and every local change. |
 | 8 | A provenance manifest from `scripts/packaging_manifest.py` | Binds the binary to `git rev-parse HEAD`, dirty state, toolchain, declared artifact kind, enabled root features, target, canonical build command, and SHA-256 digests of every covered file and the whole license tree. |
-| 9 | `third_party/cua-worker/NOTICES.md` and the complete `third_party/cua-worker/licenses/` tree | The standalone worker's own notice bundle, generated with all features from `cua-worker/Cargo.lock`. It stays separate because the worker is a separate package with its own lockfile; the root bundle covers embedded desktop linking. |
-| 10 | `cua-worker/Cargo.toml` + `cua-worker/Cargo.lock` | Pins the worker's dependency graph, including path dependencies on the vendored Cua Driver crates. |
-| 11 | `vendor/cua-driver/LICENSE` and `vendor/cua-driver/PROVENANCE.md` | MIT license for the vendored Cua Driver crates and the upstream commit plus the deliberately excluded AGPL/FSL components. |
+| 9 | `vendor/cua-driver/LICENSE` and `vendor/cua-driver/PROVENANCE.md` | MIT license for the vendored Cua Driver crates and the upstream commit plus the deliberately excluded AGPL/FSL components. |
 
 Do not drop, truncate, or reflow items 2–5 or 9: the license texts are copied
-verbatim from the crates.io packages and must stay byte-for-byte. The only
+verbatim from their upstream sources and must stay byte-for-byte. The only
 non-package texts are the SPDX overrides in `scripts/license-overrides/`,
 which are used solely for crates that ship no license file, and the vendored
-Cua Driver repository license, which is used for its crates that ship no
-per-crate file. The first-party `coorworker-cua` library is covered by the
-project's root MIT license, rather than being labeled as a crates.io patch.
+Cua Driver repository license, which is used for its MIT crates that ship no
+per-crate file. A missing upstream Cua Driver license or incompatible license
+declaration aborts generation instead of falling back to generic MIT text.
 The vendored Cua Driver crates use `vendor/cua-driver/PROVENANCE.md` for the
 upstream revision and local changes; the connectrpc and hyper forks retain
 their own `PATCHES.md` files. AGPL perception components and FSL cua-spacesd
 remain excluded and must not be shipped or linked. The generator rejects
 packages whose declared license expression includes AGPL or FSL.
+
+The retired standalone worker's `Cargo.toml`, `Cargo.lock`, `NOTICES.md`, and
+complete `licenses/` tree are retained byte-for-byte in
+`third_party/cua-worker/` as historical licensing evidence. That archive is
+not an active Cargo package or notice-generation input. Its relative paths
+record the original source layout; do not build or resolve it in place. Root
+notice generation and checks leave every archived file unchanged. Preserve
+that archive in source distributions; it is not required by the current
+binary provenance manifest.
 
 ## Canonical build
 
@@ -40,7 +47,9 @@ From a clean checkout at the pinned revision:
 
 ```sh
 git rev-parse HEAD            # record this with the artifact
-cargo build --locked -j4 --release   # default base variant, without desktop dependencies
+cargo build --locked -j4 --release   # default desktop variant, with embedded CUA
+# Desktop-free base variant:
+cargo build --locked -j4 --release --no-default-features
 ```
 
 `--locked` makes cargo use exactly the versions in `Cargo.lock` — the same
@@ -50,20 +59,22 @@ the static musl build:
 ```sh
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
 CC_x86_64_unknown_linux_musl=clang AR_x86_64_unknown_linux_musl=llvm-ar \
-cargo build --locked --release -j4 --target x86_64-unknown-linux-musl
+cargo build --locked --release -j4 --no-default-features --target x86_64-unknown-linux-musl
 ```
 
-The optional desktop daemon uses a desktop-capable platform target (for
-example Linux GNU or Windows MSVC):
+The default desktop daemon uses a desktop-capable platform target (for
+example Linux GNU or Windows MSVC). Linux builds need X11/XInput/XTest/XFixes/
+XRandR/XComposite/XRender/XExt/XDamage and xkbcommon development headers; the
+package list for Ubuntu is in `.github/workflows/ci.yml`.
 
 ```sh
-cargo build --locked -j4 --release --features cua-desktop
+cargo build --locked -j4 --release
 # Cross-target example, with the appropriate platform toolchain installed:
-cargo build --locked -j4 --release --features cua-desktop --target x86_64-pc-windows-msvc
+cargo build --locked -j4 --release --target x86_64-pc-windows-msvc
 ```
 
 The static guest build above remains the base variant. Native Windows MSVC
-desktop builds and the standalone worker additionally require the MSVC v143
+desktop builds additionally require the MSVC v143
 x64/x86 Spectre-mitigated libraries for the active toolset, installed into the
 selected Visual Studio instance. The component ID is
 `Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre`, or the matching
@@ -75,11 +86,7 @@ Component names and unattended installation parameters are documented in the
 and [installer command reference](https://learn.microsoft.com/en-us/visualstudio/install/use-command-line-parameters-to-install-visual-studio?view=vs-2022).
 
 Distribution notices are deliberately a superset and do not enable desktop
-dependencies in a base build. The standalone worker is built from its own package and lockfile:
-
-```sh
-(cd cua-worker && cargo build --locked -j4 --release --bin coorworker-cua)
-```
+dependencies in a base build. Both profiles use the root `Cargo.lock`.
 
 ## Binding artifacts to source
 
@@ -104,49 +111,55 @@ dependencies in a base build. The standalone worker is built from its own packag
     --output dist/provenance-desktop.json
   ```
 
-  `--artifact-kind` accepts `base` (the default, `features: []`) or `desktop`
-  (`features: ["cua-desktop"]`). The manifest records `artifact_kind`,
-  `features`, `target`, and the corresponding release `build_command`,
-  including `--features cua-desktop` only for desktop. Pass `--target` when
+  `--artifact-kind` accepts `desktop` (the default, `features: ["cua-desktop"]`)
+  or `base` (`features: []`). The manifest records `artifact_kind`, `features`,
+  `target`, and the corresponding release `build_command`: ordinary Cargo
+  defaults for desktop, and `--no-default-features` for base. Pass `--target` when
   the build used it; omitted targets are recorded as null for a native build.
   These are the packager's declarations: the script hashes the binary but
   does not infer or verify its compiled feature set. Match them to the actual
   build invocation. It records the Cargo command; the musl linker/compiler
   environment shown above must also be retained in the build logs.
 
+  Schema version 2 binds only the active root graph: `covered_files` includes
+  the root manifest and lockfile plus required notices and provenance, and
+  `license_tree` hashes `third_party/licenses/`. Version 1 also required the
+  worker graph and exposed `worker_license_tree`; that field and the archived
+  worker files are absent in version 2.
+
   The script refuses a dirty tree unless `--allow-dirty` is passed (the
   resulting manifest still records `dirty: true`), refuses missing covered
   files, and rejects a notice bundle that does not match `Cargo.lock`.
-- When a manifest, feature definition, path dependency, or either lockfile
-  changes (the daemon's `Cargo.lock` or `cua-worker/Cargo.lock`), refresh the
-  notice bundles before distributing:
+- When a manifest, feature definition, path dependency, or the root
+  `Cargo.lock` changes, refresh the active notice bundle before distributing:
 
   ```sh
-  python3 scripts/generate_notices.py          # regenerate both NOTICES.md + licenses/ trees
-  python3 scripts/generate_notices.py --check  # CI-style verification of both
+  python3 scripts/generate_notices.py          # regenerate root NOTICES.md + licenses/
+  python3 scripts/generate_notices.py --check  # CI-style verification of the root bundle
   ```
 
   The generator fails closed: any crate without a discoverable license
-  aborts the bundle rather than shipping a partial notice. For both packages
-  it runs `cargo metadata --locked --offline --all-features --format-version 1`
-  without a target filter, covering all root features and target platforms.
-  Populate the registry cache for both packages and all features before an
-  offline check, for example:
+  aborts the bundle rather than shipping a partial notice. It runs
+  `cargo metadata --locked --offline --all-features --format-version 1`
+  from the root without a target filter, covering all root features and
+  target platforms. Populate the registry cache for all root features before
+  an offline check, for example:
 
   ```sh
   cargo fetch --locked
-  cargo fetch --locked --manifest-path cua-worker/Cargo.toml
   ```
 
-  If metadata is unavailable, the fallback enumerates the whole lockfile and
-  resolves local path crates from their manifests, including inherited
-  workspace licenses. An unresolved locked path crate aborts generation.
-  Regeneration writes both notice bundles, even when only one graph changed.
+  If metadata is unavailable, the fallback enumerates the whole root lockfile
+  and resolves local path crates from their manifests, including optional
+  target dependencies and inherited workspace licenses. An unresolved locked
+  path crate aborts generation. The archived graph is never read, regenerated,
+  checked against a current graph, or pruned.
 
-The script regressions run without Cargo, external packages, or bundle writes:
+The script regressions run without Cargo or external packages. All subprocesses
+are mocked, and bundle writes use temporary fixtures:
 
 ```sh
-python3 -I -B -m unittest discover -s scripts -p test_distribution.py -v
+python3 -I -B scripts/test_distribution.py
 ```
 
 ## Completeness check
@@ -158,8 +171,6 @@ python3 -I -B -m unittest discover -s scripts -p test_distribution.py -v
 - [ ] `third_party/licenses/` — full tree, unmodified
 - [ ] `vendor/connectrpc/LICENSE` + `vendor/connectrpc/PATCHES.md`
 - [ ] `vendor/hyper/LICENSE` + `vendor/hyper/PATCHES.md`
-- [ ] `third_party/cua-worker/NOTICES.md`
-- [ ] `third_party/cua-worker/licenses/` — full tree, unmodified
-- [ ] `cua-worker/Cargo.toml` + `cua-worker/Cargo.lock`
+- [ ] `Cargo.toml` + `Cargo.lock`
 - [ ] `vendor/cua-driver/LICENSE` + `vendor/cua-driver/PROVENANCE.md`
 - [ ] provenance manifest for this artifact

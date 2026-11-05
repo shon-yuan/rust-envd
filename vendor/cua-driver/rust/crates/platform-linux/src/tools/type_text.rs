@@ -83,10 +83,11 @@ async fn type_text_ax_result_verified(
         return type_text_ax_result(pid, text_len, route);
     }
     let idx = token.index;
-    let readback = tokio::task::spawn_blocking(move || crate::atspi::read_value_token(&token))
-        .await
-        .ok()
-        .flatten();
+    let readback =
+        cua_driver_core::work_scope::spawn_blocking(move || crate::atspi::read_value_token(&token))
+            .await
+            .ok()
+            .flatten();
     type_text_readback_result(pid, idx, text, route, readback)
 }
 
@@ -314,7 +315,7 @@ impl Tool for TypeTextTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || {
+                let windows = cua_driver_core::work_scope::spawn_blocking(move || {
                     crate::x11::list_windows(if pid == 0 { None } else { Some(pid) })
                 })
                 .await
@@ -428,9 +429,9 @@ impl Tool for TypeTextTool {
                 if let Some(element) = token.clone() {
                     let text_ax = text.clone();
                     if matches!(
-                        tokio::task::spawn_blocking(move || crate::atspi::type_into_token(
-                            pid, &element, &text_ax
-                        ))
+                        cua_driver_core::work_scope::spawn_blocking(move || {
+                            crate::atspi::type_into_token(pid, &element, &text_ax)
+                        })
                         .await,
                         Ok(Ok(()))
                     ) {
@@ -532,7 +533,7 @@ impl Tool for TypeTextTool {
         }) {
             let text_at = text.clone();
             let target = element.clone();
-            let targeted = tokio::task::spawn_blocking(move || {
+            let targeted = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::atspi::type_into_token(pid, &target, &text_at)
             })
             .await;
@@ -551,7 +552,7 @@ impl Tool for TypeTextTool {
                 return error;
             }
             let text_w = text.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::wayland::inject_type_text(pid, xid, &text_w)
             })
             .await;
@@ -656,7 +657,7 @@ impl Tool for TypeTextTool {
         if let Some(element) = token.clone() {
             let text_at = text.clone();
             let target = element.clone();
-            let targeted = tokio::task::spawn_blocking(move || {
+            let targeted = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::atspi::type_into_token(pid, &target, &text_at)
             })
             .await;
@@ -746,10 +747,11 @@ impl Tool for TypeTextTool {
         // synthesis. Either way the structured response reports
         // `path: "key_events"` so callers can verify the route taken.
         let pid_is_terminal = is_terminal_process(pid);
-        let wm_class_is_terminal =
-            tokio::task::spawn_blocking(move || crate::terminal::is_terminal_window(xid))
-                .await
-                .unwrap_or(false);
+        let wm_class_is_terminal = cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::terminal::is_terminal_window(xid)
+        })
+        .await
+        .unwrap_or(false);
         if pid_is_terminal || wm_class_is_terminal {
             let text_len = text.chars().count();
             let text_t = text.clone();
@@ -880,7 +882,7 @@ impl Tool for TypeTextTool {
         // widget instead: terminals via pty injection, everything else via
         // XSendEvent to the focused window. A focused *editable* (Some(true)) or
         // nothing focused (None) falls through to the existing AT-SPI-first flow.
-        let focus_kind = tokio::task::spawn_blocking(move || {
+        let focus_kind = cua_driver_core::work_scope::spawn_blocking(move || {
             crate::atspi::focused_is_editable(pid).ok().flatten()
         })
         .await
@@ -953,9 +955,10 @@ impl Tool for TypeTextTool {
 
         // Try AT-SPI EditableText first (focus-free, works for Qt6/GTK4).
         let text_clone = text.clone();
-        let atspi_result =
-            tokio::task::spawn_blocking(move || crate::atspi::type_into_editable(pid, &text_clone))
-                .await;
+        let atspi_result = cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::atspi::type_into_editable(pid, &text_clone)
+        })
+        .await;
 
         match atspi_result {
             Ok(Ok(())) => {

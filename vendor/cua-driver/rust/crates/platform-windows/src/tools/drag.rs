@@ -108,7 +108,7 @@ impl Tool for DragTool {
                 Ok(hwnd) => hwnd,
                 Err(error) => return ToolResult::error(error.to_string()),
             };
-            let native_drag = tokio::task::spawn_blocking(move || {
+            let native_drag = cua_driver_core::work_scope::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::mouse::send_drag_synthesized(
                     hwnd,
@@ -217,10 +217,11 @@ impl Tool for DragTool {
         let hwnd = match hwnd_opt {
             Some(h) => h,
             None => {
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = cua_driver_core::work_scope::spawn_blocking(move || {
+                    crate::win32::list_windows(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.hwnd,
                     None => {
@@ -272,7 +273,7 @@ impl Tool for DragTool {
                     y: sy_from as f64,
                 },
             );
-            let inj = tokio::task::spawn_blocking(move || {
+            let inj = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::input::inject::inject_drag_screen(
                     target,
                     sx_from,
@@ -317,7 +318,7 @@ impl Tool for DragTool {
             let prev_fg_addr = unsafe {
                 windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
             };
-            let send_result = tokio::task::spawn_blocking(move || {
+            let send_result = cua_driver_core::work_scope::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::mouse::send_drag_synthesized_active(
                     hwnd,
@@ -339,7 +340,10 @@ impl Tool for DragTool {
                 steps,
             );
             let (send_result, ()) = tokio::join!(send_result, visual_drag);
-            tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
+            cua_driver_core::work_scope::spawn(restore_foreground_polling_best_effort(
+                prev_fg_addr,
+                pid,
+            ));
             let button_suffix = if button == "left" {
                 String::new()
             } else {
@@ -378,7 +382,7 @@ impl Tool for DragTool {
         // structured background_unavailable error so callers escalate to
         // delivery_mode:"foreground" per the documented ladder instead of
         // trusting a drag that did nothing.
-        let nc_hit = tokio::task::spawn_blocking(move || {
+        let nc_hit = cua_driver_core::work_scope::spawn_blocking(move || {
             crate::input::mouse::non_client_move_resize_hit(hwnd, sx_from, sy_from)
         })
         .await
@@ -416,7 +420,7 @@ impl Tool for DragTool {
         );
 
         let button_c = button.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::work_scope::spawn_blocking(move || {
             // Screen-coord, deepest-child variant: routes the gesture to the
             // child control under the start point (e.g. a WinForms Panel),
             // not the top-level frame that would ignore it.

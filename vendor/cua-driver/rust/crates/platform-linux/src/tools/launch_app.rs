@@ -304,13 +304,15 @@ impl Tool for LaunchAppTool {
         // Snapshot the top-levels before spawning so a window created by an
         // already-running service (D-Bus activation) can be told apart.
         let windows_before: std::collections::HashSet<u64> =
-            tokio::task::spawn_blocking(|| crate::wayland::list_windows_dispatch(None))
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|w| w.xid)
-                .collect();
-        let result = tokio::task::spawn_blocking(
+            cua_driver_core::work_scope::spawn_blocking(|| {
+                crate::wayland::list_windows_dispatch(None)
+            })
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|w| w.xid)
+            .collect();
+        let result = cua_driver_core::work_scope::spawn_blocking(
             move || -> anyhow::Result<(String, Option<u32>, String)> {
                 // Open URLs via xdg-open.
                 if !urls.is_empty() {
@@ -409,7 +411,7 @@ impl Tool for LaunchAppTool {
                     // query, Exec=) for a desktop-entry launch.
                     let query = name.clone();
                     let name = name.split('\u{0}').next().unwrap_or("").to_owned();
-                    let resolved = tokio::task::spawn_blocking(move || {
+                    let resolved = cua_driver_core::work_scope::spawn_blocking(move || {
                         resolve_launched_windows(launcher_pid, &query, &windows_before)
                     })
                     .await

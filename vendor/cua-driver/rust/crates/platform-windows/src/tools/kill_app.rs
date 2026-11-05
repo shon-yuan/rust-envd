@@ -101,7 +101,7 @@ impl Tool for KillAppTool {
         // Run the syscalls on a blocking thread — TerminateProcess + the
         // WaitForSingleObject confirmation are both blocking, and we don't
         // want to stall the tokio reactor.
-        let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let outcome = cua_driver_core::work_scope::spawn_blocking(move || -> Result<(), String> {
             use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
             use windows::Win32::System::Threading::{
                 OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,

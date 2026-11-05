@@ -274,8 +274,8 @@ impl Drop for PendingExistingProfileSetup {
             BrowserRefusalCode::BrowserBindingStale,
             "the existing-profile setup request ended before commit; rolling back its exact pending setup",
         );
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            crate::work_scope::spawn(async move {
                 let _ = platform.abort_existing_profile_setup(request, error).await;
             });
         }
@@ -1599,7 +1599,7 @@ mod tests {
                     marker.perform(|| tx.send(()).unwrap());
                     if outcome >= 2 {
                         // Model Linux's non-cancellable native action worker.
-                        tokio::task::spawn_blocking(|| {
+                        crate::work_scope::spawn_blocking(|| {
                             std::thread::sleep(Duration::from_millis(4100));
                         })
                         .await
@@ -1675,7 +1675,7 @@ mod tests {
             |action| async move {
                 action
                     .perform(|| {
-                        tokio::task::spawn_blocking(move || {
+                        crate::work_scope::spawn_blocking(move || {
                             std::thread::sleep(Duration::from_millis(4100));
                             assert!(!dropped_during_worker.load(Ordering::SeqCst));
                             finished.store(true, Ordering::SeqCst);

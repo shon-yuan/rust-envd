@@ -4,7 +4,7 @@
 //! `atspi` crate (zbus) — no Python, `pyatspi`, or GObject-introspection
 //! typelibs are required at runtime. The async zbus calls run on a shared
 //! background Tokio runtime; the public functions stay synchronous because
-//! callers invoke them inside `tokio::task::spawn_blocking`.
+//! callers invoke them inside `cua_driver_core::work_scope::spawn_blocking`.
 //!
 //! When the AT-SPI bus is unavailable (or the app exposes no a11y tree) we
 //! fall back to a minimal X11 property tree (window title + role) via x11rb.

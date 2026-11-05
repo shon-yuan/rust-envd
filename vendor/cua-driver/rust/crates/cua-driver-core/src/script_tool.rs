@@ -348,10 +348,10 @@ async fn run(registry: &ToolRegistry, request: Request) -> ToolResult {
     let spawned = std::thread::Builder::new()
         .name("cua-run-script".into())
         .stack_size(THREAD_STACK_BYTES)
-        .spawn(move || {
+        .spawn(crate::work_scope::bind_current(move || {
             let outcome = engine::run(&script, platform(), limits, engine_cancel, call_tx);
             let _ = done_tx.send(outcome);
-        });
+        }));
     if let Err(error) = spawned {
         return ToolResult::error(format!("run_script could not start its engine: {error}"));
     }

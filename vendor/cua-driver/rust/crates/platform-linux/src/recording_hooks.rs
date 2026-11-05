@@ -10,10 +10,12 @@ pub fn app_state_json_for(
     budget: cua_driver_core::recording::StateCaptureBudget,
 ) -> Option<Vec<u8>> {
     if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::spawn(move || app_state_json_for_blocking(window_id, pid, budget))
-            .join()
-            .ok()
-            .flatten();
+        return std::thread::spawn(cua_driver_core::work_scope::bind_current(move || {
+            app_state_json_for_blocking(window_id, pid, budget)
+        }))
+        .join()
+        .ok()
+        .flatten();
     }
     app_state_json_for_blocking(window_id, pid, budget)
 }
@@ -107,10 +109,12 @@ pub fn element_window_local_xy(
     let point = if !capture_point {
         None
     } else if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || element_window_local_xy_blocking(window_id, pid, element_index))
-            .join()
-            .ok()
-            .flatten()
+        std::thread::spawn(cua_driver_core::work_scope::bind_current(move || {
+            element_window_local_xy_blocking(window_id, pid, element_index)
+        }))
+        .join()
+        .ok()
+        .flatten()
     } else {
         element_window_local_xy_blocking(window_id, pid, element_index)
     };

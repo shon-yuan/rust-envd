@@ -368,7 +368,7 @@ impl Tool for ScrollTool {
         let xid = match xid_opt {
             Some(x) => x,
             None => {
-                let windows = tokio::task::spawn_blocking(move || {
+                let windows = cua_driver_core::work_scope::spawn_blocking(move || {
                     crate::x11::list_windows(if pid == 0 { None } else { Some(pid) })
                 })
                 .await
@@ -423,7 +423,10 @@ impl Tool for ScrollTool {
             (Some(x), Some(y)) if desktop_frame_requested(&args) => {
                 // Desktop-frame pixels (from get_desktop_state) against a named
                 // window: map into the window-local frame the pipeline expects.
-                match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await
+                match cua_driver_core::work_scope::spawn_blocking(move || {
+                    desktop_to_window_local(xid, x, y)
+                })
+                .await
                 {
                     Ok(Ok(local)) => Some(local),
                     Ok(Err(e)) => return desktop_frame_unmapped(xid, e),
@@ -464,7 +467,7 @@ impl Tool for ScrollTool {
 
         if named_session_cursor_key(&args).is_some() {
             let element = token.clone();
-            let visual_target = tokio::task::spawn_blocking(move || {
+            let visual_target = cua_driver_core::work_scope::spawn_blocking(move || {
                 explicit_keyboard_cursor_target(pid, xid, element.as_ref(), pixel_target)
                     .or_else(|| keyboard_window_center(xid))
             })
@@ -494,7 +497,7 @@ impl Tool for ScrollTool {
             // coordinate-based compositor fallback.
             if !(crate::wayland::wayland_input_enabled() && is_webkitgtk_embedder(pid)) {
                 let direction_for_ax = direction.clone();
-                let ax_result = tokio::task::spawn_blocking(move || {
+                let ax_result = cua_driver_core::work_scope::spawn_blocking(move || {
                     crate::atspi::scroll_token(pid, &element, &direction_for_ax, amount, by)
                 })
                 .await;
@@ -529,7 +532,7 @@ impl Tool for ScrollTool {
                 );
             }
             let point = if let Some(element) = token.clone() {
-                match tokio::task::spawn_blocking(move || {
+                match cua_driver_core::work_scope::spawn_blocking(move || {
                     resolve_element_local_coords(pid, &element, Some(xid))
                 })
                 .await
@@ -597,7 +600,7 @@ impl Tool for ScrollTool {
                 );
             };
             let direction_for_inject = direction.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::wayland::inject_scroll(pid, xid, x, y, &direction_for_inject, amount as u32)
             })
             .await;
@@ -624,7 +627,7 @@ impl Tool for ScrollTool {
                 (Some(point), _) => Some(point),
                 (None, Some(element)) => {
                     let idx = element.index;
-                    match tokio::task::spawn_blocking(move || {
+                    match cua_driver_core::work_scope::spawn_blocking(move || {
                         resolve_element_local_coords(pid, &element, Some(xid))
                     })
                     .await
@@ -695,7 +698,7 @@ impl Tool for ScrollTool {
         let element_point = match token {
             Some(element) => {
                 let idx = element.index;
-                match tokio::task::spawn_blocking(move || {
+                match cua_driver_core::work_scope::spawn_blocking(move || {
                     resolve_element_local_coords(pid, &element, Some(xid))
                 })
                 .await

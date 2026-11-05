@@ -100,8 +100,10 @@ impl Tool for MouseDragTool {
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
-        if let Ok(Ok((sx, sy))) =
-            tokio::task::spawn_blocking(move || window_local_to_screen(xid, from_x, from_y)).await
+        if let Ok(Ok((sx, sy))) = cua_driver_core::work_scope::spawn_blocking(move || {
+            window_local_to_screen(xid, from_x, from_y)
+        })
+        .await
         {
             overlay_glide_to_for(&cursor_id, sx, sy).await;
             self.state
@@ -166,8 +168,10 @@ impl Tool for MouseDragTool {
             match move_result {
                 Ok(Ok(())) => {
                     if let Ok(Ok((sx, sy))) =
-                        tokio::task::spawn_blocking(move || window_local_to_screen(xid, ix, iy))
-                            .await
+                        cua_driver_core::work_scope::spawn_blocking(move || {
+                            window_local_to_screen(xid, ix, iy)
+                        })
+                        .await
                     {
                         let heading = if (ix - prev_x).abs() > f64::EPSILON
                             || (iy - prev_y).abs() > f64::EPSILON
@@ -208,9 +212,10 @@ impl Tool for MouseDragTool {
                     .lock()
                     .unwrap()
                     .insert(cursor_id.clone(), hold.clone());
-                if let Ok(Ok((sx, sy))) =
-                    tokio::task::spawn_blocking(move || window_local_to_screen(xid, to_x, to_y))
-                        .await
+                if let Ok(Ok((sx, sy))) = cua_driver_core::work_scope::spawn_blocking(move || {
+                    window_local_to_screen(xid, to_x, to_y)
+                })
+                .await
                 {
                     self.state
                         .cursor_registry

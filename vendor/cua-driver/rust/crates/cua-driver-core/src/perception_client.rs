@@ -534,7 +534,7 @@ impl PerceptionClientHandle {
             PerceptionClientSource::Fixed(client) => client.clone(),
             PerceptionClientSource::Live(_) => {
                 let handle = self.clone();
-                tokio::task::spawn_blocking(move || handle.current_blocking())
+                crate::work_scope::spawn_blocking(move || handle.current_blocking())
                     .await
                     .unwrap_or_else(|error| {
                         tracing::warn!("perception client resolution task failed: {error}");

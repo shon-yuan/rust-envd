@@ -8,7 +8,7 @@
 //! calls in the same session are silent.
 //!
 //! ashpd is async (zbus under the hood); the rest of `wayland::screenshot_*`
-//! is sync because it's called from `tokio::task::spawn_blocking`. We build
+//! is sync because it's called from `cua_driver_core::work_scope::spawn_blocking`. We build
 //! a dedicated single-threaded tokio runtime per call so the async ashpd
 //! work has somewhere to live without colliding with the caller's runtime.
 //!
@@ -59,9 +59,11 @@ impl From<ashpd::Error> for RequestError {
 /// requesting binary in their DE's privacy settings.
 pub fn screenshot_via_portal() -> anyhow::Result<Option<Vec<u8>>> {
     if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::spawn(screenshot_via_portal_blocking)
-            .join()
-            .map_err(|_| anyhow::anyhow!("xdg-desktop-portal Screenshot worker panicked"))?;
+        return std::thread::spawn(cua_driver_core::work_scope::bind_current(
+            screenshot_via_portal_blocking,
+        ))
+        .join()
+        .map_err(|_| anyhow::anyhow!("xdg-desktop-portal Screenshot worker panicked"))?;
     }
     screenshot_via_portal_blocking()
 }

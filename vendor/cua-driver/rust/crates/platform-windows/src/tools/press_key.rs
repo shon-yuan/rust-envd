@@ -79,7 +79,7 @@ impl Tool for PressKeyTool {
                 Err(error) => return ToolResult::error(error.to_string()),
             };
             let key_display = key.clone();
-            return match tokio::task::spawn_blocking(move || {
+            return match cua_driver_core::work_scope::spawn_blocking(move || {
                 let modifiers: Vec<&str> = mods.iter().map(String::as_str).collect();
                 crate::input::send_key_synthesized(hwnd, &key, &modifiers)
             })
@@ -158,7 +158,7 @@ impl Tool for PressKeyTool {
         let hwnd = match hwnd_opt {
             Some(h) => h,
             None => {
-                let windows = tokio::task::spawn_blocking({
+                let windows = cua_driver_core::work_scope::spawn_blocking({
                     let admitted = admitted.clone();
                     move || {
                         let _admission = &admitted;
@@ -256,7 +256,7 @@ impl Tool for PressKeyTool {
                 return error;
             }
         } else if elem_idx.is_some() && delivery != DeliveryMode::Foreground {
-            let focused = tokio::task::spawn_blocking({
+            let focused = cua_driver_core::work_scope::spawn_blocking({
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
@@ -291,7 +291,7 @@ impl Tool for PressKeyTool {
                 let point = admitted.as_ref().map(|element| element.center);
                 (idx as usize, point)
             });
-            let send_result = tokio::task::spawn_blocking({
+            let send_result = cua_driver_core::work_scope::spawn_blocking({
                 let admitted = admitted.clone();
                 move || {
                     let _admission = &admitted;
@@ -313,7 +313,7 @@ impl Tool for PressKeyTool {
                 Err(e)     => ToolResult::error(format!("Task error: {e}")),
             };
         }
-        let result = tokio::task::spawn_blocking({
+        let result = cua_driver_core::work_scope::spawn_blocking({
             let admitted = admitted.clone();
             move || {
                 let _admission = &admitted;

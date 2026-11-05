@@ -72,7 +72,7 @@ impl Tool for BringToFrontTool {
                 )
                 .await;
             }
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::work_scope::spawn_blocking(move || {
                 crate::wayland::activate_window_for_input_target(window_id, Some(pid))
             })
             .await;
@@ -94,10 +94,11 @@ impl Tool for BringToFrontTool {
         let xid = match args.opt_u64("window_id") {
             Some(x) => x,
             None => {
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::x11::list_windows(Some(pid)))
-                        .await
-                        .unwrap_or_default();
+                let windows = cua_driver_core::work_scope::spawn_blocking(move || {
+                    crate::x11::list_windows(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.xid,
                     None => {
@@ -108,9 +109,10 @@ impl Tool for BringToFrontTool {
                 }
             }
         };
-        let r =
-            tokio::task::spawn_blocking(move || crate::input::x11_activate_window_persistent(xid))
-                .await;
+        let r = cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::input::x11_activate_window_persistent(xid)
+        })
+        .await;
         match r {
             Ok(Ok(prior)) => ToolResult::text(format!(
                 "✅ Brought window {xid} to front (X11 _NET_ACTIVE_WINDOW)."

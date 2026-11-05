@@ -185,7 +185,7 @@ pub async fn spawn_blocking_bounded<T: Send + 'static>(
             f()
         }
     };
-    match tokio::time::timeout(budget, tokio::task::spawn_blocking(worker)).await {
+    match tokio::time::timeout(budget, cua_driver_core::work_scope::spawn_blocking(worker)).await {
         Ok(joined) => joined,
         Err(_elapsed) => {
             action.abandon();

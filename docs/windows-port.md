@@ -1,6 +1,6 @@
 # Windows sandbox port — evaluation and plan
 
-Status: **P0–P3 complete (2026-11-04)** — the platform seam, the native
+Historical port status: **P0–P3 complete (2026-11-04)** — the platform seam, the native
 Windows backends and the complete API surface are implemented and
 contract-tested: all 13 REST operations and all 17 Connect procedures,
 `POST /upgrade` included. The library suite runs natively on a Windows 11
@@ -16,32 +16,64 @@ pinned Go oracle.
 The 314-test count above records the original port acceptance. The subsequent
 [dependency maintenance regression](windows-dependency-regression.md) at
 `c3cb81a` passed 321 native library tests plus 5 base or 9 desktop integration
-tests, 16 worker tests and another official SDK 27/27 run. It also verifies
-actual Session 0 embedded refusal. The separate
-[native CUA acceptance](windows-cua-acceptance.md) establishes embedded
+tests, 16 worker tests and another official SDK 27/27 run. That older revision
+also verified actual Session 0 embedded refusal. The separate
+[native CUA acceptance](windows-cua-acceptance.md) records embedded
 capture/click/type/window operations and actual SCM/helper start, stop,
 recovery and service restart in a disposable Windows 11 copy at the same
-source revision. Native DPAPI rotation works; empty metadata cannot authorize
-live credential reset, which returns 401 and preserves the current token.
+source revision. At that revision, native DPAPI rotation worked; empty
+metadata could not authorize live credential reset, which returned 401 and
+preserved the current token. These are historical results, not verification
+of the native REST migration below.
 
-## CUA desktop execution modes
+## Native CUA desktop execution
 
-CUA is an additive interface, separate from the S0 contract evidence above.
-The default executable keeps desktop dependencies disabled. Build with
-`--features cua-desktop` and select `COORWORKER_CUA_MODE=embedded` to execute
-CUA inside envd in a known nonzero user session. It serves `/cua/mcp` using
-the current envd `/init` credential as Bearer; S0 keeps `X-Access-Token`.
+CUA is an additive native HTTP interface in the S0 routing/authentication
+stack. The implemented [native CUA contract](native-cua.md) defines four routes on
+envd's existing listener: `GET /cua/tools`, `POST /cua/call`,
+`GET /cua/health` and `GET /cua/metrics`. All CUA paths, including unknown or
+removed paths, require completed initialization and a nonempty current
+`X-Access-Token`. Bearer, Basic and file signatures cannot substitute.
+Authentication precedes body decoding; existing CORS preflight behavior and
+S0 authentication exceptions remain unchanged.
 
-The service boot mode, including handover successors without an SCM handle,
-Session 0, and failed `ProcessIdToSessionId` lookup all refuse embedded
-initialization. Select `shared-external` for service deployments and start
-`coorworker-cua` in the target logged-in user's session. Supply matching local
-transport credentials through `CUA_ENV_TOKEN` or the helper's `--token-file`;
-clients use only the envd credential. No new user-session launcher, logon task,
-or credential-file ACL provisioning is included. Legacy mode remains available.
-See [extensions](extensions.md) for configuration, lifecycle, and limitations.
-Windows build/contract gates do not establish interactive desktop capture,
-click, typing, or application-launch acceptance.
+The only engine is the directly linked in-process desktop registry. There is
+no MCP endpoint, extension framework, execution-mode selection, worker,
+supervisor or helper transport. `/cua/mcp`, `/cua/info` and independent
+`coorworker-cua` startup are removed. Old `COORWORKER_CUA_*` configuration
+and `CUA_ENV_TOKEN` are rejected at production startup; remove them and use
+the envd credential. Calls use exactly `{"name":"…","arguments":{…}}`,
+return native `success`/`content`/optional `data` results, and use the S0
+`code`/`message` envelope for transport errors.
+
+The default executable enables optional `cua-desktop` dependencies. Known
+Windows desktop user sessions are eligible for registry construction.
+SCM-attached processes, Session 0, service handover successors in Session 0,
+and failed session lookup report CUA unavailable before constructing a
+registry. They do not start or contact a helper. S0 filesystem/process services
+remain available. `--no-default-features` retains the desktop-free base
+executable; CUA operations report unavailable after authentication.
+
+Health is passive availability information and cannot establish desktop
+action acceptance. Latest local full tests passed default 907/base 881, with
+zero failures and 24 doctests ignored in each configuration. Final default/base
+all-target strict Clippy, formatting, 17 distribution checks, notices
+verification, rebuild and the Windows base MSVC library/binary crosscheck
+passed. The crosscheck is compilation evidence; no native Windows desktop
+or live S0 Windows acceptance has been run for the new API. The latest tests'
+17 native contracts per configuration, five desktop Wayland fixtures,
+15 desktop completion regressions (including resumed-I/O deadline admission)
+and actual registry adapter test use isolated fixtures. The final Rust recheck
+closed the deadline finding alongside code/security follow-up. Observed Linux
+smoke found 63 tools, one envd process and one listener without desktop actions;
+the final rebuilt repetition passed. See the
+[local verification record, scoped coverage and limits](native-cua.md#verified-local-state).
+
+Earlier Windows test counts, SDK results and SCM/helper campaigns elsewhere
+in this document retain their older recorded revisions. No fresh Go/SDK
+comparison, local musl build, remote CI, commit/push/merge/deploy or real
+desktop action is claimed. See [native CUA instructions](extensions.md) for
+limits, migration guidance and explicitly scoped historical campaigns.
 
 ## 1. Objective
 
@@ -86,7 +118,10 @@ not by differential evidence.
 5. **Orchestration**: backend selection, image build, idle reaping, health
    checks, and a Windows security model (SIDs/ACLs, service accounts).
 
-## 3. Current state — measured surface
+## 3. Original port planning baseline — historical measurements
+
+The following counts and effort estimate were recorded before the port. They
+are retained as planning history, not current source or dependency counts.
 
 - 33,697 lines of Rust across 77 source files.
 - 36 of 77 files call `nix`/`libc` directly (225 call sites).

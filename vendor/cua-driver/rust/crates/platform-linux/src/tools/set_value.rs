@@ -98,11 +98,12 @@ impl Tool for SetValueTool {
         let ax_error = match ax {
             Ok(Ok(())) => {
                 let target = token.clone();
-                let readback =
-                    tokio::task::spawn_blocking(move || crate::atspi::read_value_token(&target))
-                        .await
-                        .ok()
-                        .flatten();
+                let readback = cua_driver_core::work_scope::spawn_blocking(move || {
+                    crate::atspi::read_value_token(&target)
+                })
+                .await
+                .ok()
+                .flatten();
                 return set_value_result(idx, &value, "ax", readback, None);
             }
             Ok(Err(error)) if crate::atspi::native::is_no_value_route(&error) => error,
@@ -204,11 +205,12 @@ impl Tool for SetValueTool {
             Ok(Ok(guard)) => {
                 // Let the toolkit commit on focus-out before reading back.
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                let readback =
-                    tokio::task::spawn_blocking(move || crate::atspi::read_value_token(&token))
-                        .await
-                        .ok()
-                        .flatten();
+                let readback = cua_driver_core::work_scope::spawn_blocking(move || {
+                    crate::atspi::read_value_token(&token)
+                })
+                .await
+                .ok()
+                .flatten();
                 set_value_result(
                     idx,
                     &value,

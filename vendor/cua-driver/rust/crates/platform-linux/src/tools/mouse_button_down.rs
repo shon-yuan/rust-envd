@@ -96,7 +96,11 @@ impl Tool for MouseButtonDownTool {
             y *= ratio;
         }
         if desktop_frame {
-            match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await {
+            match cua_driver_core::work_scope::spawn_blocking(move || {
+                desktop_to_window_local(xid, x, y)
+            })
+            .await
+            {
                 Ok(Ok((lx, ly))) => {
                     x = lx;
                     y = ly;
@@ -111,7 +115,8 @@ impl Tool for MouseButtonDownTool {
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
         if let Ok(Ok((sx, sy))) =
-            tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y)).await
+            cua_driver_core::work_scope::spawn_blocking(move || window_local_to_screen(xid, x, y))
+                .await
         {
             overlay_glide_to_for(&cursor_id, sx, sy).await;
             crate::overlay::send_command_for(
@@ -174,8 +179,10 @@ impl Tool for MouseButtonDownTool {
                     x,
                     y,
                 };
-                if let Ok(Ok((sx, sy))) =
-                    tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y)).await
+                if let Ok(Ok((sx, sy))) = cua_driver_core::work_scope::spawn_blocking(move || {
+                    window_local_to_screen(xid, x, y)
+                })
+                .await
                 {
                     self.state
                         .cursor_registry

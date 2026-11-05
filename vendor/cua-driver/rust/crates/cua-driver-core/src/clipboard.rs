@@ -73,7 +73,7 @@ impl Tool for ClipboardReadTool {
             Err(result) => return result,
         };
         let backend = self.backend.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::work_scope::spawn_blocking(move || {
             let types = normalize_types(backend.available_formats()?);
             let text = if input.include_text {
                 backend.read_text()?
@@ -136,7 +136,7 @@ impl Tool for ClipboardWriteTool {
         }
 
         let backend = self.backend.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::work_scope::spawn_blocking(move || {
             let written_type = if let Some(text) = input.text {
                 backend.write_text(text)?;
                 "text"

@@ -338,9 +338,9 @@ fn run_with_deadline<T: Send + 'static>(
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("cua-x11-foreground".into())
-        .spawn(move || {
+        .spawn(cua_driver_core::work_scope::bind_current(move || {
             let _ = tx.send(f());
-        })
+        }))
         .ok()?;
     rx.recv_timeout(remaining(deadline)).ok()
 }

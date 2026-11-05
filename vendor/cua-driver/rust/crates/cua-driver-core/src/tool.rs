@@ -1330,8 +1330,8 @@ impl ToolRegistry {
                 if revoked.is_empty() {
                     return;
                 }
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    crate::work_scope::spawn(async move {
                         for grant in revoked {
                             grants.broker().revoke(&grant).await;
                         }

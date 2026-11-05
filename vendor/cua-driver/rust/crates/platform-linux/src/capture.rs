@@ -107,9 +107,9 @@ fn capture_via_import(xid: u64) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("failed to launch ImageMagick import: {e}"))?;
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    std::thread::spawn(cua_driver_core::work_scope::bind_current(move || {
         let _ = tx.send(child.wait_with_output());
-    });
+    }));
     let out = match rx.recv_timeout(IMPORT_TIMEOUT) {
         Ok(out) => out.map_err(|e| anyhow!("failed to wait for ImageMagick import: {e}"))?,
         Err(_) => {

@@ -412,8 +412,11 @@ def synthesized_license(
         except ValueError:
             pass
         else:
+            # The repository-level MIT grant is the only fallback approved
+            # for these vendored crates. Never replace it with anonymous SPDX
+            # text or apply it to a different declared license.
             upstream = repo / "vendor" / "cua-driver" / "LICENSE"
-            if upstream.is_file():
+            if pkg.get("license") == "MIT" and upstream.is_file():
                 return (
                     "LICENSE",
                     upstream.read_bytes(),
@@ -421,6 +424,7 @@ def synthesized_license(
                     " the published crate ships no per-crate file (see"
                     " vendor/cua-driver/PROVENANCE.md)",
                 )
+            return None
     if not pkg["license"]:
         return None
     for ident, (_pat, out_name) in SYNTHETIC_LICENSE_SOURCES.items():
@@ -455,15 +459,13 @@ def generate(
     scope: str,
     root_label: str,
     license_link: str,
-    vendored_kind: str = "patch",
 ) -> tuple[str, dict[str, bytes], int, int]:
     """Return (NOTICES.md text, {relative path under the bundle root: bytes},
     total package count, third-party crate count).
 
-    ``package_dir`` is the crate whose dependency graph is enumerated (the
-    repository root, or a nested package such as ``cua-worker`` with its own
-    lockfile). ``repo`` stays the repository root for shared license and
-    provenance files.
+    ``package_dir`` is the root crate whose single active dependency graph is
+    enumerated. ``repo`` locates shared license and provenance files.
+    The historical third_party/cua-worker bundle is never regenerated.
     """
     enumerated = cargo_metadata_packages(package_dir)
     if enumerated is None:
@@ -473,11 +475,9 @@ def generate(
         fill_license_fields(pkgs)
 
     collector = Collector()
-    first_party = [pkg for pkg in pkgs if is_first_party(repo, pkg)]
-    third_party = [pkg for pkg in pkgs if not is_first_party(repo, pkg)]
-    canonical = build_canonical_index(third_party)
+    canonical = build_canonical_index(pkgs)
     collected = []
-    for pkg in sorted(third_party, key=lambda p: (p["name"].lower(), p["version"])):
+    for pkg in sorted(pkgs, key=lambda p: (p["name"].lower(), p["version"])):
         crate = f"{pkg['name']}-{pkg['version']}"
         if any(restricted in (pkg["license"] or "").upper() for restricted in ("AGPL", "FSL")):
             collector.add(crate, "AGPL/FSL components must not be shipped or linked")
@@ -536,8 +536,6 @@ def generate(
         scope=scope,
         root_label=root_label,
         license_link=license_link,
-        vendored_kind=vendored_kind,
-        first_party=first_party,
     )
     tree: dict[str, bytes] = {NOTICES_NAME: text.encode("utf-8")}
     for pkg, files, _synthetic in collected:
@@ -557,20 +555,8 @@ def local_path(repo: Path, pkg: dict) -> str | None:
         return None
 
 
-def is_first_party(repo: Path, pkg: dict) -> bool:
-    """Only the known project library shares the root MIT notice.
-
-    An arbitrary in-repo path must retain its own third-party attribution.
-    """
-    return (
-        local_path(repo, pkg) == "cua-worker"
-        and pkg["name"] == "coorworker-cua"
-        and pkg.get("license") == "MIT"
-    )
-
-
 def vendored_forks(repo: Path, collected: list[tuple[dict, dict, dict]]) -> list[tuple[str, dict]]:
-    """Upstream packages resolved under vendor/, excluding project libraries."""
+    """Upstream packages resolved under vendor/."""
     forks: list[tuple[str, dict]] = []
     for pkg, _files, _synthetic in collected:
         relative = local_path(repo, pkg)
@@ -590,8 +576,6 @@ def render_notices(
     scope: str,
     root_label: str,
     license_link: str,
-    vendored_kind: str,
-    first_party: list[dict],
 ) -> str:
     own_copyright = ""
     lic = repo / "LICENSE"
@@ -631,38 +615,29 @@ def render_notices(
     if own_copyright:
         add(f"{own_copyright}")
         add("")
-    for pkg in sorted(first_party, key=lambda p: (p["name"], p["version"])):
-        add(
-            f"The project library `{pkg['name']}` {pkg['version']} in"
-            f" `{local_path(repo, pkg)}/` is also covered by the project's"
-            f" MIT License ([`LICENSE`]({license_link})). It is not a"
-            " vendored upstream crate."
-        )
-        add("")
-    if vendored_kind != "cua":
-        add("## Vendored upstream schemas (Apache-2.0)")
-        add("")
-        add(
-            "`third_party/e2b/` contains e2b `envd` protobuf schemas"
-            " redistributed byte-for-byte from https://github.com/e2b-dev/runtime"
-            " (release 0.10.2, commit"
-            " 51083a83cc0903185d992725ea6bb33683814b29) under the Apache License,"
-            " 2.0. Any covered distribution must include"
-            " `third_party/e2b/LICENSE` and `third_party/e2b/PROVENANCE`;"
-            " generated code built from those schemas carries the same"
-            " attribution and does not replace those files."
-        )
-        add("")
-        add("## Go-derived source (BSD-3-Clause)")
-        add("")
-        add(
-            "`src/platform/linux/mmds/go_url.rs` is a Go-derived redirect URL helper carrying"
-            ' The Go Authors\' BSD-3-Clause notice ("Copyright 2009 The Go'
-            ' Authors.") in its file header. Binary redistribution of a covered'
-            " distribution must reproduce that notice; source distributions"
-            " include the file itself."
-        )
-        add("")
+    add("## Vendored upstream schemas (Apache-2.0)")
+    add("")
+    add(
+        "`third_party/e2b/` contains e2b `envd` protobuf schemas"
+        " redistributed byte-for-byte from https://github.com/e2b-dev/runtime"
+        " (release 0.10.2, commit"
+        " 51083a83cc0903185d992725ea6bb33683814b29) under the Apache License,"
+        " 2.0. Any covered distribution must include"
+        " `third_party/e2b/LICENSE` and `third_party/e2b/PROVENANCE`;"
+        " generated code built from those schemas carries the same"
+        " attribution and does not replace those files."
+    )
+    add("")
+    add("## Go-derived source (BSD-3-Clause)")
+    add("")
+    add(
+        "`src/platform/linux/mmds/go_url.rs` is a Go-derived redirect URL helper carrying"
+        ' The Go Authors\' BSD-3-Clause notice ("Copyright 2009 The Go'
+        ' Authors.") in its file header. Binary redistribution of a covered'
+        " distribution must reproduce that notice; source distributions"
+        " include the file itself."
+    )
+    add("")
     forks = vendored_forks(repo, collected)
     cua = [(path, pkg) for path, pkg in forks if path.startswith("vendor/cua-driver/")]
     patches = [(path, pkg) for path, pkg in forks if not path.startswith("vendor/cua-driver/")]
@@ -671,8 +646,8 @@ def render_notices(
         add("")
         add(
             "`vendor/cua-driver/` carries the MIT-licensed Cua Driver crates"
-            " used by the standalone `coorworker-cua` worker and the daemon's"
-            " optional `cua-desktop` feature. The pinned upstream commit,"
+            " linked directly by the daemon's native embedded `cua-desktop`"
+            " feature. The pinned upstream commit,"
             " local changes, vendored list, and deliberately excluded AGPL/FSL"
             " components are recorded in `vendor/cua-driver/PROVENANCE.md`."
             " Those excluded components must not be shipped or linked."
@@ -689,28 +664,27 @@ def render_notices(
                 " also indexed below."
             )
             add("")
-    if patches or vendored_kind != "cua":
-        add("## Vendored Rust crate forks")
+    add("## Vendored Rust crate forks")
+    add("")
+    if not patches:
+        add(
+            "No in-tree crate forks are resolved by the current lockfile; this"
+            " section becomes active when a `[patch.crates-io]` path"
+            " dependency is present."
+        )
         add("")
-        if not patches:
-            add(
-                "No in-tree crate forks are resolved by the current lockfile; this"
-                " section becomes active when a `[patch.crates-io]` path"
-                " dependency is present."
-            )
-            add("")
-        for relative, pkg in patches:
-            crate = f"{pkg['name']}-{pkg['version']}"
-            add(
-                f"`{relative}/` is an in-tree fork of crates.io `{pkg['name']}`"
-                f" {pkg['version']} ({pkg['license'] or 'see files'}), selected with"
-                " `[patch.crates-io]`. Covered distributions must include this"
-                f" file, the license text(s) under `{LICENSES_DIR}/{crate}/`,"
-                f" and `{relative}/PATCHES.md`, which records the upstream"
-                " revision and every local change. The fork's license text is"
-                " enumerated below with the other third-party crates."
-            )
-            add("")
+    for relative, pkg in patches:
+        crate = f"{pkg['name']}-{pkg['version']}"
+        add(
+            f"`{relative}/` is an in-tree fork of crates.io `{pkg['name']}`"
+            f" {pkg['version']} ({pkg['license'] or 'see files'}), selected with"
+            " `[patch.crates-io]`. Covered distributions must include this"
+            f" file, the license text(s) under `{LICENSES_DIR}/{crate}/`,"
+            f" and `{relative}/PATCHES.md`, which records the upstream"
+            " revision and every local change. The fork's license text is"
+            " enumerated below with the other third-party crates."
+        )
+        add("")
     add("## Third-party crates")
     add("")
     add(
@@ -811,7 +785,8 @@ def write_bundle(third_party: Path, tree: dict[str, bytes]) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.exists() or dest.read_bytes() != payload:
             dest.write_bytes(payload)
-    # Prune files/dirs no longer part of the bundle.
+    # Prune only this active bundle's licenses/ tree. In particular, the
+    # historical third_party/cua-worker/ files are outside this traversal.
     for path in sorted(licenses_root.rglob("*"), reverse=True):
         if path.is_file() and path not in keep_files:
             path.unlink()
@@ -863,28 +838,18 @@ def check_bundle(base: Path, tree: dict[str, bytes], label: str) -> int:
 MAIN_SCOPE = (
     "These notices cover every distribution built from this repository:"
     " the linked `envd` daemon binaries produced from this crate, including"
-    " the optional `cua-desktop` variant, and any guest or sandbox image"
+    " the default `cua-desktop` variant, and any guest or sandbox image"
     " that embeds such a binary. The dependency graph is a superset of all"
-    " root features and target platforms; the default base binary remains"
-    " desktop-free. Distributing a"
+    " root features and target platforms; the base binary built with"
+    " `--no-default-features` remains desktop-free. Distributing a"
     " covered distribution requires reproducing this file, the"
     " `licenses/` tree, and the files called out in"
     " [`PACKAGING.md`](PACKAGING.md)."
 )
-WORKER_SCOPE = (
-    "These notices cover the `coorworker-cua` worker binary built from"
-    " `cua-worker/`, a separate package with its own lockfile. The daemon can"
-    " supervise the standalone worker or link its library with `cua-desktop`."
-    " Distributing the worker requires reproducing this file and the"
-    " `licenses/` tree beside it; the daemon's bundle in `third_party/`"
-    " separately covers its embedded variant. Packaging steps are specified in"
-    " [`../PACKAGING.md`](../PACKAGING.md)."
-)
 
 
 def bundles(repo: Path) -> list[tuple[str, Path, tuple[str, dict[str, bytes], int, int]]]:
-    """The notice bundles this repository ships: the daemon's and the
-    worker's. Each is generated from its own locked dependency graph."""
+    """Generate only the active root graph; leave archived notices untouched."""
     return [
         (
             "third_party",
@@ -896,19 +861,6 @@ def bundles(repo: Path) -> list[tuple[str, Path, tuple[str, dict[str, bytes], in
                 scope=MAIN_SCOPE,
                 root_label="rust-envd",
                 license_link="../LICENSE",
-            ),
-        ),
-        (
-            "third_party/cua-worker",
-            repo / "third_party" / "cua-worker",
-            generate(
-                repo / "cua-worker",
-                repo,
-                title="Third-Party Notices — coorworker-cua",
-                scope=WORKER_SCOPE,
-                root_label="coorworker-cua",
-                license_link="../../LICENSE",
-                vendored_kind="cua",
             ),
         ),
     ]

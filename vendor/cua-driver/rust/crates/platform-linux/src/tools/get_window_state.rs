@@ -346,7 +346,7 @@ impl Tool for GetWindowStateTool {
         let xid = match args.opt_u64("window_id") {
             Some(v) => v,
             None => {
-                let chosen = tokio::task::spawn_blocking(move || {
+                let chosen = cua_driver_core::work_scope::spawn_blocking(move || {
                     if let Some(popup) = crate::input::mapped_popup_windows()
                         .into_iter()
                         .rev()
@@ -537,7 +537,7 @@ impl Tool for GetWindowStateTool {
         let state_for_capture = state.clone();
         let query_for_walk = query.clone();
 
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let result = cua_driver_core::work_scope::spawn_blocking(move || -> anyhow::Result<_> {
             // Skip the AT-SPI walk on the capture-only path
             // (include_accessibility_tree:false).
             let tree_result = if want_tree {

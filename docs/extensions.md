@@ -1,371 +1,196 @@
-# Extensions
+# Native CUA and historical extensions
 
-rust-envd serves the official envd surface **plus** additive surfaces. The
-compatibility claim is scoped to the official surface; an extension is a
-separate, independently versioned product that happens to run in the same
+The official envd surface remains frozen: 13 REST operations and 17 Connect
+procedures at the pinned upstream release `0.10.2` (`51083a8`). CUA is an
+additive native HTTP service in the existing daemon. Its four routes run
+inside S0 routing and authentication; there is no extension mounting layer.
+The implemented [native CUA contract](native-cua.md) has passed the local
+verification matrix described below. Historical results remain separately
+scoped to earlier revisions.
+
+## Native interface
+
+| Endpoint | Request | Response |
+| --- | --- | --- |
+| `GET /cua/tools` | No body | `{"tools":[{"name":"…","description":"…","input_schema":{…}}]}` |
+| `POST /cua/call` | `{"name":"…","arguments":{…}}` | `{"success":true,"content":[…],"data":…}` |
+| `GET /cua/health` | No body | Passive runtime availability and reason; no desktop probe or action. |
+| `GET /cua/metrics` | No body | Bounded Prometheus tool counters, latency and runtime readiness. |
+
+The call body must be an object with exactly `name` and `arguments`, and
+`arguments` must be an object. JSON-RPC envelopes, notifications, batches and
+unknown fields are rejected. Tool schemas use `input_schema`; image content
+uses `mime_type`. Results carry no JSON-RPC `id`/`result` or MCP
+`isError`/`structuredContent`. Tool-reported failures use `success:false`;
+`data` preserves the driver's raw structured diagnostics. A failure without
+structured data receives `{"code":"tool_error"}`. Discovery omits
+`output_schema`: the vendor's normalized output schema does not describe every
+raw diagnostic payload. Transport failures use the existing newline-terminated
+S0 JSON error envelope with `code` and `message`.
+
+| Status | Transport failure |
+| --- | --- |
+| 400 | Invalid JSON or arguments |
+| 401 | Missing, uninitialized, ambiguous or invalid credentials |
+| 404 | Unknown route or tool |
+| 405 | Wrong method |
+| 413 | Request too large |
+| 415 | Unsupported media type |
+| 429 | Execution already busy |
+| 500 | Internal failure |
+| 503 | Unavailable runtime |
+| 504 | Execution deadline exceeded |
+
+Requests are limited to 1 MiB and serialized responses to 32 MiB. The
+execution deadline is 30 seconds. One execution slot stays held until the
+underlying action actually finishes, including after an HTTP timeout or
+client disconnect. A timeout does not guarantee cancellation of native OS
+work. The desktop adapter uses the vendor's `work_scope::InvocationScope` to
+track and drain finite blocking, async and raw-thread handoffs, including
+nested work and panic cleanup. Markers are acquired before enqueueing, and
+bound futures retain their caller-selected runtime. Finite GNOME compositor
+requests preserve their absolute deadline and reject expired queued work
+before polling or helper invocation; finite accessibility probes also carry
+the scope. Persistent session resources and event loops stay under their
+existing owners, outside the per-call drain. A wedged OS call can keep the
+slot held until completion or process termination.
+
+## Authentication and observation
+
+All CUA paths, including `/cua`, unknown descendants and removed endpoints,
+require completed envd initialization and a nonempty current
+`X-Access-Token`. Exactly one unambiguous header value is required; duplicate,
+comma-joined, empty or invalid values are rejected. Bearer, Basic and file
+signatures cannot replace that header. Authentication runs in the existing S0
+middleware before decoding a body or invoking a tool. Existing CORS preflight behavior remains unchanged
+and cannot execute a tool. The original S0 paths, protobufs, authentication
+exceptions and response contracts stay unchanged.
+
+Credential rotation affects subsequent requests; an admitted action may
+finish after rotation. Rejected credentials do not count as tool execution.
+Both health and metrics require the same token. Health is passive availability
+information, not evidence of successful screenshot/input/window actions.
+CUA Prometheus metrics are separate from the unchanged S0 `/metrics` JSON
+surface; worker supervision and restart metrics have no role in this API.
+
+## Runtime and setup
+
+The sole engine is envd's directly linked, in-process vendored desktop
+registry. There is no MCP endpoint, initialization handshake, extension
+framework, worker supervisor, helper transport or execution-mode selection.
+Native desktop failures can terminate envd because execution shares its
 process.
 
-```text
-S0  official envd surface   frozen: 13 REST + 17 Connect, byte-identical
-S1  extension surfaces      additive, namespaced (/cua/...), own auth
-S2  control surface         /health, /metrics (unchanged)
-```
+The default build enables optional `cua-desktop` dependencies. Linux and known
+Windows desktop user sessions are eligible. Use the normal envd launch and
+token provisioning procedure, then list tools through `GET /cua/tools` and
+invoke them through `POST /cua/call`. No separate process, listener, transport
+token or MCP client initialization is required. Model/provider credentials
+belong in AgentHost.
 
-## Invariants
+Windows SCM-attached processes, Session 0, service successors in Session 0,
+and unknown sessions report unavailable before constructing a desktop
+registry. They neither start nor contact a helper. The S0 filesystem and
+process services remain available. Use `--no-default-features` for the
+desktop-free base/static build; CUA operations then report unavailable after
+authentication. Desktop dependencies remain optional.
 
-1. **S0 is frozen.** Every request the pinned Go daemon (0.10.2,
-   `51083a8`) accepts keeps its status line, headers, framing, trailers and
-   body. The differential gates run S0 only.
-2. **An extension cannot shadow S0.** Extensions are nested under
-   `/<name>` and `Extensions::new` rejects a name that is one of envd's
-   first path segments (`health`, `files`, `init`, …). Names are otherwise
-   `[a-z][a-z0-9_-]{0,62}`; a dot or slash is rejected, so a name can never
-   collide with a Connect `/<package>.<Service>/<Method>` path.
-3. **Layering is separate.** `app_with_*` mounts extensions *after*
-   `http::layered`, so the envd frontdoor, authorization and CORS layers
-   never run for an extension request. An extension owns its status codes,
-   credential policy and error envelope. The explicitly selected shared CUA
-   modes read the live protected `/init` credential; this does not apply S0
-   middleware to extensions or change S0's accepted headers.
-4. **No extension means no change.** `Extensions::empty()` is the parity
-   build; mounting it is a no-op. The suite that proves S0 is the same
-   suite the campaign has been running.
-5. **Evidence is separated.** S0 evidence is differential. An extension is
-   proven by its own contract tests and, where one exists, by an upstream
-   client's conformance run. Neither result stands in for the other.
+Remove old `COORWORKER_CUA_*` mode/worker/proxy configuration and
+`CUA_ENV_TOKEN` from production launch environments: their presence is
+rejected at startup with an actionable migration error. There is no legacy
+compatibility mode. `/cua/mcp`, `/cua/info`, extension discovery and independent
+`coorworker-cua` startup are removed. Earlier helper setup, restart budgets,
+proxy credentials and Bearer-based examples below are historical evidence,
+not deployment instructions for the native service.
 
-## Usage
+## Linux window enumeration and vendor patches
 
-```rust
-use coorworker_envd::daemon::app_with_execution_and_extensions;
-use coorworker_envd::ext::cua::CuaExtension;
-use coorworker_envd::ext::{Extension, Extensions};
+Native Wayland enumeration remains opt-in through
+`CUA_DRIVER_RS_ENABLE_WAYLAND=1`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and the
+current `HYPRLAND_INSTANCE_SIGNATURE` for a Hyprland session. A stale
+signature is an IPC failure. Without the opt-in, the registry uses its
+existing X11 path; rootless XWayland with no X11 clients can correctly return
+zero windows. These driver settings are distinct from the removed
+`COORWORKER_CUA_*` execution configuration.
 
-let cua = CuaExtension::spawn(worker_binary, worker_listen).await;
-let extensions = Extensions::new(vec![Arc::new(cua) as Arc<dyn Extension>])?;
-let router = app_with_execution_and_extensions(state, runtime, &extensions);
-```
+The local Hyprland patch accepts legacy numeric workspace IDs and 0.57 stable
+workspace addresses, including named and special workspaces. Addresses take
+precedence, display names do not establish identity, and empty workspaces are
+excluded from visibility matching. A mapped window without a workspace
+identity is an error. Full compositor window IDs, PID/geometry validation,
+and hidden/DPMS visibility rules remain intact. The fallible dispatcher
+preserves authoritative Hyprland/niri enumeration and blocking-task failures;
+a successful empty enumeration still returns an empty list. The native HTTP
+adapter uses `success:false` for tool failures rather than the older MCP
+result envelope. Other internal callers retain the best-effort interface;
+the generic Wayland/X11 fallback policy is unchanged.
 
-`CuaExtension::from_env()` is the same thing driven by `COORWORKER_CUA_BIN`.
+These patches cover enumeration, not rotated multi-monitor capture/input.
+Screen-size and action admission keep their existing checks. Patch provenance
+and update obligations are in
+[`vendor/cua-driver/PROVENANCE.md`](../vendor/cua-driver/PROVENANCE.md).
+Earlier worker/MCP tests below do not establish native API acceptance.
 
-`Extension::router()` returns paths relative to the extension prefix and must
-not install a fallback: the envd router owns the process-wide 404 shape.
-`Extension::health()` reports readiness without failing S0.
+## Licensing
 
-Extension configuration is not carried in `/init`: Go's decoder ignores
-unknown members, so interpreting one there would make the same input mean two
-different things on the two daemons.
+Only the MIT crates are vendored: `cua-driver-core`, `cua-driver-contract`,
+`platform-linux`, `platform-windows`, `cursor-overlay`, `cua-cursor-motion`
+and `pip-preview`. The AGPL-3.0-only `cua-perception` and FSL-1.1-MIT
+`libs/cua-spacesd` remain excluded. Preserve the local patches and upstream
+license attribution. Distribution notices and manifest procedures are
+documented in [`third_party/PACKAGING.md`](../third_party/PACKAGING.md);
+older worker bundle counts are not claims about this migration's resolved
+dependency graph.
 
-## Status
+## Verified local native API results
 
-| Extension | State |
-| --- | --- |
-| `cua` | Embedded execution or supervised/adopted `coorworker-cua` worker; both reuse the vendored Cua Driver registry. |
+The latest full tests passed default 907/base 881 tests, zero failures, with
+24 doctests ignored in each configuration. Final strict Clippy for both
+configurations and all targets, formatting, the Windows base MSVC
+library/binary crosscheck, 17 distribution checks, notices verification and
+rebuild passed. Focused reruns of the 15 completion, 17 native API and five
+Wayland regressions also passed after the deadline fix. Counts exclude nested
+filtered subprocess summaries.
 
-## `cua`: computer-use surface
+The full tests include 17 isolated native API contracts per configuration,
+five desktop Wayland fixture regressions, 15 desktop completion regressions,
+and the actual registry adapter's in-memory completion test. All 15 completion
+regressions also passed separately, covering finite nested blocking/async/raw-
+thread work after timeout, disconnect or panic, pre-enqueue binding, dedicated
+runtimes and all three exact compositor deadline-helper cases. The added
+resumed-I/O case verifies that `BeforeDeadline` checks the deadline and timer
+before every inner poll, so I/O becoming ready after expiry cannot dispatch a
+request. The final Rust recheck closed that finding and confirmed timer
+wake-up behavior, with no remaining blocking defect, alongside code/security
+follow-up. A cached-database audit reported zero vulnerabilities and seven
+unmaintained-dependency warnings, without a fresh advisory-data claim.
 
-### Shared credential and embedded execution
+Observed rebuilt Linux smoke found 63 tools, one envd process with no children
+and one owned TCP listener; old MCP returned 404, JSON-RPC returned 400 and
+obsolete startup configuration was rejected. No desktop actions were performed.
+The final rebuilt repetition after the deadline fix passed. Final scoped line
+coverage for three root modules is recorded in the canonical verification
+record; dependency exports were empty, so no numeric
+`work_scope` coverage is claimed.
 
-Set `COORWORKER_CUA_MODE` explicitly to migrate from legacy deployment:
+These are local fixture and compilation results. Native Windows desktop/live
+S0 Windows acceptance of the new API remains unrun; no local musl compiler
+was available. No fresh Go differential/SDK campaign, remote CI, commit, push,
+merge, deployment or real desktop action is claimed. The canonical
+[verification record and limits](native-cua.md#verified-local-state) retain
+that scope.
 
-| Mode | Runtime | Requirements |
-| --- | --- | --- |
-| unset / `legacy` | Existing worker supervision or adoption | Existing `BIN` / `EXTERNAL` and proxy configuration below |
-| `embedded` | MCP registry inside envd | Build with `--features cua-desktop`; run in desktop user's session |
-| `shared-external` | Adopted user-session helper | Loopback `COORWORKER_CUA_LISTEN`; nonempty matching `CUA_ENV_TOKEN` |
+## Historical evidence — older revisions only
 
-Shared modes expose `POST /cua/mcp` on the existing envd listener. The caller
-sends `Authorization: Bearer <current envd access token>`. Before installing a
-token through `/init`, and after an authorized token reset, CUA denies all
-requests. Successful `/init` rotation immediately invalidates the old token
-for subsequent admissions. Failed or timestamp-skipped init retains the
-actual current state. Authentication occurs before body parsing, backend
-execution and accounting; admitted work may finish after rotation without
-holding the configuration lock. S0 continues accepting `X-Access-Token` and
-keeps its original fresh-boot policy and exclusions. Neither header substitutes
-for the other.
+All results in the following subsections predate the native four-route API.
+They retain the original counts, commands, transport fields and limitations
+as evidence for the recorded campaigns. References to extension mounting,
+MCP/Bearer admission, modes, helpers, workers and their tests describe removed
+architecture. They do not validate native REST admission, new runtime wiring,
+the current dependency graph or new Linux/Windows platform acceptance. No new
+tests, builds, CI or desktop acceptance are claimed here.
 
-On the native Windows DPAPI provisioning path, rotation is established but
-live reset is not: empty metadata is treated as unprovisioned and cannot
-provide the empty-token hash required to authorize `/init {}`. The request
-returns 401 and preserves the installed token. Synthetic-provider reset tests
-do not establish this native capability; see the
-[native acceptance limitation](windows-cua-acceptance.md#native-live-reset-limitation).
-
-```sh
-cargo build --locked -j4 --features cua-desktop
-COORWORKER_CUA_MODE=embedded target/debug/coorworker-envd --development
-```
-
-Initialize envd using its normal token provisioning procedure before connecting
-an MCP client to `/cua/mcp`. No extra worker listener or process is created.
-The desktop build links the same platform registry as the standalone worker;
-its native crashes can therefore terminate envd. The default build does not
-activate those dependencies and remains suitable for static musl guests.
-Selecting embedded mode in a base build reports unavailable rather than
-falling back to another mode.
-
-Windows SCM mode, service handover successors, Session 0, and failed session
-lookup refuse embedded initialization before the registry is constructed.
-For these deployments select `shared-external`, run the standalone helper in
-the target user's session, and supply its local transport token to envd using
-`CUA_ENV_TOKEN`. The helper can read the same value through `--token-file`.
-Provisioning the helper and securing that file are deployment responsibilities.
-The envd token is never copied to the helper. Missing or empty local transport
-credentials leave the shared extension unavailable. The helper's `/health`
-probe establishes liveness; it cannot prove a separately configured transport
-token matches, so MCP may still return 401 for a mismatch.
-
-Shared discovery reports `mode`, `auth_source: "envd"`, `auth_configured`, and
-relative `proxy_path: "/cua/mcp"`. Embedded mode has no helper URL. Health
-separates backend availability from credential readiness; neither is a GUI
-session or screenshot acceptance probe. Embedded worker gauges/restart
-counters stay zero. Backend/readiness gauges and tool counters describe the
-shared endpoint; rejected credentials do not increment tool-call counters.
-`/cua/info`, `/cua/health`, and `/cua/metrics` remain credential-free metadata
-and belong on a trusted listener or behind deployment access controls.
-Invalid explicit modes never downgrade to legacy authentication.
-
-### Legacy separate process
-
-The Cua Driver desktop stack (X11/AT-SPI on Linux, UI Automation on Windows)
-is excluded from the default daemon dependency graph. A separate
-`coorworker-cua` binary remains useful for that lightweight build, native crash
-isolation, and Windows services that execute outside the interactive session.
-The following configuration describes the unchanged legacy mode.
-
-```text
-guest / host
-  coorworker-envd
-    ext::cua  ── spawns, watches ──►  coorworker-cua
-      GET /cua/health                   POST /mcp   (MCP JSON-RPC)
-      GET /cua/info                     GET  /mcp   → 405
-      GET /cua/metrics
-      POST /cua/mcp   (optional proxy)
-```
-
-The extension is enabled only when the worker binary is configured. With no
-`COORWORKER_CUA_BIN`, the build is the parity daemon: no routes, no child,
-and the router is identical to S0.
-
-### Extension routes
-
-`/cua/health` returns `200` with `{"status":"healthy"}` (plus the
-`restarts` count) while the worker process is alive, and `503` with the
-reason in `detail` after it exits or fails to start. The document also carries
-`observed_restarts` and `budget_exhausted`. In spawn mode `observed_restarts`
-is always `0`; `budget_exhausted` turns `true` only when the supervisor gave
-up. `/cua/info` publishes
-`name` (`cua`), `mcp_url`, `transport`, `protocol` and `auth` (`bearer` when
-the worker has a `CUA_ENV_TOKEN`, otherwise `none`) and never the token: a
-discovery document that leaked it would hand every guest process control of
-the desktop. Both routes are extension-owned — they are mounted after
-`http::layered` and do not use the envd `/init` access token.
-
-A worker that exits is replaced. The supervisor relaunches it with
-exponential backoff (0.5 s doubling to a 30 s cap, each step jittered between
-half and 1.5× its nominal delay; a worker that stayed up for 60 s resets the
-sequence) and only reports healthy once the new process accepts on its
-loopback port. A worker that never comes up does not fail the daemon: S0 keeps
-serving and the extension stays visible as unhealthy with the reason in
-`detail`.
-
-After `COORWORKER_CUA_MAX_RESTARTS` consecutive failed launches or immediate
-exits (default 8; `0` restores unlimited retry) the supervisor stops
-relaunching and records `budget_exhausted: true` with detail
-`restart budget exhausted after N attempts: …`. `/cua/health` stays `503` and
-`coorworker_envd_cua_worker_budget_exhausted` becomes `1`; nothing retries in
-the background. Recovery is manual: fix or replace the worker binary and
-restart envd. The budget counts a crash loop, not occasional restarts — one
-stable run clears it.
-
-### Adopted workers
-
-With `COORWORKER_CUA_EXTERNAL` set, envd does not spawn the worker; it
-**adopts** the one listening at `COORWORKER_CUA_LISTEN`. The probe runs at
-startup and every 2 s: `GET /health` must answer `204` within 2 s, so a
-process that still accepts but no longer serves is not reported healthy.
-`/cua/health`, `/cua/info`, `/cua/metrics` and the optional proxy behave
-exactly as in spawn mode; a worker that disappears turns the extension
-unhealthy with the connection error in `detail`, and one that comes back is
-picked up again. `restarts` stays `0` in this mode: envd never replaces a
-process it does not own, and `coorworker_envd_cua_worker_restarts_total`
-must not be read as a restart count for it. Instead,
-`observed_restarts` (and `coorworker_envd_cua_worker_observed_restarts_total`)
-counts healthy→unhealthy→healthy recoveries the 2 s probe actually saw: a
-worker that is absent at adoption and later appears is a start (0), not a
-restart. `COORWORKER_CUA_EXTERNAL` wins when both variables are set.
-
-`/cua/metrics` exposes Prometheus text:
-
-| Series | Meaning |
-| --- | --- |
-| `coorworker_envd_cua_worker_up` | `1` while the worker answers; `0` otherwise. |
-| `coorworker_envd_cua_worker_restarts_total` | Exits the supervisor replaced. Spawn mode only; always `0` for an adopted worker. |
-| `coorworker_envd_cua_worker_observed_restarts_total` | Recoveries observed while adopting. Never mixed with the supervisor counter. |
-| `coorworker_envd_cua_worker_budget_exhausted` | `1` once the spawn supervisor gave up. |
-| `coorworker_envd_cua_tool_calls_total{tool,status}` | `tools/call` requests forwarded through `POST /cua/mcp`, by tool and `ok`/`error`. |
-| `coorworker_envd_cua_tool_latency_seconds_sum` | Cumulative time spent forwarding those calls. |
-
-The tool series cover only the optional envd proxy. A caller that reaches the
-worker directly, and the ToolHost WS relay, are not counted; do not read them
-as global desktop-tool usage. At most 64 distinct tool names are kept and
-every later name is attributed to `tool="other"`, so a caller cannot grow the
-label set without bound. These counters are extension-owned and deliberately
-separate from S2 `/metrics`, whose JSON wire format is the oracle's and stays
-byte-identical.
-
-A scrape sample:
-
-```yaml
-scrape_configs:
-  - job_name: coorworker-envd-cua
-    metrics_path: /cua/metrics
-    scrape_interval: 15s
-    static_configs:
-      - targets: ["127.0.0.1:49983"]
-```
-
-`/cua/health` and `/cua/metrics` are unauthenticated like the existing
-extension precedent and must stay on a loopback or otherwise trusted
-listener; `/cua/mcp` is the only route with a credential.
-
-### Remote access without a second port
-
-The worker listens on loopback only, so a caller outside the guest cannot
-reach it. Configuring `COORWORKER_CUA_PROXY_TOKEN` mounts `POST /cua/mcp` on
-the envd surface instead: envd checks that bearer token (constant-time; an
-empty value means "not configured" and the route is absent) and forwards one
-JSON-RPC request to the worker. The deployment then needs no extra port
-beyond the one envd already exposes.
-
-- The proxy token and the worker's `CUA_ENV_TOKEN` are different credentials.
-  The caller only ever learns the proxy token; envd injects the worker token,
-  so the caller's `Authorization` header never reaches the worker.
-- Only `mcp-protocol-version` and `mcp-session-id` are forwarded besides the
-  body. Requests are capped at 1 MiB and worker responses at 32 MiB; the
-  proxy waits 30 s. Errors are extension-owned: `401` wrong or missing token,
-  `503` worker not running, `502` worker unreachable, `504` timeout. The
-  worker's own HTTP status is passed through unchanged (a JSON-RPC `400`
-  stays `400`).
-- `/cua/info` adds `proxy_path` (`/cua/mcp`) and `proxy_auth` (`bearer`) when
-  the proxy is mounted. It is relative because envd does not know the address
-  a caller reached it on, and the token is never echoed.
-- This route is extension-owned like the rest: it is mounted after
-  `http::layered` and does not accept the envd `/init` access token.
-
-### Worker interface
-
-| Method and path | Behaviour |
-| --- | --- |
-| `GET /health` | `204`, no body. |
-| `POST /mcp` | MCP JSON-RPC over HTTP: `initialize`, `tools/list`, `tools/call`, notifications (`202`, empty body). Parse errors are JSON-RPC `-32700` / `-32600` with HTTP `400`. |
-| `GET /mcp` | `405`. |
-
-Tools come from `platform_linux::register_tools()` /
-`platform_windows::register_tools()` (63 tools on Linux at the vendored
-commit). Every tool name must carry a reviewed risk classification in Cua
-Driver; an unclassified name is denied, and that policy is not relaxed by
-this worker.
-
-### Configuration
-
-| Variable / flag | Meaning |
-| --- | --- |
-| `COORWORKER_CUA_BIN` | Path to the worker binary. Unset disables the extension. |
-| `COORWORKER_CUA_LISTEN` | Worker listen address; default `127.0.0.1:3211`. |
-| `COORWORKER_CUA_EXTERNAL` | Non-empty and not `0`/`false`: adopt the worker at `COORWORKER_CUA_LISTEN` instead of spawning one. Wins over `COORWORKER_CUA_BIN`. |
-| `COORWORKER_CUA_PROXY_TOKEN` | Enables `POST /cua/mcp` and is the bearer token callers present. Empty means disabled. |
-| `COORWORKER_CUA_MAX_RESTARTS` | Consecutive failed launches/exits before the supervisor stops; default `8`, `0` means unlimited. Invalid values leave the extension visible but unavailable with the parse error. |
-| `--listen` | Worker flag for the same address (the extension passes it). |
-| `--token-file` / `CUA_ENV_TOKEN` | Bearer token for `/mcp`. Accepted as `Authorization: Bearer …` or `X-Cua-Env-Authorization`. When set in envd's environment the worker inherits it and the proxy injects it on forwards. |
-
-The worker refuses to bind a non-loopback address without a token. On
-loopback with no token, auth is disabled and the worker says so on startup.
-
-### Build
-
-The standalone worker is its own package with a separate lockfile and target
-directory. The default daemon excludes its desktop dependencies; the optional
-`cua-desktop` build links its reusable library:
-
-```sh
-cargo build --locked --bin coorworker-envd
-cd cua-worker && cargo build --locked --bin coorworker-cua
-```
-
-Set `DISPLAY` for the worker on Linux; it needs a running X server.
-
-### Windows
-
-A session-0 service cannot drive the interactive desktop, so the service
-must not spawn the worker. It can still serve the `cua` surface by adopting
-one the user session started:
-
-1. Start `coorworker-cua --listen 127.0.0.1:3211` in the logged-in session
-   (for example a logon scheduled task, or the same command in the user's
-   startup folder).
-2. Start envd as the SCM service with `COORWORKER_CUA_EXTERNAL=1` and, if the
-   worker uses one, `CUA_ENV_TOKEN` set to the same token. Loopback is shared
-   between sessions, so the service reaches the worker without a second port.
-
-envd then probes the worker every 2 s and reports `/cua/health`,
-`/cua/info`, `/cua/metrics` and the optional proxy as usual. A service
-started with only `COORWORKER_CUA_BIN` still refuses the extension with a log
-line, and the log now names `COORWORKER_CUA_EXTERNAL`. This is adoption, not
-a `CreateProcessAsUser` bridge: envd does not start the worker in the user's
-session, so the deployment must.
-
-CI builds the worker with the MSVC toolchain and runs its contract tests on
-`windows-latest`, so the Windows code path compiles and serves MCP. Those
-tests use a static tool provider: real UI Automation actions still require a
-logged-in desktop session and are not exercised there.
-
-### Linux window enumeration
-
-Native Wayland enumeration is opt-in: set `CUA_DRIVER_RS_ENABLE_WAYLAND=1`,
-`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and the current
-`HYPRLAND_INSTANCE_SIGNATURE` for a Hyprland session. A stale signature is
-an IPC failure. Without the opt-in the worker uses its existing X11 path;
-rootless XWayland with no X11 clients can correctly return zero windows.
-
-The local Hyprland patch accepts both legacy numeric workspace IDs and
-0.57 stable workspace addresses, including named and special workspaces.
-Addresses take precedence when present, while display names do not establish
-identity. Empty workspaces are excluded from visibility matching, and a
-mapped window without a workspace identity is an error. Full compositor
-window IDs, PID/geometry validation and hidden/DPMS visibility rules are
-preserved. See `vendor/cua-driver/PROVENANCE.md` for the pinned upstream and
-local patch list.
-
-For explicit `tools/call list_windows`, recognized Hyprland/niri enumeration
-failures and blocking-task failures return MCP `result.isError: true` with a
-structured error code. They must not be interpreted as an empty desktop or
-trigger a fallback into another window-ID namespace. An actual successful
-empty enumeration still returns `structuredContent.windows: []`. Other
-internal callers retain their best-effort interface, and the generic
-Wayland/X11 fallback policy is unchanged. This does not claim that every
-backend failure or every tool now uses the stricter policy.
-
-This change covers enumeration only. It does not add rotated multi-monitor
-capture/input support; screen-size and action admission retain their existing
-checks. Desktop interaction and Windows desktop support require separate
-acceptance evidence.
-
-### Licensing
-
-Only the MIT crates are vendored (`vendor/cua-driver/`, provenance in
-`vendor/cua-driver/PROVENANCE.md`): `cua-driver-core`,
-`cua-driver-contract`, `platform-linux`, `platform-windows`,
-`cursor-overlay`, `cua-cursor-motion`, `pip-preview`. `cua-perception` is
-AGPL-3.0-only and is excluded. `libs/cua-spacesd` is FSL-1.1-MIT and must
-not be merged into this MIT repository. The worker's dependency notices are
-a separate bundle under `third_party/cua-worker/` (502 packages, generated
-from `cua-worker/Cargo.lock` by `scripts/generate_notices.py`); packages that
-ship no license file use the upstream Cua Driver license or the checked-in
-SPDX texts in `scripts/license-overrides/`.
-
-### Shared-mode acceptance and dependency audit
+### Shared-mode acceptance and dependency audit (before native REST)
 
 On 2026-11-04, an isolated Xvfb desktop and a real desktop-enabled envd
 process completed MCP initialization, discovery of 63 tools, and
@@ -401,7 +226,7 @@ each graph; they have not been hidden or classified as fixed. The earlier CUA
 acceptance audit failed with three vulnerabilities and the Tokio warning;
 the maintenance record preserves that baseline and the ownership migration.
 
-### Earlier worker and enumeration evidence
+### Earlier worker and enumeration evidence (before native REST)
 
 - Worker contract tests: 9 passed, plus 5 Linux worker/MCP integration
   regressions (`cargo test --manifest-path cua-worker/Cargo.toml --lib --bins

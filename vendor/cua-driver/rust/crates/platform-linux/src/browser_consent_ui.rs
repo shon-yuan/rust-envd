@@ -280,7 +280,7 @@ async fn consent_action<T: Send + 'static>(
         // outliving the attempt it serves.
         let bound =
             crate::input::action::Action::new(deadline.saturating_duration_since(Instant::now()));
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::work_scope::spawn_blocking(move || {
             let _bound = crate::input::action::bind(bound);
             check_deadline(deadline)?;
             operation().map_err(|error| {
@@ -320,15 +320,16 @@ pub async fn handle(
         check_deadline(deadline)?;
         prove_window_owner(pid, request.window_id)?;
         let window_id = request.window_id;
-        let tree =
-            tokio::task::spawn_blocking(move || crate::atspi::walk_tree(pid, window_id, None))
-                .await
-                .map_err(|error| {
-                    BrowserRefusal::new(
-                        BrowserRefusalCode::BrowserRouteUnavailable,
-                        format!("could not inspect the browser consent UI: {error}"),
-                    )
-                })?;
+        let tree = cua_driver_core::work_scope::spawn_blocking(move || {
+            crate::atspi::walk_tree(pid, window_id, None)
+        })
+        .await
+        .map_err(|error| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("could not inspect the browser consent UI: {error}"),
+            )
+        })?;
         check_deadline(deadline)?;
         let prompt_present = remote_debugging_prompt_present(&tree.nodes);
         saw_prompt |= prompt_present;
